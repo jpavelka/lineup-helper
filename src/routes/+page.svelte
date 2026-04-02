@@ -28,7 +28,6 @@
   
   let newPlayerName = '';
   let newPositionName = '';
-  let snapshotName = '';
   let showManager = false;
   let managerTab = 'roster';
   let selectedItem = null;
@@ -37,18 +36,48 @@
   let lineupRosterSort = 'name'; 
   let now = Date.now(); 
 
+  // Modal State
+  let showEventModal = false;
+  let eventType = 'goal'; // 'goal' or 'booking'
+  let eventTeam = 'mine'; // 'mine' or 'theirs'
+  let eventScorer = '';
+  let eventAssist = '';
+  let eventCard = 'yellow'; // 'yellow' or 'red'
+  let eventPlayer = '';
+
+  let viewingPlayerId = null; // Used for the player stats modal
+
+  const PALETTE = [
+    '#3b82f6', '#ef4444', '#10b981', '#f59e0b', 
+    '#8b5cf6', '#ec4899', '#06b6d4', '#f97316', 
+    '#84cc16', '#6366f1'
+  ];
+
+  // Dynamically assign colors to unique groups
+  $: groupColors = [...new Set(positions.map(p => (p.parent || p.name).trim() || 'Unknown'))]
+    .reduce((acc, group, idx) => {
+      acc[group] = PALETTE[idx % PALETTE.length];
+      return acc;
+    }, {});
+
   function loadState() {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (raw) {
       try {
         const data = JSON.parse(raw);
-        roster = roster = (data.roster ?? defaultState.roster).map(p => ({
+        roster = (data.roster ?? defaultState.roster).map(p => ({
           ...p,
           available: p.available !== false // defaults to true for existing players
         }));
         positions = data.positions ?? defaultState.positions;
         lineup = data.lineup ?? defaultState.lineup;
-        history = data.history ?? [];
+        
+        // Backwards compatibility: Map old history items to the new 'events' array structure
+        history = (data.history ?? []).map(h => {
+          if (h.events) return h;
+          return { ...h, events: [{ event: h.label || 'Event', playerId: null, detail: '', gameTime: 0 }] };
+        });
+        
         gameStartedAt = data.gameStartedAt ?? defaultState.gameStartedAt;
         gameLive = data.gameLive ?? defaultState.gameLive;
         gameTimeStats = data.gameTimeStats ?? { total: 0, sessionStart: null };
@@ -65,6 +94,7 @@
           if (stat.benchTotal === undefined) stat.benchTotal = 0;
           if (stat.stintActiveTotal === undefined) stat.stintActiveTotal = stat.activeTotal || 0;
           if (stat.stintBenchTotal === undefined) stat.stintBenchTotal = stat.benchTotal || 0;
+          if (stat.positionTotals === undefined) stat.positionTotals = {};
         }
       } catch {
         Object.assign(this, defaultState);
@@ -102,6 +132,13 @@
         if (activeIds.has(id)) {
           stats.activeTotal += elapsed;
           stats.stintActiveTotal += elapsed;
+          
+          // Add to specific position total
+          const posId = Object.keys(lastSavedLineup).find(k => lastSavedLineup[k] === id);
+          if (posId) {
+            if (!stats.positionTotals) stats.positionTotals = {};
+            stats.positionTotals[posId] = (stats.positionTotals[posId] || 0) + elapsed;
+          }
         } else {
           stats.benchTotal += elapsed;
           stats.stintBenchTotal += elapsed;
@@ -110,6 +147,10 @@
       }
     }
     playerTimeStats = { ...playerTimeStats };
+  }
+
+  function getCurrentGameTime() {
+    return gameTimeStats.total + (gameLive && gameTimeStats.sessionStart ? Date.now() - gameTimeStats.sessionStart : 0);
   }
 
   function resumeTracking() {
@@ -121,7 +162,7 @@
 
     roster.forEach(player => {
       if (!playerTimeStats[player.id]) {
-        playerTimeStats[player.id] = { activeTotal: 0, benchTotal: 0, stintActiveTotal: 0, stintBenchTotal: 0, sessionStart: null };
+        playerTimeStats[player.id] = { activeTotal: 0, benchTotal: 0, stintActiveTotal: 0, stintBenchTotal: 0, sessionStart: null, positionTotals: {} };
       }
     });
 
@@ -136,7 +177,6 @@
     playerTimeStats = { ...playerTimeStats };
   }
 
-  // Purely updates the DRAFT lineup, without affecting ticking times
   function updateLineup(newLineup) {
     lineup = newLineup;
     saveState();
@@ -157,55 +197,104 @@
       if (!proceed) return;
     }
 
-    // Lock in times up to this exact moment using the OLD active lineup
     commitTime(); 
 
     const oldActiveIds = new Set(Object.values(lastSavedLineup).filter(Boolean));
     const newActiveIds = new Set(Object.values(lineup).filter(Boolean));
 
-    // Calculate subbed in/out stints
     roster.forEach(player => {
       const id = player.id;
       if (!playerTimeStats[id]) return;
       const wasActive = oldActiveIds.has(id);
       const isActive = newActiveIds.has(id);
       
-      // If a player swapped states (Field to Bench, or Bench to Field) reset BOTH stint timers to 0
       if (wasActive !== isActive) {
         playerTimeStats[id].stintBenchTotal = 0;
         playerTimeStats[id].stintActiveTotal = 0;
       }
     });
 
-    const label = snapshotName.trim() || 'Lineup snapshot';
+    const currentGameTime = getCurrentGameTime();
+    const events = [];
+    positions.forEach(pos => {
+      const oldPlayerId = lastSavedLineup[pos.id];
+      const newPlayerId = lineup[pos.id];
+
+      if (oldPlayerId !== newPlayerId) {
+        if (oldPlayerId) {
+          events.push({ event: 'Exits lineup', playerId: oldPlayerId, detail: pos.name, gameTime: currentGameTime });
+        }
+        if (newPlayerId) {
+          events.push({ event: 'Enters lineup', playerId: newPlayerId, detail: pos.name, gameTime: currentGameTime });
+        }
+      }
+    });
+
+    if (events.length === 0) {
+      events.push({ event: 'Lineup snapshot', playerId: null, detail: 'No changes', gameTime: currentGameTime });
+    }
+
     const entry = {
       id: uniqueId('history'),
-      label,
       created: new Date().toISOString(),
       lineup: JSON.parse(JSON.stringify(lineup)),
       positions: JSON.parse(JSON.stringify(positions)),
-      roster: JSON.parse(JSON.stringify(roster))
+      roster: JSON.parse(JSON.stringify(roster)),
+      events
     };
     history = [entry, ...history];
-    snapshotName = '';
     
-    // Start timers again based on the NEW active lineup we just saved
     resumeTracking(); 
     saveState();
   }
 
-  function recordGameEvent(label) {
+  function addHistoryEntry(events) {
     const activeLineup = history.length > 0 ? history[0].lineup : lineup; 
+    const currentGameTime = getCurrentGameTime();
+    
+    // Automatically attach the game time to all passed events
+    const eventsWithTime = events.map(e => ({ ...e, gameTime: e.gameTime ?? currentGameTime }));
+
     const entry = {
       id: uniqueId('history'),
-      label,
       created: new Date().toISOString(),
       lineup: JSON.parse(JSON.stringify(activeLineup)),
       positions: JSON.parse(JSON.stringify(positions)),
-      roster: JSON.parse(JSON.stringify(roster))
+      roster: JSON.parse(JSON.stringify(roster)),
+      events: eventsWithTime
     };
     history = [entry, ...history];
     saveState();
+  }
+
+  function openEventModal() {
+    eventType = 'goal';
+    eventTeam = 'mine';
+    eventScorer = '';
+    eventAssist = '';
+    eventCard = 'yellow';
+    eventPlayer = '';
+    showEventModal = true;
+  }
+
+  function saveGameEvent() {
+    const events = [];
+    if (eventType === 'goal') {
+      if (eventTeam === 'theirs') {
+        events.push({ event: 'Goal conceded', playerId: null, detail: '' });
+      } else {
+        events.push({ event: 'Goal scored', playerId: eventScorer, detail: '' });
+        if (eventAssist) {
+          events.push({ event: 'Goal assisted', playerId: eventAssist, detail: '' });
+        }
+      }
+    } else if (eventType === 'booking') {
+      const cardType = eventCard === 'yellow' ? 'Yellow card' : 'Red card';
+      events.push({ event: cardType, playerId: eventPlayer, detail: '' });
+    }
+    
+    addHistoryEntry(events);
+    showEventModal = false;
   }
 
   function ensureLineupSlots() {
@@ -227,21 +316,28 @@
 
     commitTime();
     
-    // Set up new game tracking state
     gameStartedAt = Date.now();
     gameTimeStats = { total: 0, sessionStart: null };
     for (let id in playerTimeStats) {
-      playerTimeStats[id] = { activeTotal: 0, benchTotal: 0, stintActiveTotal: 0, stintBenchTotal: 0, sessionStart: null };
+      playerTimeStats[id] = { activeTotal: 0, benchTotal: 0, stintActiveTotal: 0, stintBenchTotal: 0, sessionStart: null, positionTotals: {} };
     }
     
-    // Apply the currently staged lineup to history with the label "Game started"
+    const startEvents = [{ event: 'Game started', playerId: null, detail: '', gameTime: 0 }];
+    
+    positions.forEach(pos => {
+      const playerId = lineup[pos.id];
+      if (playerId) {
+        startEvents.push({ event: 'Enters lineup', playerId, detail: pos.name, gameTime: 0 });
+      }
+    });
+
     const entry = {
       id: uniqueId('history'),
-      label: 'Game started',
       created: new Date().toISOString(),
       lineup: JSON.parse(JSON.stringify(lineup)),
       positions: JSON.parse(JSON.stringify(positions)),
-      roster: JSON.parse(JSON.stringify(roster))
+      roster: JSON.parse(JSON.stringify(roster)),
+      events: startEvents
     };
     history = [entry, ...history];
     
@@ -255,7 +351,7 @@
     commitTime();
     gameLive = !gameLive;
     resumeTracking();
-    recordGameEvent(gameLive ? 'Game resumed' : 'Game paused');
+    addHistoryEntry([{ event: gameLive ? 'Game resumed' : 'Game paused', playerId: null, detail: '' }]);
   }
 
   function endGame() {
@@ -263,7 +359,7 @@
     gameStartedAt = null;
     gameLive = false;
     resumeTracking();
-    recordGameEvent('Game stopped');
+    addHistoryEntry([{ event: 'Game stopped', playerId: null, detail: '' }]);
   }
 
   function uniqueId(prefix) {
@@ -273,7 +369,7 @@
   function addPlayer() {
     const name = newPlayerName.trim();
     if (!name) return;
-    roster = [...roster, { id: uniqueId('player'), name, available: true }]; // Added available
+    roster = [...roster, { id: uniqueId('player'), name, available: true }]; 
     newPlayerName = '';
     resumeTracking();
     saveState();
@@ -297,7 +393,6 @@
   function togglePlayerAvailability(id, available) {
     roster = roster.map((player) => (player.id === id ? { ...player, available } : player));
     
-    // If marked unavailable, automatically remove them from the draft lineup if they are in it
     if (!available) {
       let newLineup = { ...lineup };
       let changed = false;
@@ -316,7 +411,6 @@
     const name = newPositionName.trim();
     if (!name) return;
     const id = uniqueId('position');
-    // Added parent property here (defaults to empty string)
     positions = [...positions, { id, name, parent: '' }];
     lineup = { ...lineup, [id]: null };
     newPositionName = '';
@@ -451,9 +545,25 @@
       newLineup[sourcePos] = lineup[targetPos];
       newLineup[targetPos] = lineup[sourcePos];
     } else if (payload.sourceType === 'slot' && targetType === 'roster') {
-      newLineup[payload.id] = null;
+      newLineup[payload.id] = targetId; 
     }
     updateLineup(newLineup);
+  }
+
+  function handleSlotClick(posId) {
+    if (selectedItem) {
+      handleTapDrop('slot', posId);
+    } else {
+      selectItem('slot', posId);
+    }
+  }
+
+  function handleRosterClick(playerId) {
+    if (selectedItem && selectedItem.sourceType === 'slot') {
+      handleTapDrop('roster', playerId);
+    } else {
+      selectItem('roster', playerId);
+    }
   }
 
   function handleKeyboardAction(event, callback) {
@@ -525,35 +635,74 @@
     const stats = playerTimeStats[player.id];
     let activeSession = 0;
     let benchSession = 0;
-    
-    // Status strictly based on the LAST SAVED lineup
     const inLiveLineup = Object.values(lastSavedLineup).includes(player.id);
     const inDraftLineup = Object.values(lineup).includes(player.id);
+    
+    let currentPositionTotals = { ...(stats?.positionTotals || {}) };
 
     if (stats && stats.sessionStart && gameLive) {
       const elapsed = Math.max(0, now - stats.sessionStart);
-      if (inLiveLineup) activeSession = elapsed;
-      else benchSession = elapsed;
+      if (inLiveLineup) {
+        activeSession = elapsed;
+        const livePosId = Object.keys(lastSavedLineup).find(p => lastSavedLineup[p] === player.id);
+        if (livePosId) {
+           currentPositionTotals[livePosId] = (currentPositionTotals[livePosId] || 0) + elapsed;
+        }
+      } else {
+        benchSession = elapsed;
+      }
     }
+    
+    const activeDurationMs = (stats ? stats.activeTotal : 0) + activeSession;
+    
+    let positionSegments = [];
+    let positionDetails = [];
+
+    if (activeDurationMs > 0) {
+      for (let posId in currentPositionTotals) {
+        const pTime = currentPositionTotals[posId];
+        if (pTime > 0) {
+           const posDef = positions.find(p => p.id === posId);
+           const pName = posDef ? posDef.name : 'Unknown';
+           const pGroup = posDef ? (posDef.parent || posDef.name).trim() || 'Unknown' : 'Unknown';
+           
+           positionSegments.push({
+             posId,
+             group: pGroup,
+             pct: (pTime / activeDurationMs) * 100
+           });
+
+           positionDetails.push({
+             posId,
+             name: pName,
+             group: pGroup,
+             durationMs: pTime
+           });
+        }
+      }
+    }
+    
+    positionDetails.sort((a,b) => b.durationMs - a.durationMs);
 
     return {
       ...player,
-      activeDurationMs: (stats ? stats.activeTotal : 0) + activeSession,
+      activeDurationMs,
       benchDurationMs: (stats ? stats.benchTotal : 0) + benchSession,
       stintActiveMs: (stats ? stats.stintActiveTotal || 0 : 0) + activeSession,
       stintBenchMs: (stats ? stats.stintBenchTotal || 0 : 0) + benchSession,
       inLiveLineup,
-      inDraftLineup
+      inDraftLineup,
+      positionSegments,
+      positionDetails
     };
   });
 
   $: sortedManagerRoster = [...rosterPlayers].sort((a,b) => {
-    // Sort available players to the top, then alphabetically
     return a.name.localeCompare(b.name);
   });
 
   $: sortedLineupRoster = [...rosterPlayers]
-    .filter(p => p.available) // HIDE UNAVAILABLE PLAYERS HERE
+    .filter(p => p.available) 
     .sort((a, b) => {
       if (lineupRosterSort === 'name') {
         return a.name.localeCompare(b.name);
@@ -566,6 +715,16 @@
       }
       return 0;
     });
+
+  $: activeStatsPlayer = viewingPlayerId ? rosterPlayers.find(p => p.id === viewingPlayerId) : null;
+
+  $: score = history.reduce((acc, item) => {
+    item.events.forEach(ev => {
+      if (ev.event === 'Goal scored') acc.mine++;
+      if (ev.event === 'Goal conceded') acc.theirs++;
+    });
+    return acc;
+  }, { mine: 0, theirs: 0 });
 
   function hasSavedDifference(positionId, currentLineup, savedLineup, currentRoster, savedRoster, historyList) {
     if (!historyList || historyList.length === 0) return false;
@@ -581,12 +740,21 @@
 
   function exportHistoryCsv() {
     if (!history.length) return;
-    const rows = [['Event label', 'Recorded at', 'Position', 'Player name']];
-    history.forEach((item) => {
-      const createdLabel = new Date(item.created).toLocaleString();
-      item.positions.forEach((position) => {
-        const playerName = getPlayerNameFromRoster(item.lineup[position.id], item.roster);
-        rows.push([item.label, createdLabel, position.name, playerName]);
+    const rows = [['Event', 'Timestamp', 'Game Time', 'Player', 'Detail']];
+    
+    // Reverse to export chronologically
+    [...history].reverse().forEach((item) => {
+      const timestamp = new Date(item.created).toLocaleString();
+      
+      item.events.forEach(ev => {
+        const playerName = ev.playerId ? getPlayerNameFromRoster(ev.playerId, item.roster) : '';
+        rows.push([
+          ev.event,
+          timestamp,
+          formatDuration(ev.gameTime || 0),
+          playerName,
+          ev.detail || ''
+        ]);
       });
     });
 
@@ -622,10 +790,7 @@
   function clearEvents() {
     const proceed = confirm('Are you sure you want to remove all history items, reset all timers to 0, and end the current game?');
     if (proceed) {
-      // 1. Clear history entirely
       history = [];
-      
-      // 2. Reset all timers
       gameTimeStats = { total: 0, sessionStart: null };
       for (let id in playerTimeStats) {
         playerTimeStats[id] = {
@@ -633,16 +798,14 @@
           benchTotal: 0,
           stintActiveTotal: 0,
           stintBenchTotal: 0,
-          sessionStart: null
+          sessionStart: null,
+          positionTotals: {}
         };
       }
       
-      // 3. End the game
       gameStartedAt = null;
       gameLive = false;
-      gameName = ''; // Optional: clear the game name for next time
-      
-      // 4. Save the reset state
+      gameName = ''; 
       saveState();
     }
   }
@@ -663,6 +826,117 @@
   on:pointerup={stopTouchDrag} 
   on:pointercancel={cancelTouchDrag} 
 />
+
+{#if showEventModal}
+  <div class="modal-backdrop" on:click={() => showEventModal = false}>
+    <div class="modal-panel" on:click|stopPropagation>
+      <h2>Add Game Event</h2>
+      
+      <div class="form-group">
+        <label>Event Type</label>
+        <select bind:value={eventType}>
+          <option value="goal">Goal</option>
+          <option value="booking">Booking (Card)</option>
+        </select>
+      </div>
+
+      {#if eventType === 'goal'}
+        <div class="form-group">
+          <label>Team</label>
+          <select bind:value={eventTeam}>
+            <option value="mine">Our Team</option>
+            <option value="theirs">Opposing Team</option>
+          </select>
+        </div>
+        {#if eventTeam === 'mine'}
+          <div class="form-group">
+            <label>Goal Scorer</label>
+            <select bind:value={eventScorer}>
+              <option value="">-- Select Player --</option>
+              {#each sortedLineupRoster as p}
+                <option value={p.id}>{p.name}</option>
+              {/each}
+            </select>
+          </div>
+          <div class="form-group">
+            <label>Assist (optional)</label>
+            <select bind:value={eventAssist}>
+              <option value="">-- None --</option>
+              {#each sortedLineupRoster as p}
+                <option value={p.id}>{p.name}</option>
+              {/each}
+            </select>
+          </div>
+        {/if}
+      {:else if eventType === 'booking'}
+        <div class="form-group">
+          <label>Card</label>
+          <select bind:value={eventCard}>
+            <option value="yellow">Yellow Card</option>
+            <option value="red">Red Card</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>Player</label>
+          <select bind:value={eventPlayer}>
+            <option value="">-- Select Player --</option>
+            {#each sortedLineupRoster as p}
+              <option value={p.id}>{p.name}</option>
+            {/each}
+          </select>
+        </div>
+      {/if}
+
+      <div class="modal-actions">
+        <button class="secondary" on:click={() => showEventModal = false}>Cancel</button>
+        <button class="primary" on:click={saveGameEvent} disabled={
+          (eventType === 'goal' && eventTeam === 'mine' && !eventScorer) ||
+          (eventType === 'booking' && !eventPlayer)
+        }>Save Event</button>
+      </div>
+    </div>
+  </div>
+{/if}
+
+{#if activeStatsPlayer}
+  <div class="modal-backdrop" on:click={() => viewingPlayerId = null}>
+    <div class="modal-panel" on:click|stopPropagation>
+      <h2>{activeStatsPlayer.name}</h2>
+      
+      <div class="stats-list-totals">
+        <div>
+          <span>Total Field Time</span>
+          <span style="font-weight: bold; color: #34d399;">{formatDuration(activeStatsPlayer.activeDurationMs)}</span>
+        </div>
+        <div>
+          <span>Total Bench Time</span>
+          <span style="font-weight: bold; color: #94a3b8;">{formatDuration(activeStatsPlayer.benchDurationMs)}</span>
+        </div>
+      </div>
+
+      {#if activeStatsPlayer.positionDetails.length > 0}
+        <h3 style="margin-top: 0; color: #cbd5e1; font-size: 1rem;">Positions Played</h3>
+        <ul class="stats-list">
+          {#each activeStatsPlayer.positionDetails as pos}
+            <li>
+               <div style="display: flex; align-items: center; gap: 0.5rem;">
+                 <div class="position-color-bar" style="width: 12px; height: 12px; border-radius: 2px; background-color: {groupColors[pos.group]}"></div>
+                 <span>{pos.name} <span class="muted" style="font-size: 0.85em;">({pos.group})</span></span>
+               </div>
+               <span>{formatDuration(pos.durationMs)}</span>
+            </li>
+          {/each}
+        </ul>
+      {:else}
+        <p class="muted">No field time yet.</p>
+      {/if}
+      
+      <div class="modal-actions">
+        <button class="secondary" on:click={() => viewingPlayerId = null}>Close</button>
+      </div>
+    </div>
+  </div>
+{/if}
 
 <section class="hero">
   <div>
@@ -687,6 +961,11 @@
           <div class="game-status-info">
             <span class="status-label">Game:</span>
             <span class="game-name-display">{gameName || 'Unnamed'}</span>
+            <div class="scoreboard">
+              <span class="score-box">{score.mine}</span>
+              <span class="score-separator">-</span>
+              <span class="score-box">{score.theirs}</span>
+            </div>
             <span class="status-label">Time:</span>
             <span class="game-clock">{formatDuration(liveGameTime)}</span>
             <span class="status-chip {gameLive ? 'live' : 'stopped'}">{gameLive ? 'Live' : 'Paused'}</span>
@@ -704,28 +983,18 @@
 <div class="grid-layout">
   {#if !showManager}
     <section class="panel lineup-panel">
-      <h2>Lineup Editor</h2>
+      <div class="lineup-panel-header">
+        <h2>Lineup Editor</h2>
+        <button class="secondary small" type="button" style="margin-bottom:8pt" on:click={saveCurrentLineup}>Apply lineup</button>
+      </div>
       <div class="list-columns">
         <div class="list-column lineup-column">
-          <div class="lineup-tools">
-            <div>
-              <h3>Lineup</h3>
-              <form class="inline-form" on:submit|preventDefault={saveCurrentLineup}>
-                <input
-                  type="text"
-                  placeholder="Lineup name (optional)"
-                  bind:value={snapshotName}
-                  aria-label="Snapshot name"
-                />
-                <button type="submit">Apply lineup</button>
-              </form>
-            </div>
-          </div>
           <div class="scroll-box">
             <ul class="lineup-list">
               {#each positions as position (position.id)}
                 <li>
                   <div class="lineup-item"
+                    class:selected={selectedItem?.sourceType === 'slot' && selectedItem?.id === position.id}
                     class:changed={hasSavedDifference(position.id, lineup, lastSavedLineup, roster, lastSavedRoster, history)}
                     class:empty-slot={!lineup[position.id]}
                     role="button"
@@ -735,14 +1004,18 @@
                     on:pointerdown={(event) => startTouchDrag(event, 'slot', position.id)}
                     on:dragover|preventDefault
                     on:drop={(event) => handleDrop(event, 'slot', position.id)}
-                    on:click={() => handleTapDrop('slot', position.id)}
-                    on:keydown={(event) => handleKeyboardAction(event, () => handleTapDrop('slot', position.id))}>
+                    on:click={() => handleSlotClick(position.id)}
+                    on:keydown={(event) => handleKeyboardAction(event, () => handleSlotClick(position.id))}>
+                    
                     <div class="lineup-row">
-                      <span class="position-name">{position.name}</span>
+                      <div class="position-badge">
+                        <span class="position-name">{position.name}</span>
+                        <div class="position-color-bar" style="background-color: {groupColors[(position.parent || position.name).trim() || 'Unknown']}"></div>
+                      </div>
                       <span class="player-name">
                         {#if lineup[position.id]}
                           {#if lastSavedLineup[position.id] && lastSavedLineup[position.id] !== lineup[position.id]}
-                            Sub: {getPlayerNameFromRoster(lineup[position.id], roster)} ({getPlayerStatusText(lineup[position.id], rosterPlayers, true)})
+                            Sub: {getPlayerNameFromRoster(lineup[position.id], roster)}
                           {:else}
                             {getPlayerNameFromRoster(lineup[position.id], roster)} ({getPlayerStatusText(lineup[position.id], rosterPlayers)})
                           {/if}
@@ -753,7 +1026,7 @@
                             {/if}
                           </span>
                         {:else}
-                          <span class="slot-empty">Drop player here</span>
+                          <span class="slot-empty">Drop/Tap player here</span>
                           {#if lastSavedLineup[position.id]}
                             <span class="previous-lineup-note">Last: {getPlayerNameFromRoster(lastSavedLineup[position.id], lastSavedRoster)}</span>
                           {/if}
@@ -795,24 +1068,44 @@
             <ul class="list">
               {#each sortedLineupRoster as player (player.id)}
                 <li>
-                  <button class="list-item roster-list-item {selectedItem && selectedItem.sourceType === 'roster' && selectedItem.id === player.id ? 'selected' : ''}"
+                  <button class="list-item roster-list-item"
+                    class:selected={selectedItem?.sourceType === 'roster' && selectedItem?.id === player.id}
                     disabled={player.inDraftLineup}
                     type="button"
                     draggable={!player.inDraftLineup}
                     on:pointerdown={(event) => !player.inDraftLineup && startTouchDrag(event, 'roster', player.id)}
                     on:dragstart={(event) => !player.inDraftLineup && onDragStart(event, 'roster', player.id)}
-                    on:click={() => !player.inDraftLineup && selectItem('roster', player.id)}
-                    on:keydown={(event) => !player.inDraftLineup && handleKeyboardAction(event, () => selectItem('roster', player.id))}
+                    on:click={() => !player.inDraftLineup && handleRosterClick(player.id)}
+                    on:keydown={(event) => !player.inDraftLineup && handleKeyboardAction(event, () => handleRosterClick(player.id))}
                   >
-                    <div class="roster-item-name">{player.name}</div>
-                    <div class="roster-item-stats">
-                      <div>Total: {formatDuration(player.activeDurationMs)}</div>
-                      {#if player.inLiveLineup}
-                        <div class="time-active">Field: {formatDuration(player.stintActiveMs)}</div>
-                      {:else}
-                        <div class="time-bench">Bench: {formatDuration(player.stintBenchMs)}</div>
-                      {/if}
+                    <div class="roster-item-top">
+                      <div style="display: flex; align-items: center; min-width: 0;">
+                        <span class="info-btn" role="button" tabindex="0" on:click|stopPropagation={() => viewingPlayerId = player.id} on:pointerdown|stopPropagation>
+                          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <circle cx="12" cy="12" r="10"></circle>
+                            <line x1="12" y1="16" x2="12" y2="12"></line>
+                            <line x1="12" y1="8" x2="12.01" y2="8"></line>
+                          </svg>
+                        </span>
+                        <div class="roster-item-name">{player.name}</div>
+                      </div>
+                      <div class="roster-item-stats">
+                        <div>Total: {formatDuration(player.activeDurationMs)}</div>
+                        {#if player.inLiveLineup}
+                          <div class="time-active">Field: {formatDuration(player.stintActiveMs)}</div>
+                        {:else}
+                          <div class="time-bench">Bench: {formatDuration(player.stintBenchMs)}</div>
+                        {/if}
+                      </div>
                     </div>
+                    
+                    {#if player.positionSegments?.length > 0}
+                      <div class="player-position-bar">
+                        {#each player.positionSegments as seg}
+                          <div class="pos-segment" style="width: {seg.pct}%; background-color: {groupColors[seg.group]}" title="{seg.group}"></div>
+                        {/each}
+                      </div>
+                    {/if}
                   </button>
                 </li>
               {/each}
@@ -916,7 +1209,7 @@
                    }}
                    on:pointerdown={(e) => startTouchDrag(e, 'position', position.id)}
               >☰</div>
-              <div>
+              <div class="position-inputs">
                 <input
                   type="text"
                   value={position.name}
@@ -926,7 +1219,7 @@
                 <input
                   type="text"
                   value={position.parent || ''}
-                  placeholder="Position group"
+                  placeholder="Group (e.g. DEF)"
                   on:change={(event) => updatePositionParent(position.id, event.target.value)}
                   aria-label="Position group"
                 />
@@ -943,7 +1236,8 @@
     <section class="panel history-panel">
       <div class="history-tools">
         <h2>Game Events</h2>
-        <div>
+        <div style="display: flex; gap: 0.5rem; align-items: center;">
+          <button class="secondary small" type="button" on:click={openEventModal}>+ Add Event</button>
           <button class="secondary small" type="button" on:click={exportHistoryCsv}>Export CSV</button>
           <button disabled={history.length === 0} class="secondary small clear-events" type="button" on:click={clearEvents}>Clear</button>
         </div>
@@ -955,12 +1249,25 @@
       <div class="history-list">
         {#each history as item (item.id)}
           <article class="history-item">
-            <div>
-              <strong>{item.label}</strong>
-              <div class="muted">{new Date(item.created).toLocaleString()}</div>
+            <div class="history-item-events">
+              <div class="muted" style="margin-bottom: 0.25rem;">{new Date(item.created).toLocaleTimeString()}</div>
+              {#each item.events as ev}
+                <div>
+                  <span class="muted" style="margin-right: 0.4rem; font-variant-numeric: tabular-nums;">
+                    [{formatDuration(ev.gameTime || 0)}]
+                  </span>
+                  <strong>{ev.event}</strong>
+                  {#if ev.playerId}
+                    - <span style="color: #cbd5e1;">{getPlayerNameFromRoster(ev.playerId, item.roster)}</span>
+                  {/if}
+                  {#if ev.detail}
+                    <span class="muted" style="margin-left: 0.25rem;">({ev.detail})</span>
+                  {/if}
+                </div>
+              {/each}
             </div>
             <div class="history-actions">
-              <button on:click={() => recallLineup(item)}>Recall</button>
+              <button on:click={() => recallLineup(item)}>Recall Lineup</button>
               <button class="mini" on:click={() => removeHistoryItem(item.id)}>×</button>
             </div>
           </article>
@@ -975,6 +1282,7 @@
   :global(body) {
     margin: 0;
     background: #0f172a;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   }
 
   .hero {
@@ -989,6 +1297,11 @@
   h1 {
     margin: 0;
     font-size: clamp(2rem, 3vw, 2.6rem);
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    flex-wrap: wrap;
+    color: #f8fafc;
   }
 
   .hero p {
@@ -1064,6 +1377,19 @@
     cursor: pointer;
   }
 
+  .primary {
+    background: #2563eb;
+    border: none;
+    color: white;
+    padding: 0.85rem 1rem;
+    border-radius: 0.75rem;
+    cursor: pointer;
+  }
+  .primary:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
   .grid-layout {
     display: grid;
     gap: 1rem;
@@ -1098,6 +1424,7 @@
 
   .lineup-tools h3 {
     margin: 0;
+    color: #f8fafc;
   }
 
   .history-tools {
@@ -1154,11 +1481,9 @@
     .list-columns {
       grid-template-columns: 1fr;
     }
-
     .list-column {
       min-height: 0;
     }
-
     .list-column .scroll-box {
       max-height: 36vh;
     }
@@ -1249,12 +1574,52 @@
     background: #0f172a;
     border-color: #1e293b;
   }
+  
+  .list-item.unavailable {
+    background: #0f172a;
+    border-color: #1e293b;
+  }
+  
+  .list-item.unavailable input[type="text"] {
+    text-decoration: line-through;
+    opacity: 0.45;
+  }
+
+  .availability-toggle {
+    width: 1.25rem;
+    height: 1.25rem;
+    cursor: pointer;
+    accent-color: #2563eb;
+    margin: 0;
+  }
 
   .roster-list-item {
+    display: block;
+    padding: 0.6rem 0.8rem;
+  }
+
+  .roster-item-top {
     display: flex;
     justify-content: space-between;
     align-items: center;
-    padding: 0.6rem 0.8rem;
+  }
+  
+  .info-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0.35rem;
+    margin-right: 0.5rem;
+    color: #94a3b8;
+    background: transparent;
+    border-radius: 50%;
+    cursor: pointer;
+    transition: background 150ms ease, color 150ms ease;
+  }
+  
+  .info-btn:hover {
+    color: #e2e8f0;
+    background: #334155;
   }
 
   .roster-item-name {
@@ -1282,15 +1647,36 @@
     color: #94a3b8;
   }
 
-  .list-item input {
+  .player-position-bar {
+    display: flex;
+    height: 5px;
+    width: 100%;
+    border-radius: 3px;
+    overflow: hidden;
+    margin-top: 0.4rem;
+    background: #334155;
+  }
+
+  .pos-segment {
+    height: 100%;
+  }
+
+  .position-inputs {
+    display: flex;
     flex: 1;
+    gap: 0.5rem;
+  }
+
+  .list-item input[type="text"] {
+    flex: 1;
+    min-width: 0;
     border: none;
     background: transparent;
     color: #f8fafc;
     font-size: 1rem;
   }
 
-  .list-item input:focus {
+  .list-item input[type="text"]:focus {
     outline: none;
   }
 
@@ -1363,11 +1749,9 @@
     .manager-tabs {
       display: none;
     }
-
     .manager-editor {
       grid-template-columns: 1fr 1fr;
     }
-
     .tab-panel {
       display: block;
     }
@@ -1382,7 +1766,7 @@
   }
 
   .lineup-item {
-    padding: 0.95rem 1rem;
+    padding: 0.25rem;
     border-radius: 0.9rem;
     border: 1px solid #334155;
     background: #0f172a;
@@ -1409,6 +1793,12 @@
   .lineup-item.empty-slot .slot-empty {
     color: #fd0101;
     font-style: italic;
+  }
+
+  .lineup-item.selected, .list-item.selected {
+    border-color: #3b82f6;
+    box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.4);
+    background: rgba(37, 99, 235, 0.15);
   }
 
   .lineup-item.changed {
@@ -1445,10 +1835,23 @@
     min-width: 0;
   }
 
+  .position-badge {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    min-width: 3.5rem;
+    gap: 0.2rem;
+  }
+
   .position-name {
     font-weight: 700;
     color: #e2e8f0;
-    min-width: 3rem;
+  }
+
+  .position-color-bar {
+    width: 100%;
+    height: 3px;
+    border-radius: 2px;
   }
 
   .player-name {
@@ -1478,11 +1881,6 @@
     background: #475569;
   }
 
-  .selected {
-    border-color: #2563eb;
-    background: rgba(37, 99, 235, 0.15);
-  }
-
   .slot-empty {
     color: #94a3b8;
   }
@@ -1508,6 +1906,13 @@
     border-radius: 1rem;
     border: 1px solid #334155;
     background: #0f172a;
+  }
+  
+  .history-item-events {
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+    color: #f8fafc;
   }
 
   .history-actions {
@@ -1536,21 +1941,143 @@
     background-color: #7f1d1d;
   }
 
-  .list-item.unavailable {
-    background: #0f172a;
-    border-color: #1e293b;
-  }
-  
-  .list-item.unavailable input[type="text"] {
-    text-decoration: line-through;
-    opacity: 0.45;
+  /* Modal Styles */
+  .modal-backdrop {
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: rgba(0, 0, 0, 0.75);
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    z-index: 1000;
+    padding: 1rem;
   }
 
-  .availability-toggle {
-    width: 1.25rem;
-    height: 1.25rem;
-    cursor: pointer;
-    accent-color: #2563eb;
-    margin: 0;
+  .modal-panel {
+    background: #111827;
+    border: 1px solid #334155;
+    border-radius: 1rem;
+    padding: 1.5rem;
+    width: 100%;
+    max-width: 400px;
+    box-shadow: 0 20px 40px rgba(0, 0, 0, 0.5);
+  }
+
+  .modal-panel h2 {
+    margin-top: 0;
+    margin-bottom: 1.5rem;
+    color: #f8fafc;
+  }
+
+  .form-group {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    margin-bottom: 1rem;
+  }
+
+  .form-group label {
+    color: #cbd5e1;
+    font-size: 0.9rem;
+    font-weight: 500;
+  }
+
+  .form-group select {
+    padding: 0.75rem 0.9rem;
+    border-radius: 0.75rem;
+    border: 1px solid #334155;
+    background: #0f172a;
+    color: #e2e8f0;
+    font-size: 1rem;
+    outline: none;
+  }
+
+  .form-group select:focus {
+    border-color: #2563eb;
+  }
+
+  .modal-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.75rem;
+    margin-top: 1.5rem;
+  }
+
+  /* Stats List UI inside Modal */
+  .stats-list-totals {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    margin-bottom: 1.5rem;
+  }
+
+  .stats-list-totals div {
+    display: flex;
+    justify-content: space-between;
+    background: #0f172a;
+    padding: 0.75rem 1rem;
+    border-radius: 0.5rem;
+    border: 1px solid #334155;
+    color: #f8fafc;
+  }
+
+  .stats-list {
+    list-style: none;
+    padding: 0;
+    margin: 0 0 1.5rem 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+
+  .stats-list li {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: #1f2937;
+    padding: 0.75rem 1rem;
+    border-radius: 0.5rem;
+    border: 1px solid #334155;
+    color: #f8fafc;
+  }
+
+  .lineup-panel-header {
+    display: flex;
+    justify-content: space-between;
+  }
+
+  .scoreboard {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+    margin: 0 1rem;
+    background: #000;
+    padding: 0.2rem 0.6rem;
+    border-radius: 0.5rem;
+    border: 1px solid #334155;
+    font-family: 'Courier New', Courier, monospace;
+  }
+
+  .score-box {
+    color: #f8fafc;
+    font-size: 1.2rem;
+    font-weight: bold;
+    min-width: 1.2rem;
+    text-align: center;
+  }
+
+  .score-separator {
+    color: #475569;
+    font-weight: bold;
+  }
+
+  /* Optional: Pulse effect for our team scoring */
+  .score-box:first-child {
+    color: #34d399; /* Green for our team */
+  }
+
+  /* Red for opponent team */
+  .score-box:last-child {
+    color: #ef4444;
   }
 </style>
