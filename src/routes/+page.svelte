@@ -12,7 +12,8 @@
     playerTimeStats: {}, 
     gameTimeStats: { total: 0, sessionStart: null },
     gameStartedAt: null,
-    gameLive: false
+    gameLive: false,
+    gameName: ''
   };
 
   let roster = [];
@@ -23,6 +24,7 @@
   let gameTimeStats = { total: 0, sessionStart: null };
   let gameStartedAt = null;
   let gameLive = false;
+  let gameName = '';
   
   let newPlayerName = '';
   let newPositionName = '';
@@ -40,13 +42,17 @@
     if (raw) {
       try {
         const data = JSON.parse(raw);
-        roster = data.roster ?? defaultState.roster;
+        roster = roster = (data.roster ?? defaultState.roster).map(p => ({
+          ...p,
+          available: p.available !== false // defaults to true for existing players
+        }));
         positions = data.positions ?? defaultState.positions;
         lineup = data.lineup ?? defaultState.lineup;
         history = data.history ?? [];
         gameStartedAt = data.gameStartedAt ?? defaultState.gameStartedAt;
         gameLive = data.gameLive ?? defaultState.gameLive;
         gameTimeStats = data.gameTimeStats ?? { total: 0, sessionStart: null };
+        gameName = data.gameName ?? defaultState.gameName;
         
         playerTimeStats = data.playerTimeStats ?? {};
         
@@ -71,7 +77,7 @@
   }
 
   function saveState() {
-    const state = { roster, positions, lineup, history, playerTimeStats, gameTimeStats, gameStartedAt, gameLive };
+    const state = { roster, positions, lineup, history, playerTimeStats, gameTimeStats, gameStartedAt, gameLive, gameName };
     localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
   }
 
@@ -137,9 +143,17 @@
   }
 
   function saveCurrentLineup() {
+    if (!gameStartedAt) {
+      alert("The first lineup will be applied when the 'Start game' button is pressed.");
+      return;
+    }
+
     const hasEmpty = positions.some(p => !lineup[p.id]);
     if (hasEmpty) {
-      const proceed = confirm("One or more positions are empty. Are you sure you want to save this lineup?");
+      const proceed = confirm("One or more positions are empty. Are you sure you want to apply this lineup?");
+      if (!proceed) return;
+    } else {
+      const proceed = confirm("Are you sure you want to apply this lineup?");
       if (!proceed) return;
     }
 
@@ -205,17 +219,35 @@
   }
 
   function startGame() {
-    commitTime();
-    if (!gameStartedAt) {
-      gameStartedAt = Date.now();
-      gameTimeStats = { total: 0, sessionStart: null };
-      for (let id in playerTimeStats) {
-        playerTimeStats[id] = { activeTotal: 0, benchTotal: 0, stintActiveTotal: 0, stintBenchTotal: 0, sessionStart: null };
-      }
+    const hasEmpty = positions.some(p => !lineup[p.id]);
+    if (hasEmpty) {
+      const proceed = confirm("One or more positions are empty. Are you sure you want to start the game with this lineup?");
+      if (!proceed) return;
     }
+
+    commitTime();
+    
+    // Set up new game tracking state
+    gameStartedAt = Date.now();
+    gameTimeStats = { total: 0, sessionStart: null };
+    for (let id in playerTimeStats) {
+      playerTimeStats[id] = { activeTotal: 0, benchTotal: 0, stintActiveTotal: 0, stintBenchTotal: 0, sessionStart: null };
+    }
+    
+    // Apply the currently staged lineup to history with the label "Game started"
+    const entry = {
+      id: uniqueId('history'),
+      label: 'Game started',
+      created: new Date().toISOString(),
+      lineup: JSON.parse(JSON.stringify(lineup)),
+      positions: JSON.parse(JSON.stringify(positions)),
+      roster: JSON.parse(JSON.stringify(roster))
+    };
+    history = [entry, ...history];
+    
     gameLive = true;
     resumeTracking();
-    recordGameEvent('Game started');
+    saveState();
   }
 
   function toggleGameLive() {
@@ -241,7 +273,7 @@
   function addPlayer() {
     const name = newPlayerName.trim();
     if (!name) return;
-    roster = [...roster, { id: uniqueId('player'), name }];
+    roster = [...roster, { id: uniqueId('player'), name, available: true }]; // Added available
     newPlayerName = '';
     resumeTracking();
     saveState();
@@ -262,11 +294,30 @@
     updateLineup(newLineup);
   }
 
+  function togglePlayerAvailability(id, available) {
+    roster = roster.map((player) => (player.id === id ? { ...player, available } : player));
+    
+    // If marked unavailable, automatically remove them from the draft lineup if they are in it
+    if (!available) {
+      let newLineup = { ...lineup };
+      let changed = false;
+      Object.keys(newLineup).forEach(posId => {
+        if (newLineup[posId] === id) {
+          newLineup[posId] = null;
+          changed = true;
+        }
+      });
+      if (changed) updateLineup(newLineup);
+    }
+    saveState();
+  }
+
   function addPosition() {
     const name = newPositionName.trim();
     if (!name) return;
     const id = uniqueId('position');
-    positions = [...positions, { id, name }];
+    // Added parent property here (defaults to empty string)
+    positions = [...positions, { id, name, parent: '' }];
     lineup = { ...lineup, [id]: null };
     newPositionName = '';
     saveState();
@@ -274,6 +325,11 @@
 
   function updatePositionName(id, name) {
     positions = positions.map((position) => (position.id === id ? { ...position, name } : position));
+    saveState();
+  }
+
+  function updatePositionParent(id, parent) {
+    positions = positions.map((position) => (position.id === id ? { ...position, parent } : position));
     saveState();
   }
 
@@ -491,20 +547,25 @@
     };
   });
 
-  $: sortedManagerRoster = [...rosterPlayers].sort((a,b) => a.name.localeCompare(b.name));
-
-  $: sortedLineupRoster = [...rosterPlayers].sort((a, b) => {
-    if (lineupRosterSort === 'name') {
-      return a.name.localeCompare(b.name);
-    } else if (lineupRosterSort === 'total') {
-      return b.activeDurationMs - a.activeDurationMs;
-    } else if (lineupRosterSort === 'stintActive') {
-      return (a.stintBenchMs - a.stintActiveMs) - (b.stintBenchMs - b.stintActiveMs);
-    } else if (lineupRosterSort === 'stintBench') {
-      return (b.stintBenchMs - b.stintActiveMs) - (a.stintBenchMs - a.stintActiveMs);
-    }
-    return 0;
+  $: sortedManagerRoster = [...rosterPlayers].sort((a,b) => {
+    // Sort available players to the top, then alphabetically
+    return a.name.localeCompare(b.name);
   });
+
+  $: sortedLineupRoster = [...rosterPlayers]
+    .filter(p => p.available) // HIDE UNAVAILABLE PLAYERS HERE
+    .sort((a, b) => {
+      if (lineupRosterSort === 'name') {
+        return a.name.localeCompare(b.name);
+      } else if (lineupRosterSort === 'total') {
+        return b.activeDurationMs - a.activeDurationMs;
+      } else if (lineupRosterSort === 'stintActive') {
+        return (a.stintBenchMs - a.stintActiveMs) - (b.stintBenchMs - b.stintActiveMs);
+      } else if (lineupRosterSort === 'stintBench') {
+        return (b.stintBenchMs - b.stintActiveMs) - (a.stintBenchMs - a.stintActiveMs);
+      }
+      return 0;
+    });
 
   function hasSavedDifference(positionId, currentLineup, savedLineup, currentRoster, savedRoster, historyList) {
     if (!historyList || historyList.length === 0) return false;
@@ -534,7 +595,10 @@
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.setAttribute('download', 'lineup-history.csv');
+    
+    const safeGameName = gameName.trim() ? gameName.trim().replace(/[^a-z0-9]/gi, '_').toLowerCase() : 'lineup';
+    link.setAttribute('download', `${safeGameName}-history.csv`);
+    
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
@@ -556,11 +620,30 @@
   }
 
   function clearEvents() {
-    const proceed = confirm('Are you sure you want to remove all history items?')
+    const proceed = confirm('Are you sure you want to remove all history items, reset all timers to 0, and end the current game?');
     if (proceed) {
-      for (const item of history) {
-        removeHistoryItem(item.id);
+      // 1. Clear history entirely
+      history = [];
+      
+      // 2. Reset all timers
+      gameTimeStats = { total: 0, sessionStart: null };
+      for (let id in playerTimeStats) {
+        playerTimeStats[id] = {
+          activeTotal: 0,
+          benchTotal: 0,
+          stintActiveTotal: 0,
+          stintBenchTotal: 0,
+          sessionStart: null
+        };
       }
+      
+      // 3. End the game
+      gameStartedAt = null;
+      gameLive = false;
+      gameName = ''; // Optional: clear the game name for next time
+      
+      // 4. Save the reset state
+      saveState();
     }
   }
 
@@ -583,17 +666,28 @@
 
 <section class="hero">
   <div>
-    <h1>Lineup Helper</h1>
-    <p>Manage your roster, custom positions, and substitute players by dragging names into position slots.</p>
+    <h1>Lineup Helper
+    <button class="secondary" on:click={() => (showManager = !showManager)}>
+      {showManager ? 'Show lineup editor' : 'Edit roster/positions'}
+    </button></h1>
   </div>
   <div class="hero-actions">
     {#if !showManager}
       <div class="game-status">
         {#if !gameStartedAt}
+          <input 
+            type="text" 
+            placeholder="Game name (optional)" 
+            bind:value={gameName} 
+            class="game-name-input" 
+            aria-label="Game name"
+          />
           <button class="secondary" type="button" on:click={startGame}>Start game</button>
         {:else}
           <div class="game-status-info">
-            <span class="status-label">Game time:</span>
+            <span class="status-label">Game:</span>
+            <span class="game-name-display">{gameName || 'Unnamed'}</span>
+            <span class="status-label">Time:</span>
             <span class="game-clock">{formatDuration(liveGameTime)}</span>
             <span class="status-chip {gameLive ? 'live' : 'stopped'}">{gameLive ? 'Live' : 'Paused'}</span>
           </div>
@@ -604,9 +698,6 @@
         {/if}
       </div>
     {/if}
-    <button class="secondary" on:click={() => (showManager = !showManager)}>
-      {showManager ? 'Show lineup editor' : 'Manage roster & positions'}
-    </button>
   </div>
 </section>
 
@@ -626,7 +717,7 @@
                   bind:value={snapshotName}
                   aria-label="Snapshot name"
                 />
-                <button type="submit">Save lineup</button>
+                <button type="submit">Apply lineup</button>
               </form>
             </div>
           </div>
@@ -749,7 +840,11 @@
 
     <div class="manager-editor">
       <section class="panel roster-panel tab-panel {managerTab === 'roster' ? 'active' : ''}">
-        <h2>Roster</h2>
+        <div style="display: flex; justify-content: space-between; align-items: baseline;">
+          <h2>Roster</h2>
+          <span class="muted" style="font-size: 0.85rem;">(Uncheck to hide from game)</span>
+        </div>
+        
         <form class="inline-form" on:submit|preventDefault={addPlayer}>
           <input
             type="text"
@@ -762,8 +857,17 @@
 
         <ul class="list">
           {#each sortedManagerRoster as player (player.id)}
-            <li class="list-item">
+            <li class="list-item" class:unavailable={!player.available}>
               <input
+                type="checkbox"
+                class="availability-toggle"
+                checked={player.available}
+                on:change={(e) => togglePlayerAvailability(player.id, e.target.checked)}
+                title="Available for game"
+                aria-label="Toggle availability"
+              />
+              <input
+                type="text"
                 value={player.name}
                 on:click|stopPropagation
                 on:change={(event) => updatePlayerName(player.id, event.target.value)}
@@ -812,11 +916,21 @@
                    }}
                    on:pointerdown={(e) => startTouchDrag(e, 'position', position.id)}
               >☰</div>
-              <input
-                value={position.name}
-                on:change={(event) => updatePositionName(position.id, event.target.value)}
-                aria-label="Position name"
-              />
+              <div>
+                <input
+                  type="text"
+                  value={position.name}
+                  on:change={(event) => updatePositionName(position.id, event.target.value)}
+                  aria-label="Position name"
+                />
+                <input
+                  type="text"
+                  value={position.parent || ''}
+                  placeholder="Position group"
+                  on:change={(event) => updatePositionParent(position.id, event.target.value)}
+                  aria-label="Position group"
+                />
+              </div>
               <button class="mini" on:click={() => removePosition(position.id)} aria-label="Remove position">×</button>
             </li>
           {/each}
@@ -897,6 +1011,21 @@
     flex-wrap: wrap;
   }
 
+  .game-name-input {
+    padding: 0.75rem 0.9rem;
+    border-radius: 0.75rem;
+    border: 1px solid #334155;
+    background: #0f172a;
+    color: #e2e8f0;
+    min-width: 200px;
+  }
+
+  .game-name-display {
+    font-weight: 600;
+    color: #f8fafc;
+    margin-right: 0.5rem;
+  }
+
   .game-status-info {
     display: flex;
     align-items: center;
@@ -908,6 +1037,7 @@
   .game-clock {
     font-variant-numeric: tabular-nums;
     font-weight: 600;
+    margin-right: 0.25rem;
   }
 
   .status-chip {
@@ -1154,7 +1284,6 @@
 
   .list-item input {
     flex: 1;
-    min-width: 0;
     border: none;
     background: transparent;
     color: #f8fafc;
@@ -1405,5 +1534,23 @@
 
   .secondary.small.clear-events {
     background-color: #7f1d1d;
+  }
+
+  .list-item.unavailable {
+    background: #0f172a;
+    border-color: #1e293b;
+  }
+  
+  .list-item.unavailable input[type="text"] {
+    text-decoration: line-through;
+    opacity: 0.45;
+  }
+
+  .availability-toggle {
+    width: 1.25rem;
+    height: 1.25rem;
+    cursor: pointer;
+    accent-color: #2563eb;
+    margin: 0;
   }
 </style>
