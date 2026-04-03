@@ -38,6 +38,7 @@
 
   // Modal State
   let showEventModal = false;
+  let showTimelineModal = false; // Added for Feature 5
   let eventType = 'goal'; // 'goal' or 'booking'
   let eventTeam = 'mine'; // 'mine' or 'theirs'
   let eventScorer = '';
@@ -279,11 +280,15 @@
 
   function saveGameEvent() {
     const events = [];
+    let currentScore = { ...score }; // Capture the current score before modification
+    
     if (eventType === 'goal') {
       if (eventTeam === 'theirs') {
-        events.push({ event: 'Goal conceded', playerId: null, detail: '' });
+        currentScore.theirs += 1; // Update copy for feature 4
+        events.push({ event: 'Goal conceded', playerId: null, detail: '', scoreAtTime: { ...currentScore } });
       } else {
-        events.push({ event: 'Goal scored', playerId: eventScorer, detail: '' });
+        currentScore.mine += 1; // Update copy for feature 4
+        events.push({ event: 'Goal scored', playerId: eventScorer, detail: '', scoreAtTime: { ...currentScore } });
         if (eventAssist) {
           events.push({ event: 'Goal assisted', playerId: eventAssist, detail: '' });
         }
@@ -308,6 +313,9 @@
   }
 
   function startGame() {
+    // Feature 2: Prevent new game from starting if uncleared game history exists
+    if (history.length > 0) return;
+
     const hasEmpty = positions.some(p => !lineup[p.id]);
     if (hasEmpty) {
       const proceed = confirm("One or more positions are empty. Are you sure you want to start the game with this lineup?");
@@ -362,6 +370,9 @@
   }
 
   function endGame() {
+    // Feature 1: Confirm user intent to end the game
+    if (!confirm("Are you sure you want to end the game?")) return;
+
     commitTime();
     gameStartedAt = null;
     gameLive = false;
@@ -502,6 +513,7 @@
     if (event.key === 'Escape') {
       if (showEventModal) showEventModal = false;
       if (viewingPlayerId) viewingPlayerId = null;
+      if (showTimelineModal) showTimelineModal = false;
     }
   }
 
@@ -749,6 +761,20 @@
     return acc;
   }, { mine: 0, theirs: 0 });
 
+  // Feature 5: Derived chronological timeline of goals from history
+  $: goalTimeline = [...history].reverse().flatMap(item => 
+    item.events
+      .filter(e => e.event === 'Goal scored' || e.event === 'Goal conceded')
+      .map(e => ({
+        id: item.id + '-' + e.event,
+        gameTime: e.gameTime || 0,
+        event: e.event,
+        playerId: e.playerId,
+        roster: item.roster,
+        scoreAtTime: e.scoreAtTime || { mine: 0, theirs: 0 }
+      }))
+  );
+
   function hasSavedDifference(positionId, currentLineup, savedLineup, currentRoster, savedRoster, historyList) {
     if (!historyList || historyList.length === 0) return false;
     const currentName = currentLineup[positionId] ? getPlayerNameFromRoster(currentLineup[positionId], currentRoster) : '';
@@ -771,12 +797,14 @@
       
       item.events.forEach(ev => {
         const playerName = ev.playerId ? getPlayerNameFromRoster(ev.playerId, item.roster) : '';
+        // Include score text in CSV if present
+        const scoreStr = ev.scoreAtTime ? `Score: ${ev.scoreAtTime.mine}-${ev.scoreAtTime.theirs}` : '';
         rows.push([
           ev.event,
           timestamp,
           formatDuration(ev.gameTime || 0),
           playerName,
-          ev.detail || ''
+          (ev.detail || '') + scoreStr
         ]);
       });
     });
@@ -803,6 +831,12 @@
     updateLineup(newLineup);
     ensureLineupSlots();
     saveState();
+  }
+
+  // Feature 3: Determine if the history entry can be recalled (hide recall on goals/cards)
+  function isLineupRecallable(item) {
+    const nonRecallableEvents = ['Goal scored', 'Goal conceded', 'Goal assisted', 'Yellow card', 'Red card'];
+    return !item.events.some(e => nonRecallableEvents.includes(e.event));
   }
 
   function removeHistoryItem(id) {
@@ -923,6 +957,42 @@
   </div>
 {/if}
 
+<!-- Feature 5: Timeline Score Modal -->
+{#if showTimelineModal}
+  <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+  <div class="modal-backdrop" on:click={() => showTimelineModal = false}>
+    <div class="modal-panel" on:click|stopPropagation>
+      <h2>Goal Timeline</h2>
+      
+      {#if goalTimeline.length === 0}
+        <p class="muted">No goals have been scored yet.</p>
+      {:else}
+        <ul class="stats-list timeline-list">
+          {#each goalTimeline as goal}
+            <li>
+              <div style="display: flex; flex-direction: column; gap: 0.25rem;">
+                <strong>{formatDuration(goal.gameTime)} - {goal.event === 'Goal scored' ? 'Our Goal' : 'Opponent Goal'}</strong>
+                <span class="muted">
+                  {goal.event === 'Goal scored' ? getPlayerNameFromRoster(goal.playerId, goal.roster) : 'Opponent'}
+                </span>
+              </div>
+              <div class="score-timeline-box">
+                <span style="color: #34d399;">{goal.scoreAtTime.mine}</span>
+                <span style="color: #475569; margin: 0 0.2rem;">-</span>
+                <span style="color: #ef4444;">{goal.scoreAtTime.theirs}</span>
+              </div>
+            </li>
+          {/each}
+        </ul>
+      {/if}
+
+      <div class="modal-actions">
+        <button class="secondary" on:click={() => showTimelineModal = false}>Close</button>
+      </div>
+    </div>
+  </div>
+{/if}
+
 {#if activeStatsPlayer}
   <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
   <div class="modal-backdrop" on:click={() => viewingPlayerId = null}>
@@ -975,19 +1045,28 @@
     {#if !showManager}
       <div class="game-status">
         {#if !gameStartedAt}
+          <!-- Feature 2: Disable starting a game if uncleared data exists -->
           <input 
             type="text" 
             placeholder="Game name (optional)" 
             bind:value={gameName} 
             class="game-name-input" 
             aria-label="Game name"
+            disabled={history.length > 0} 
           />
-          <button class="secondary" type="button" on:click={startGame}>Start game</button>
+          <button class="secondary" type="button" on:click={startGame} disabled={history.length > 0}>Start game</button>
+          
+          {#if history.length > 0}
+            <!-- Render a clear button alongside Start if they have to clear old data -->
+            <button class="secondary small clear-events" type="button" on:click={clearEvents}>Clear previous game</button>
+          {/if}
         {:else}
           <div class="game-status-info">
             <span class="status-label">Game:</span>
             <span class="game-name-display">{gameName || 'Unnamed'}</span>
-            <div class="scoreboard">
+            <!-- Feature 5: Score display is clickable to open Modal -->
+            <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+            <div class="scoreboard" on:click={() => showTimelineModal = true} title="Click to view Goal Timeline">
               <span class="score-box">{score.mine}</span>
               <span class="score-separator">-</span>
               <span class="score-box">{score.theirs}</span>
@@ -999,7 +1078,7 @@
           <button class="secondary small" type="button" on:click={toggleGameLive}>
             {gameLive ? 'Pause' : 'Resume'}
           </button>
-          <button class="secondary small" type="button" on:click={endGame}>Game over</button>
+          <button class="secondary small warning" type="button" on:click={endGame}>Game over</button>
         {/if}
       </div>
     {/if}
@@ -1302,11 +1381,20 @@
                   {#if ev.detail}
                     <span class="muted" style="margin-left: 0.25rem;">({ev.detail})</span>
                   {/if}
+                  <!-- Feature 4: Render Score inside goal events -->
+                  {#if (ev.event === 'Goal scored' || ev.event === 'Goal conceded') && ev.scoreAtTime}
+                    <span class="muted" style="margin-left: 0.25rem;">
+                      (Score: {ev.scoreAtTime.mine} - {ev.scoreAtTime.theirs})
+                    </span>
+                  {/if}
                 </div>
               {/each}
             </div>
             <div class="history-actions">
-              <button on:click={() => recallLineup(item)}>Recall Lineup</button>
+              <!-- Feature 3: Hide Recall Lineup for single game events -->
+              {#if isLineupRecallable(item)}
+                <button on:click={() => recallLineup(item)}>Recall Lineup</button>
+              {/if}
               <button class="mini" on:click={() => removeHistoryItem(item.id)}>×</button>
             </div>
           </article>
@@ -1413,6 +1501,15 @@
     padding: 0.85rem 1rem;
     border-radius: 0.75rem;
     cursor: pointer;
+  }
+  
+  .secondary:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .secondary.warning {
+    background: #b91c1c; /* A darker red for "Game over" button hover/feel */
   }
 
   .primary {
@@ -2001,6 +2098,9 @@
     width: 100%;
     max-width: 400px;
     box-shadow: 0 20px 40px rgba(0, 0, 0, 0.5);
+    max-height: 90vh;
+    display: flex;
+    flex-direction: column;
   }
 
   .modal-panel h2 {
@@ -2069,6 +2169,12 @@
     flex-direction: column;
     gap: 0.5rem;
   }
+  
+  .timeline-list {
+    overflow-y: auto;
+    margin-bottom: 0;
+    padding-right: 0.5rem;
+  }
 
   .stats-list li {
     display: flex;
@@ -2079,6 +2185,15 @@
     border-radius: 0.5rem;
     border: 1px solid #334155;
     color: #f8fafc;
+  }
+  
+  .score-timeline-box {
+    background: #000;
+    padding: 0.4rem 0.6rem;
+    border-radius: 0.5rem;
+    font-family: 'Courier New', Courier, monospace;
+    font-weight: bold;
+    font-size: 1.1rem;
   }
 
   .lineup-panel-header {
@@ -2096,6 +2211,12 @@
     border-radius: 0.5rem;
     border: 1px solid #334155;
     font-family: 'Courier New', Courier, monospace;
+    cursor: pointer;
+    transition: box-shadow 0.2s ease;
+  }
+  
+  .scoreboard:hover {
+    box-shadow: 0 0 8px rgba(255, 255, 255, 0.2);
   }
 
   .score-box {
