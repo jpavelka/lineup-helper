@@ -1390,6 +1390,7 @@
             <ul class="list" style="max-height: 400px; overflow-y: auto;">
               {#each gamePlanSequence as step, idx (step.id)}
                 <li class="list-item"
+                    style="padding: 0.5rem;"
                     class:is-dragging={draggedPlanStepId === step.id}
                     animate:flip={{ duration: 250 }}
                     on:dragenter={() => { if (draggedPlanStepId) handlePlanStepSwap(step.id, draggedPlanStepId); }}
@@ -1401,14 +1402,15 @@
                        on:dragend={() => { draggedPlanStepId = null; saveState(); }}>☰</div>
 
                   <div style="display: flex; flex: 1; gap: 0.5rem; align-items: center; flex-wrap: wrap;">
-                    <span style="font-weight: bold; color: #64748b; width: 20px;">{idx + 1}.</span>
-                    <select bind:value={step.presetId} on:change={saveState} style="flex: 1; padding: 0.5rem; border-radius: 0.5rem; background: #0f172a; color: white; border: 1px solid #334155;">
-                      <option value="">-- Select Preset --</option>
-                      {#each presets as preset}
-                        <option value={preset.id}>{preset.name}</option>
-                      {/each}
-                    </select>
-                    
+                    <div style="display: flex; align-items: center;">
+                      <span style="font-weight: bold; color: #64748b; width: 20px;">{idx + 1}.</span>
+                      <select bind:value={step.presetId} on:change={saveState} style="flex: 1; padding: 0.5rem; border-radius: 0.5rem; background: #0f172a; color: white; border: 1px solid #334155;">
+                        <option value="">-- Select Preset --</option>
+                        {#each presets as preset}
+                          <option value={preset.id}>{preset.name}</option>
+                        {/each}
+                      </select>
+                    </div>
                     <div style="display: flex; align-items: center; gap: 0.25rem;">
                       <input type="number" min="1" max="120" bind:value={step.durationMins} on:change={saveState} style="width: 60px; padding: 0.5rem; border-radius: 0.5rem; background: #0f172a; color: white; border: 1px solid #334155; text-align: center;" />
                       <span class="muted">mins</span>
@@ -2705,6 +2707,7 @@
     max-height: 90vh;
     display: flex;
     flex-direction: column;
+    overflow-y: auto;
   }
 
   .large-modal {
