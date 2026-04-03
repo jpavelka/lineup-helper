@@ -36,11 +36,17 @@
   let touchDrag = null;
   let draggedPosId = null;
   let lineupRosterSort = 'name'; 
-  let now = Date.now(); 
+  let now = Date.now();
+
+  let showEditModal = false;
+  let editingItem = null;
+  let editMin = 0;
+  let editSec = 0;
+  let editCascade = true;
 
   // Modal State
   let showEventModal = false;
-  let showTimelineModal = false; // Added for Feature 5
+  let showTimelineModal = false;
   let eventType = 'goal'; // 'goal' or 'booking'
   let eventTeam = 'mine'; // 'mine' or 'theirs'
   let eventScorer = '';
@@ -326,10 +332,10 @@
     
     if (eventType === 'goal') {
       if (eventTeam === 'theirs') {
-        currentScore.theirs += 1; // Update copy for feature 4
+        currentScore.theirs += 1;
         events.push({ event: 'Goal conceded', playerId: null, detail: '', scoreAtTime: { ...currentScore } });
       } else {
-        currentScore.mine += 1; // Update copy for feature 4
+        currentScore.mine += 1;
         events.push({ event: 'Goal scored', playerId: eventScorer, detail: '', scoreAtTime: { ...currentScore } });
         if (eventAssist) {
           events.push({ event: 'Goal assisted', playerId: eventAssist, detail: '' });
@@ -355,7 +361,7 @@
   }
 
   function startGame() {
-    // Feature 2: Prevent new game from starting if uncleared game history exists
+    // Prevent new game from starting if uncleared game history exists
     if (history.length > 0) return;
 
     const hasEmpty = positions.some(p => !lineup[p.id]);
@@ -412,7 +418,7 @@
   }
 
   function endGame() {
-    // Feature 1: Confirm user intent to end the game
+    // Confirm user intent to end the game
     if (!confirm("Are you sure you want to end the game?")) return;
 
     commitTime();
@@ -697,6 +703,134 @@
     return `${minutes}:${seconds.toString().padStart(2, '0')}`;
   }
 
+  function openEditModal(item) {
+    if (gameLive) {
+      // CRITICAL: If the game is running, lock the elapsed live time into the history 
+      // BEFORE we open the editor, otherwise the gap time will be lost during recalculation.
+      commitTime();
+      addHistoryEntry([{ event: 'Timeline sync', playerId: null, detail: 'Sync before edit' }]);
+    }
+    
+    editingItem = JSON.parse(JSON.stringify(item)); // Deep copy
+    const tMs = editingItem.events[0]?.gameTime || 0;
+    const totalSec = Math.floor(tMs / 1000);
+    editMin = Math.floor(totalSec / 60);
+    editSec = totalSec % 60;
+    editCascade = true;
+    showEditModal = true;
+  }
+
+  function saveEdit() {
+    const originalTimeMs = history.find(h => h.id === editingItem.id)?.events[0]?.gameTime || 0;
+    const newTimeMs = (editMin * 60 + editSec) * 1000;
+    const delta = newTimeMs - originalTimeMs;
+    const itemCreatedDate = new Date(editingItem.created);
+
+    history = history.map(h => {
+      // 1. Update the specific item we are editing
+      if (h.id === editingItem.id) {
+         editingItem.events.forEach(e => e.gameTime = newTimeMs);
+         return editingItem;
+      }
+      // 2. Cascade shift to subsequent events (if checkbox is checked)
+      if (editCascade && delta !== 0) {
+         const hDate = new Date(h.created);
+         if (hDate > itemCreatedDate) {
+            const shifted = { ...h };
+            shifted.events.forEach(e => {
+               e.gameTime = Math.max(0, (e.gameTime || 0) + delta);
+            });
+            return shifted;
+         }
+      }
+      return h;
+    });
+
+    recalculateStatsFromHistory();
+    showEditModal = false;
+  }
+
+  function recalculateStatsFromHistory() {
+    let newTotal = 0;
+    let newPlayerStats = {};
+    
+    // 1. Zero out all player stats
+    roster.forEach(p => {
+      newPlayerStats[p.id] = { 
+        activeTotal: 0, benchTotal: 0, stintActiveTotal: 0, stintBenchTotal: 0, 
+        sessionStart: null, positionTotals: {} 
+      };
+    });
+
+    // 2. Sort history chronologically to "replay" the game
+    let ascHistory = [...history].sort((a, b) => {
+      const aT = a.events[0]?.gameTime || 0;
+      const bT = b.events[0]?.gameTime || 0;
+      if (aT === bT) return new Date(a.created) - new Date(b.created);
+      return aT - bT;
+    });
+
+    let lastTime = 0;
+    let isLive = false;
+    let curLineup = {};
+
+    // 3. Replay the timeline
+    ascHistory.forEach(item => {
+      const t = item.events[0]?.gameTime || 0;
+      const delta = Math.max(0, t - lastTime);
+
+      // Add time elapsed since the last event to the lineup that was on the field
+      if (isLive && delta > 0) {
+        newTotal += delta;
+        const actives = new Set(Object.values(curLineup).filter(Boolean));
+        
+        roster.forEach(p => {
+          if (actives.has(p.id)) {
+            newPlayerStats[p.id].activeTotal += delta;
+            newPlayerStats[p.id].stintActiveTotal += delta;
+            const pos = Object.keys(curLineup).find(k => curLineup[k] === p.id);
+            if (pos) newPlayerStats[p.id].positionTotals[pos] = (newPlayerStats[p.id].positionTotals[pos] || 0) + delta;
+          } else {
+            newPlayerStats[p.id].benchTotal += delta;
+            newPlayerStats[p.id].stintBenchTotal += delta;
+          }
+        });
+      }
+
+      // Process state changes caused by THIS event
+      const events = item.events.map(e => e.event);
+      if (events.includes('Game started') || events.includes('Game resumed')) isLive = true;
+      if (events.includes('Game paused') || events.includes('Game stopped')) isLive = false;
+
+      // Reset stint clocks if a player was subbed
+      const oldIds = new Set(Object.values(curLineup).filter(Boolean));
+      const newIds = new Set(Object.values(item.lineup).filter(Boolean));
+      roster.forEach(p => {
+        if (oldIds.has(p.id) !== newIds.has(p.id)) {
+          newPlayerStats[p.id].stintActiveTotal = 0;
+          newPlayerStats[p.id].stintBenchTotal = 0;
+        }
+      });
+
+      curLineup = item.lineup;
+      lastTime = t;
+    });
+
+    // 4. Update the global live tracking
+    gameTimeStats.total = newTotal;
+    if (gameLive) {
+      const now = Date.now();
+      gameTimeStats.sessionStart = now;
+      roster.forEach(p => newPlayerStats[p.id].sessionStart = now);
+    } else {
+      gameTimeStats.sessionStart = null;
+    }
+    
+    playerTimeStats = newPlayerStats;
+    history = ascHistory.reverse(); // Flip back to descending order for the UI list
+    saveState();
+  }
+
   $: liveGameTime = gameTimeStats.total + (gameLive && gameTimeStats.sessionStart ? now - gameTimeStats.sessionStart : 0);
 
   $: rosterPlayers = roster.map((player) => {
@@ -803,7 +937,7 @@
     return acc;
   }, { mine: 0, theirs: 0 });
 
-  // Feature 5: Derived chronological timeline of goals from history
+  // Derived chronological timeline of goals from history
   $: goalTimeline = [...history].reverse().flatMap(item => 
     item.events
       .filter(e => e.event === 'Goal scored' || e.event === 'Goal conceded')
@@ -875,9 +1009,11 @@
     saveState();
   }
 
-  // Feature 3: Determine if the history entry can be recalled (hide recall on goals/cards)
+  // Determine if the history entry can be recalled (hide recall on goals/cards)
   function isLineupRecallable(item) {
-    const nonRecallableEvents = ['Goal scored', 'Goal conceded', 'Goal assisted', 'Yellow card', 'Red card'];
+    const nonRecallableEvents = [
+      'Goal scored', 'Goal conceded', 'Goal assisted', 'Yellow card', 'Red card', 'Game resumed', 'Game paused', 'Game stopped'
+    ];
     return !item.events.some(e => nonRecallableEvents.includes(e.event));
   }
 
@@ -999,7 +1135,7 @@
   </div>
 {/if}
 
-<!-- Feature 5: Timeline Score Modal -->
+<!-- Timeline Score Modal -->
 {#if showTimelineModal}
   <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
   <div class="modal-backdrop" on:click={() => showTimelineModal = false}>
@@ -1080,6 +1216,54 @@
   </div>
 {/if}
 
+{#if showEditModal && editingItem}
+  <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+  <div class="modal-backdrop" on:click={() => showEditModal = false}>
+    <div class="modal-panel" on:click|stopPropagation>
+      <h2>Edit Timeline Event</h2>
+      
+      <div class="form-group">
+        <label>Game Time (Min : Sec)</label>
+        <div style="display: flex; gap: 0.5rem; align-items: center;">
+          <input type="number" min="0" bind:value={editMin} style="width: 80px; padding: 0.75rem; border-radius: 0.5rem; background: #0f172a; border: 1px solid #334155; color: white; text-align: center;" />
+          <span style="color: white; font-weight: bold;">:</span>
+          <input type="number" min="0" max="59" bind:value={editSec} style="width: 80px; padding: 0.75rem; border-radius: 0.5rem; background: #0f172a; border: 1px solid #334155; color: white; text-align: center;" />
+        </div>
+      </div>
+
+      <div class="form-group" style="flex-direction: row; align-items: center; gap: 0.75rem; margin-top: 0.5rem;">
+        <input type="checkbox" id="edit-cascade" bind:checked={editCascade} style="width: 1.25rem; height: 1.25rem; accent-color: #2563eb;" />
+        <label for="edit-cascade" style="margin: 0; cursor: pointer; line-height: 1.4;">
+          Shift all subsequent events by the same amount 
+          <br/><small class="muted">(Keeps the rest of the game chronological)</small>
+        </label>
+      </div>
+
+      <hr style="border: none; border-top: 1px solid #334155; margin: 1.5rem 0;" />
+
+      {#each editingItem.events as ev}
+        <!-- Allow editing of Players involved in specific events -->
+        {#if ['Goal scored', 'Goal assisted', 'Yellow card', 'Red card'].includes(ev.event)}
+          <div class="form-group">
+            <label>{ev.event} Player</label>
+            <select bind:value={ev.playerId}>
+              <option value="">-- Unknown / None --</option>
+              {#each roster as p}
+                <option value={p.id}>{p.name}</option>
+              {/each}
+            </select>
+          </div>
+        {/if}
+      {/each}
+
+      <div class="modal-actions">
+        <button class="secondary" on:click={() => showEditModal = false}>Cancel</button>
+        <button class="primary" on:click={saveEdit}>Save Changes</button>
+      </div>
+    </div>
+  </div>
+{/if}
+
 {#if activeStatsPlayer}
   <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
   <div class="modal-backdrop" on:click={() => viewingPlayerId = null}>
@@ -1132,7 +1316,7 @@
     {#if !showManager}
       <div class="game-status">
         {#if !gameStartedAt}
-          <!-- Feature 2: Disable starting a game if uncleared data exists -->
+          <!-- Disable starting a game if uncleared data exists -->
           <input 
             type="text" 
             placeholder="Game name (optional)" 
@@ -1148,24 +1332,27 @@
             <button class="secondary small clear-events" type="button" on:click={clearEvents}>Clear previous game</button>
           {/if}
         {:else}
-          <div class="game-status-info">
+          <div>
             <span class="status-label">Game:</span>
             <span class="game-name-display">{gameName || 'Unnamed'}</span>
-            <!-- Feature 5: Score display is clickable to open Modal -->
+          </div>
+          <div class="game-status-info">
             <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+            <span class="status-label">Time:</span>
+            <span class="game-clock">{formatDuration(liveGameTime)}</span>
             <div class="scoreboard" on:click={() => showTimelineModal = true} title="Click to view Goal Timeline">
               <span class="score-box">{score.mine}</span>
               <span class="score-separator">-</span>
               <span class="score-box">{score.theirs}</span>
             </div>
-            <span class="status-label">Time:</span>
-            <span class="game-clock">{formatDuration(liveGameTime)}</span>
             <span class="status-chip {gameLive ? 'live' : 'stopped'}">{gameLive ? 'Live' : 'Paused'}</span>
           </div>
-          <button class="secondary small" type="button" on:click={toggleGameLive}>
-            {gameLive ? 'Pause' : 'Resume'}
-          </button>
-          <button class="secondary small warning" type="button" on:click={endGame}>Game over</button>
+          <div>
+            <button class="secondary small" type="button" on:click={toggleGameLive}>
+              {gameLive ? 'Pause' : 'Resume'}
+            </button>
+            <button class="secondary small warning" type="button" on:click={endGame}>Game over</button>
+          </div>
         {/if}
       </div>
     {/if}
@@ -1177,11 +1364,11 @@
     <section class="panel lineup-panel">
       <div class="lineup-panel-header">
         <h2>Lineup Editor</h2>
-        <div>
-          <button class="secondary small" type="button" on:click={() => showPresetsModal = true}>Presets</button>
-          <button class="secondary small" style="background:#7f1d1d" type="button" on:click={clearLineup}>Clear</button>
-          <button class="secondary small" type="button" on:click={saveCurrentLineup}>Apply</button>
-        </div>
+      </div>
+      <div class='lineup-action-buttons-panel'>
+        <button class="secondary small" style="background:#7f1d1d" type="button" on:click={clearLineup}>Clear</button>
+        <button class="secondary small" type="button" on:click={() => showPresetsModal = true}>Presets</button>
+        <button class="secondary small" type="button" on:click={saveCurrentLineup}>Apply</button>
       </div>
       <div class="list-columns">
         <div class="list-column lineup-column">
@@ -1320,6 +1507,15 @@
                             </svg>
                           {/if}
                         </div>
+                      </div>
+                      
+                      <div class="roster-item-stats">
+                        <div>Field total: {formatDuration(player.activeDurationMs)}</div>
+                        {#if player.inLiveLineup}
+                          <div class="time-active">Field stint: {formatDuration(player.stintActiveMs)}</div>
+                        {:else}
+                          <div class="time-bench">Bench stint: {formatDuration(player.stintBenchMs)}</div>
+                        {/if}
                       </div>
                     </div>
                     
@@ -1468,45 +1664,51 @@
           <button disabled={history.length === 0} class="secondary small clear-events" type="button" on:click={clearEvents}>Clear</button>
         </div>
       </div>
-
     {#if history.length === 0}
       <p class="muted">No game events yet. Start, pause, resume, or stop the game to record events.</p>
     {:else}
-      <div class="history-list">
-        {#each history as item (item.id)}
-          <article class="history-item">
-            <div class="history-item-events">
-              <div class="muted" style="margin-bottom: 0.25rem;">{new Date(item.created).toLocaleTimeString()}</div>
-              {#each item.events as ev}
-                <div>
-                  <span class="muted" style="margin-right: 0.4rem; font-variant-numeric: tabular-nums;">
-                    [{formatDuration(ev.gameTime || 0)}]
-                  </span>
-                  <strong>{ev.event}</strong>
-                  {#if ev.playerId}
-                    - <span style="color: #cbd5e1;">{getPlayerNameFromRoster(ev.playerId, item.roster)}</span>
-                  {/if}
-                  {#if ev.detail}
-                    <span class="muted" style="margin-left: 0.25rem;">({ev.detail})</span>
-                  {/if}
-                  <!-- Feature 4: Render Score inside goal events -->
-                  {#if (ev.event === 'Goal scored' || ev.event === 'Goal conceded') && ev.scoreAtTime}
-                    <span class="muted" style="margin-left: 0.25rem;">
-                      (Score: {ev.scoreAtTime.mine} - {ev.scoreAtTime.theirs})
+      <div class="scroll-box">
+        <div class="history-list">
+          {#each history as item (item.id)}
+            <article class="history-item">
+              <div class="history-item-events">
+                <div class="muted" style="margin-bottom: 0.25rem;">{new Date(item.created).toLocaleTimeString()}</div>
+                {#each item.events as ev}
+                  <div>
+                    <span class="muted" style="margin-right: 0.4rem; font-variant-numeric: tabular-nums;">
+                      [{formatDuration(ev.gameTime || 0)}]
                     </span>
-                  {/if}
-                </div>
-              {/each}
-            </div>
-            <div class="history-actions">
-              <!-- Feature 3: Hide Recall Lineup for single game events -->
-              {#if isLineupRecallable(item)}
-                <button on:click={() => recallLineup(item)}>Recall Lineup</button>
-              {/if}
-              <button class="mini" on:click={() => removeHistoryItem(item.id)}>×</button>
-            </div>
-          </article>
-        {/each}
+                    <strong>{ev.event}</strong>
+                    {#if ev.playerId}
+                      - <span style="color: #cbd5e1;">{getPlayerNameFromRoster(ev.playerId, item.roster)}</span>
+                    {/if}
+                    {#if ev.detail}
+                      <span class="muted" style="margin-left: 0.25rem;">({ev.detail})</span>
+                    {/if}
+                    <!-- Render Score inside goal events -->
+                    {#if (ev.event === 'Goal scored' || ev.event === 'Goal conceded') && ev.scoreAtTime}
+                      <span class="muted" style="margin-left: 0.25rem;">
+                        (Score: {ev.scoreAtTime.mine} - {ev.scoreAtTime.theirs})
+                      </span>
+                    {/if}
+                  </div>
+                {/each}
+              </div>
+              <div class="history-actions">
+                {#if isLineupRecallable(item)}
+                  <button on:click={() => recallLineup(item)}>Recall Lineup</button>
+                {/if}
+                <button class="secondary small" on:click={() => openEditModal(item)} title="Edit Event" style="padding: 0.5rem;">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path>
+                    <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path>
+                  </svg>
+                </button>
+                <button class="mini" on:click={() => removeHistoryItem(item.id)}>×</button>
+              </div>
+            </article>
+          {/each}
+        </div>
       </div>
     {/if}
   </section>
@@ -1871,6 +2073,15 @@
     flex: 1;
     min-width: 0;
     color: #f8fafc;
+  }
+
+  .roster-item-stats {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 0.15rem;
+    font-size: 0.85rem;
+    color: #94a3b8;
   }
 
   .time-active {
@@ -2346,5 +2557,11 @@
     align-items: center;
     justify-content: center;
     margin-left: 0.25rem;
+  }
+
+  .lineup-action-buttons-panel {
+    display: flex;
+    justify-content: flex-end;
+    gap: 5pt;
   }
 </style>
