@@ -1,6 +1,7 @@
 <script>
   import { onMount } from 'svelte';
   import { flip } from 'svelte/animate';
+  import { fade } from 'svelte/transition';
 
   const STORAGE_KEY = 'lineup-helper-state';
 
@@ -38,6 +39,8 @@
   let touchDrag = null;
   let draggedPosId = null;
   let lineupRosterSort = 'status'; 
+  let barMode = 'aggregate'; // 'aggregate' or 'chrono'
+  let planTab = 'players'; // 'players', 'positions', 'groups'
   let now = Date.now();
 
   let showEditModal = false;
@@ -68,18 +71,37 @@
   let viewingPlayerId = null; 
   let viewingPlannedPlayerId = null;
 
+  // Preset Editor Modal
+  let presetEditorObj = null; 
+  let presetEditorSelectedItem = null;
+
+  // Toasts
+  let toasts = [];
+
   const PALETTE = [
     '#3b82f6', '#ef4444', '#10b981', '#f59e0b', 
     '#8b5cf6', '#ec4899', '#06b6d4', '#f97316', 
     '#84cc16', '#6366f1'
   ];
 
-  // Map groups to colors, manually ensuring 'Bench' is a distinct gray
   $: groupColors = [...new Set(positions.map(p => (p.parent || p.name).trim() || 'Unknown'))]
     .reduce((acc, group, idx) => {
       acc[group] = PALETTE[idx % PALETTE.length];
       return acc;
     }, { 'Bench': '#475569' });
+
+  function showToast(msg) {
+    const id = Date.now();
+    toasts = [...toasts, { id, msg }];
+    setTimeout(() => {
+      toasts = toasts.filter(t => t.id !== id);
+    }, 4000);
+  }
+
+  function getGroupForPos(posId) {
+    const posDef = positions.find(p => p.id === posId);
+    return posDef ? (posDef.parent || posDef.name).trim() || 'Unknown' : 'Unknown';
+  }
 
   function loadState() {
     const raw = localStorage.getItem(STORAGE_KEY);
@@ -186,9 +208,22 @@
     const validPositionIds = new Set(positions.map(p => p.id));
     
     let cleanedLineup = {};
+    let missingCount = 0;
+    
     for (const posId in loadedLineup) {
       if (validPositionIds.has(posId)) {
-         cleanedLineup[posId] = loadedLineup[posId];
+         const playerId = loadedLineup[posId];
+         if (playerId) {
+           const player = roster.find(p => p.id === playerId);
+           if (player && player.available) {
+             cleanedLineup[posId] = playerId;
+           } else {
+             cleanedLineup[posId] = null;
+             missingCount++;
+           }
+         } else {
+           cleanedLineup[posId] = null;
+         }
       }
     }
     
@@ -196,6 +231,10 @@
     ensureLineupSlots();
     saveState();
     showPresetsModal = false;
+
+    if (missingCount > 0) {
+      showToast(`${missingCount} player${missingCount > 1 ? 's' : ''} currently unavailable in the preset lineup. Position${missingCount > 1 ? 's' : ''} left empty.`);
+    }
   }
 
   function deletePreset(id) {
@@ -241,6 +280,57 @@
     saveState();
   }
 
+  // --- Preset Editor Modal Logic ---
+  function openPresetEditor(preset) {
+    presetEditorObj = JSON.parse(JSON.stringify(preset));
+    presetEditorSelectedItem = null;
+  }
+
+  function savePresetEditor() {
+    const idx = presets.findIndex(p => p.id === presetEditorObj.id);
+    if (idx >= 0) {
+      presets[idx] = presetEditorObj;
+      presets = [...presets];
+      saveState();
+    }
+    presetEditorObj = null;
+    presetEditorSelectedItem = null;
+  }
+
+  function handlePresetSlotClick(posId) {
+    if (presetEditorSelectedItem) {
+        let newLineup = { ...presetEditorObj.lineup };
+        if (presetEditorSelectedItem.sourceType === 'presetRoster') {
+            newLineup[posId] = presetEditorSelectedItem.id;
+        } else if (presetEditorSelectedItem.sourceType === 'presetSlot') {
+            const src = presetEditorSelectedItem.id;
+            newLineup[src] = presetEditorObj.lineup[posId];
+            newLineup[posId] = presetEditorObj.lineup[src];
+        }
+        presetEditorObj.lineup = newLineup;
+        presetEditorSelectedItem = null;
+    } else {
+        presetEditorSelectedItem = { sourceType: 'presetSlot', id: posId };
+    }
+  }
+
+  function handlePresetRosterClick(playerId) {
+    if (presetEditorSelectedItem && presetEditorSelectedItem.sourceType === 'presetSlot') {
+        let newLineup = { ...presetEditorObj.lineup };
+        newLineup[presetEditorSelectedItem.id] = playerId;
+        presetEditorObj.lineup = newLineup;
+        presetEditorSelectedItem = null;
+    } else {
+        presetEditorSelectedItem = { sourceType: 'presetRoster', id: playerId };
+    }
+  }
+
+  function removePlayerFromPresetSlot(posId) {
+    let newLineup = { ...presetEditorObj.lineup };
+    newLineup[posId] = null;
+    presetEditorObj.lineup = newLineup;
+  }
+
   function autoFocus(node) {
     node.focus();
   }
@@ -274,6 +364,7 @@
   $: plannedRosterPlayers = roster.map(player => {
     let activeMins = 0;
     let positionTotals = {};
+    let chronoSegments = [];
 
     gamePlanSequence.forEach(step => {
       if (!step.presetId || !step.durationMins) return;
@@ -281,9 +372,20 @@
       if (!preset) return;
 
       const posId = Object.keys(preset.lineup).find(k => preset.lineup[k] === player.id);
+      const group = posId ? getGroupForPos(posId) : 'Bench';
+      const pct = totalPlanMins > 0 ? (step.durationMins / totalPlanMins) * 100 : 0;
+
       if (posId) {
         activeMins += step.durationMins;
         positionTotals[posId] = (positionTotals[posId] || 0) + step.durationMins;
+      }
+      
+      if (pct > 0) {
+        if (chronoSegments.length > 0 && chronoSegments[chronoSegments.length-1].group === group) {
+            chronoSegments[chronoSegments.length-1].pct += pct;
+        } else {
+            chronoSegments.push({ group, pct });
+        }
       }
     });
 
@@ -296,34 +398,17 @@
     const totalDurationMs = totalPlanMins * 60 * 1000;
 
     if (totalDurationMs > 0) {
-      // 1. Add active field time segments
       for (let posId in positionTotals) {
         const pMins = positionTotals[posId];
         const posDef = positions.find(p => p.id === posId);
         const pName = posDef ? posDef.name : 'Unknown';
         const pGroup = posDef ? (posDef.parent || posDef.name).trim() || 'Unknown' : 'Unknown';
 
-        positionSegments.push({
-          posId,
-          group: pGroup,
-          pct: (pMins / totalPlanMins) * 100
-        });
-
-        positionDetails.push({
-          posId,
-          name: pName,
-          group: pGroup,
-          durationMs: pMins * 60 * 1000
-        });
+        positionSegments.push({ posId, group: pGroup, pct: (pMins / totalPlanMins) * 100 });
+        positionDetails.push({ posId, name: pName, group: pGroup, durationMs: pMins * 60 * 1000 });
       }
-      
-      // 2. Add bench time segment to fill out the 100% bar
       if (benchMins > 0) {
-        positionSegments.push({
-          posId: 'bench',
-          group: 'Bench',
-          pct: (benchMins / totalPlanMins) * 100
-        });
+        positionSegments.push({ posId: 'bench', group: 'Bench', pct: (benchMins / totalPlanMins) * 100 });
       }
     }
 
@@ -334,9 +419,103 @@
       activeDurationMs,
       benchDurationMs,
       positionSegments,
+      chronoSegments,
       positionDetails
     };
   }).sort((a, b) => b.activeDurationMs - a.activeDurationMs || a.name.localeCompare(b.name));
+
+  $: planPositionTotals = positions.map(pos => {
+      const players = [];
+      plannedRosterPlayers.forEach(p => {
+          const posDetail = p.positionDetails.find(d => d.posId === pos.id);
+          if (posDetail && posDetail.durationMs > 0) players.push({ player: p, durationMs: posDetail.durationMs });
+      });
+      players.sort((a,b) => b.durationMs - a.durationMs);
+      const totalMs = players.reduce((sum, x) => sum + x.durationMs, 0);
+      return { ...pos, players, totalMs };
+  }).filter(pos => pos.totalMs > 0).sort((a,b) => b.totalMs - a.totalMs);
+
+  $: planGroupTotals = Object.entries(
+       plannedRosterPlayers.reduce((acc, p) => {
+           p.positionDetails.forEach(d => {
+               if(!acc[d.group]) acc[d.group] = { group: d.group, players: {}, totalMs: 0 };
+               acc[d.group].players[p.id] = (acc[d.group].players[p.id]||0) + d.durationMs;
+               acc[d.group].totalMs += d.durationMs;
+           });
+           return acc;
+       }, {})
+  ).map(([group, data]) => {
+       const players = Object.entries(data.players).map(([pId, ms]) => ({
+           player: plannedRosterPlayers.find(p=>p.id===pId),
+           durationMs: ms
+       })).sort((a,b) => b.durationMs - a.durationMs);
+       return { group, players, totalMs: data.totalMs };
+  }).sort((a,b) => b.totalMs - a.totalMs);
+
+  function exportPlanCsv() {
+    if (gamePlanSequence.length === 0) {
+        showToast("Game plan is empty.");
+        return;
+    }
+    let rows = [];
+    
+    // Table 1: Chronological Steps
+    rows.push(["CHRONOLOGICAL SEQUENCE"]);
+    rows.push(["Step", "Duration (mins)", "Position", "Player"]);
+    gamePlanSequence.forEach((step, idx) => {
+        const preset = presets.find(p => p.id === step.presetId);
+        if(preset) {
+            positions.forEach(pos => {
+                const pId = preset.lineup[pos.id];
+                const pName = getPlayerNameFromRoster(pId, roster);
+                if(pName) rows.push([idx+1, step.durationMins, pos.name, pName]);
+            });
+        }
+    });
+    rows.push([]);
+    
+    // Table 2: Player vs Position
+    rows.push(["PLAYER VS POSITION"]);
+    const posHeaders = positions.map(p => p.name);
+    rows.push(["Player", ...posHeaders, "Bench", "Total"]);
+    plannedRosterPlayers.forEach(p => {
+        const row = [p.name];
+        positions.forEach(pos => {
+            const detail = p.positionDetails.find(d => d.posId === pos.id);
+            row.push(detail ? (detail.durationMs / 60000).toFixed(1) : "0");
+        });
+        row.push((p.benchDurationMs / 60000).toFixed(1));
+        row.push(((p.activeDurationMs + p.benchDurationMs) / 60000).toFixed(1));
+        rows.push(row);
+    });
+    rows.push([]);
+    
+    // Table 3: Player vs Position Group
+    rows.push(["PLAYER VS POSITION GROUP"]);
+    const groups = [...new Set(positions.map(p => getGroupForPos(p.id)))];
+    rows.push(["Player", ...groups, "Bench", "Total"]);
+    plannedRosterPlayers.forEach(p => {
+        const row = [p.name];
+        groups.forEach(g => {
+            const ms = p.positionDetails.filter(d => d.group === g).reduce((sum, d) => sum + d.durationMs, 0);
+            row.push((ms / 60000).toFixed(1));
+        });
+        row.push((p.benchDurationMs / 60000).toFixed(1));
+        row.push(((p.activeDurationMs + p.benchDurationMs) / 60000).toFixed(1));
+        rows.push(row);
+    });
+
+    const csv = rows.map(r => r.map(csvEscape).join(',')).join('\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.setAttribute('download', `game-plan-export.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  }
 
   $: activePlannedStatsPlayer = viewingPlannedPlayerId ? plannedRosterPlayers.find(p => p.id === viewingPlannedPlayerId) : null;
 
@@ -709,6 +888,7 @@
       if (showGamePlanModal) showGamePlanModal = false;
       if (showEditModal) showEditModal = false;
       if (editingPresetId) editingPresetId = null;
+      if (presetEditorObj) { presetEditorObj = null; presetEditorSelectedItem = null; }
     }
   }
 
@@ -961,6 +1141,63 @@
 
   $: liveGameTime = gameTimeStats.total + (gameLive && gameTimeStats.sessionStart ? now - gameTimeStats.sessionStart : 0);
 
+  $: playerChronoSegments = (() => {
+    let chrono = {};
+    roster.forEach(p => chrono[p.id] = []);
+    const totalTimeMs = Math.max(1, liveGameTime);
+    
+    let ascHistory = [...history].sort((a,b) => {
+      const aT = a.events[0]?.gameTime || 0;
+      const bT = b.events[0]?.gameTime || 0;
+      if (aT === bT) return new Date(a.created) - new Date(b.created);
+      return aT - bT;
+    });
+
+    let lastTime = 0;
+    let currentLineup = {};
+    let isLive = false;
+
+    ascHistory.forEach(item => {
+        const t = item.events[0]?.gameTime || 0;
+        const delta = Math.max(0, t - lastTime);
+
+        if (isLive && delta > 0) {
+            roster.forEach(p => {
+                const posId = Object.keys(currentLineup).find(k => currentLineup[k] === p.id);
+                const group = posId ? getGroupForPos(posId) : 'Bench';
+                const pct = (delta / totalTimeMs) * 100;
+                if(pct > 0) {
+                    let arr = chrono[p.id];
+                    if(arr.length > 0 && arr[arr.length-1].group === group) arr[arr.length-1].pct += pct;
+                    else arr.push({ group, pct });
+                }
+            });
+        }
+
+        const events = item.events.map(e => e.event);
+        if (events.includes('Game started') || events.includes('Game resumed')) isLive = true;
+        if (events.includes('Game paused') || events.includes('Game stopped')) isLive = false;
+
+        currentLineup = item.lineup;
+        lastTime = t;
+    });
+
+    if (gameLive && liveGameTime > lastTime) {
+        const delta = liveGameTime - lastTime;
+        roster.forEach(p => {
+            const posId = Object.keys(currentLineup).find(k => currentLineup[k] === p.id);
+            const group = posId ? getGroupForPos(posId) : 'Bench';
+            const pct = (delta / totalTimeMs) * 100;
+            if(pct > 0) {
+                let arr = chrono[p.id];
+                if(arr.length > 0 && arr[arr.length-1].group === group) arr[arr.length-1].pct += pct;
+                else arr.push({ group, pct });
+            }
+        });
+    }
+    return chrono;
+  })();
+
   $: rosterPlayers = roster.map((player) => {
     const stats = playerTimeStats[player.id];
     let activeSession = 0;
@@ -991,7 +1228,6 @@
     let positionDetails = [];
 
     if (totalDurationMs > 0) {
-      // 1. Add active field time segments
       for (let posId in currentPositionTotals) {
         const pTime = currentPositionTotals[posId];
         if (pTime > 0) {
@@ -999,28 +1235,13 @@
            const pName = posDef ? posDef.name : 'Unknown';
            const pGroup = posDef ? (posDef.parent || posDef.name).trim() || 'Unknown' : 'Unknown';
            
-           positionSegments.push({
-             posId,
-             group: pGroup,
-             pct: (pTime / totalDurationMs) * 100
-           });
-
-           positionDetails.push({
-             posId,
-             name: pName,
-             group: pGroup,
-             durationMs: pTime
-           });
+           positionSegments.push({ posId, group: pGroup, pct: (pTime / totalDurationMs) * 100 });
+           positionDetails.push({ posId, name: pName, group: pGroup, durationMs: pTime });
         }
       }
       
-      // 2. Add bench time segment to fill out the 100% bar
       if (benchDurationMs > 0) {
-        positionSegments.push({
-          posId: 'bench',
-          group: 'Bench',
-          pct: (benchDurationMs / totalDurationMs) * 100
-        });
+        positionSegments.push({ posId: 'bench', group: 'Bench', pct: (benchDurationMs / totalDurationMs) * 100 });
       }
     }
     
@@ -1035,11 +1256,12 @@
       inLiveLineup,
       inDraftLineup,
       positionSegments,
+      chronoSegments: playerChronoSegments[player.id] || [],
       positionDetails
     };
   });
 
-  $: sortedManagerRoster = [...rosterPlayers].sort((a,b) => {
+  $: sortedManagerRoster = [...roster].sort((a,b) => {
     return a.name.localeCompare(b.name);
   });
 
@@ -1177,6 +1399,16 @@
     }
   }
 
+  function getPlayerPositionGroupDetails(p) {
+    const groupMap = {};
+    p.positionDetails.forEach(d => {
+      if (!groupMap[d.group]) groupMap[d.group] = 0;
+      groupMap[d.group] += d.durationMs;
+    });
+    const sortedGroups = Object.keys(groupMap).sort((a,b) => groupMap[b] - groupMap[a]);
+    return sortedGroups.map(g => ({group: g, durationMs: groupMap[g]}));
+  }
+
   onMount(() => {
     loadState();
     const timer = setInterval(() => {
@@ -1194,6 +1426,12 @@
   on:pointercancel={cancelTouchDrag}
   on:keydown={handleKeydown} 
 />
+
+<div class="toast-container">
+  {#each toasts as toast (toast.id)}
+     <div class="toast" transition:fade>{toast.msg}</div>
+  {/each}
+</div>
 
 {#if showEventModal}
   <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
@@ -1302,6 +1540,7 @@
   </div>
 {/if}
 
+<!-- PRESETS MODAL -->
 {#if showPresetsModal}
   <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
   <div class="modal-backdrop" on:click={() => showPresetsModal = false}>
@@ -1349,6 +1588,7 @@
               </div>
 
               <div style="display: flex; gap: 0.5rem; margin-left: 0.5rem;">
+                <button class="secondary small" on:click={() => openPresetEditor(preset)}>Edit</button>
                 <button class="secondary small" on:click={() => loadPreset(preset)}>Load</button>
                 <button class="secondary small" style="background:#7f1d1d; min-width: 0; padding: 0.5rem;" on:click={() => deletePreset(preset.id)}>
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -1369,25 +1609,102 @@
   </div>
 {/if}
 
+<!-- PRESET EDITOR MODAL -->
+{#if presetEditorObj}
+  <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+  <div class="modal-backdrop preset-editor-backdrop" on:click={() => { presetEditorObj = null; presetEditorSelectedItem = null; }} style="z-index: 1002;">
+    <div class="modal-panel large-modal preset-editor-panel" on:click|stopPropagation style="max-height: 95vh; display: flex; flex-direction: column;">
+      <h2>Editing Preset: {presetEditorObj.name}</h2>
+      
+      <div class="list-columns" style="flex: 1; min-height: 0; overflow: hidden;">
+        <div class="list-column lineup-column" style="display: flex; flex-direction: column;">
+          <h3 style="margin-top:0;">Lineup Slots</h3>
+          <div class="scroll-box" style="flex: 1;">
+            <ul class="lineup-list">
+              {#each positions as position}
+                <li>
+                  <div class="lineup-item"
+                        class:selected={presetEditorSelectedItem?.sourceType === 'presetSlot' && presetEditorSelectedItem?.id === position.id}
+                        class:empty-slot={!presetEditorObj.lineup[position.id]}
+                        on:click={() => handlePresetSlotClick(position.id)}
+                        role="button" tabindex="0" on:keydown={(e) => handleKeyboardAction(e, () => handlePresetSlotClick(position.id))}>
+                    <div class="lineup-row">
+                        <div class="position-badge">
+                          <span class="position-name">{position.name}</span>
+                          <div class="position-color-bar" style="background-color: {groupColors[(position.parent || position.name).trim() || 'Unknown']}"></div>
+                        </div>
+                        <span class="player-name">
+                          {#if presetEditorObj.lineup[position.id]}
+                              {getPlayerNameFromRoster(presetEditorObj.lineup[position.id], roster)}
+                          {:else}
+                              <span class="slot-empty">Tap player, then tap here</span>
+                          {/if}
+                        </span>
+                        <div class="lineup-item-actions">
+                          {#if presetEditorObj.lineup[position.id]}
+                              <button class="remove-lineup" on:click|stopPropagation={() => removePlayerFromPresetSlot(position.id)}>Remove</button>
+                          {/if}
+                        </div>
+                    </div>
+                  </div>
+                </li>
+              {/each}
+            </ul>
+          </div>
+        </div>
+
+        <div class="list-column roster-column" style="display: flex; flex-direction: column;">
+          <h3 style="margin-top:0;">Available Players</h3>
+          <div class="scroll-box" style="flex: 1;">
+            <ul class="list">
+              {#each roster.filter(p => p.available).sort((a,b) => a.name.localeCompare(b.name)) as player}
+                {@const isDrafted = Object.values(presetEditorObj.lineup).includes(player.id)}
+                <li>
+                  <button class="list-item roster-list-item"
+                      class:selected={presetEditorSelectedItem?.sourceType === 'presetRoster' && presetEditorSelectedItem?.id === player.id}
+                      disabled={isDrafted}
+                      on:click={() => !isDrafted && handlePresetRosterClick(player.id)}>
+                    <div class="roster-item-top">
+                        <div class="roster-item-name">{player.name}</div>
+                        {#if isDrafted}
+                          <svg title="In Preset Lineup" width="14" height="14" viewBox="0 0 24 24" fill="#34d399"><circle cx="12" cy="12" r="8"></circle></svg>
+                        {/if}
+                    </div>
+                  </button>
+                </li>
+              {/each}
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <div class="modal-actions" style="margin-top: 1rem;">
+        <button class="secondary" on:click={() => { presetEditorObj = null; presetEditorSelectedItem = null; }}>Cancel</button>
+        <button class="primary" on:click={savePresetEditor}>Save Changes</button>
+      </div>
+    </div>
+  </div>
+{/if}
+
+
 <!-- GAME PLAN MODAL -->
 {#if showGamePlanModal}
   <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
   <div class="modal-backdrop" on:click={() => showGamePlanModal = false} style="z-index: 999;">
-    <div class="modal-panel large-modal" on:click|stopPropagation>
+    <div class="modal-panel large-modal" on:click|stopPropagation style="max-height: 95vh; display: flex; flex-direction: column;">
       <h2>Game Plan</h2>
-
       {#if presets.length === 0}
         <p class="muted">You need to create some presets in the Lineup Editor first!</p>
       {:else}
-        <div class="grid-layout">
+        <div class="grid-layout" style="flex: 1;">
           <!-- Left Side: Sequence Builder -->
-          <div class="panel">
+          <div class="panel" style="display: flex; flex-direction: column;">
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
               <h3 style="margin: 0; color: #f8fafc;">Rotation Sequence</h3>
               <button class="secondary small" on:click={addPlanStep}>+ Add Step</button>
             </div>
 
-            <ul class="list" style="max-height: 400px; overflow-y: auto;">
+            <ul class="list scroll-box" style="flex: 1;">
               {#each gamePlanSequence as step, idx (step.id)}
                 <li class="list-item"
                     style="padding: 0.5rem;"
@@ -1421,61 +1738,127 @@
                 </li>
               {/each}
               {#if gamePlanSequence.length === 0}
-                <p class="muted">Click '+ Add Step' to start building your game plan.</p>
+                <p class="muted" style="padding: 1rem 0;">Click '+ Add Step' to start building your game plan.</p>
               {/if}
             </ul>
           </div>
 
           <!-- Right Side: Generated Report -->
-          <div class="panel list-column">
-            <h3 style="margin: 0 0 1rem 0; color: #f8fafc;">Estimated Playing Time</h3>
-            <div class="scroll-box" style="max-height: 400px;">
-              <ul class="list">
-                {#each plannedRosterPlayers as player (player.id)}
-                  <li>
-                    <div class="list-item roster-list-item" style="cursor: default; touch-action: auto;">
-                      <div class="roster-item-top">
-                        <div style="display: flex; align-items: center; min-width: 0; gap: 0.5rem; flex: 1;">
-                          <span
-                            class="info-btn"
-                            role="button"
-                            tabindex="0"
-                            on:click|stopPropagation={() => viewingPlannedPlayerId = player.id}
-                            on:keydown={(event) => handleKeyboardAction(event, () => viewingPlannedPlayerId = player.id)}
-                          >
-                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                              <circle cx="12" cy="12" r="10"></circle>
-                              <line x1="12" y1="16" x2="12" y2="12"></line>
-                              <line x1="12" y1="8" x2="12.01" y2="8"></line>
-                            </svg>
-                          </span>
-                          <div class="roster-item-name" style="flex: unset;">{player.name}</div>
-                        </div>
-                        
-                        <div class="roster-item-stats">
-                          <div style="font-weight: bold; color: {player.activeDurationMs > 0 ? '#34d399' : '#94a3b8'}">
-                            {formatDuration(player.activeDurationMs)}
+          <div class="panel list-column" style="display: flex; flex-direction: column;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
+              <h3 style="margin: 0; color: #f8fafc;">Estimated Playing Time</h3>
+            </div>
+
+            <div class="tabs" style="margin-bottom: 0.5rem;">
+               <button class="tab-button {planTab === 'players' ? 'active' : ''}" style="padding: 0.5rem;" on:click={() => planTab='players'}>Players</button>
+               <button class="tab-button {planTab === 'positions' ? 'active' : ''}" style="padding: 0.5rem;" on:click={() => planTab='positions'}>Positions</button>
+               <button class="tab-button {planTab === 'groups' ? 'active' : ''}" style="padding: 0.5rem;" on:click={() => planTab='groups'}>Groups</button>
+            </div>
+
+            <div class="scroll-box" style="flex: 1;">
+              {#if planTab === 'players'}
+                <div class="sort-controls" style="margin-bottom: 0.5rem; justify-content: flex-end;">
+                  <label>Bar Mode:</label>
+                  <select bind:value={barMode}>
+                    <option value="aggregate">Grouped</option>
+                    <option value="chrono">Timeline</option>
+                  </select>
+                </div>
+                <ul class="list">
+                  {#each plannedRosterPlayers as player (player.id)}
+                    <li>
+                      <div class="list-item roster-list-item" style="cursor: default; touch-action: auto;">
+                        <div class="roster-item-top">
+                          <div style="display: flex; align-items: center; min-width: 0; gap: 0.5rem; flex: 1;">
+                            <span
+                              class="info-btn"
+                              role="button"
+                              tabindex="0"
+                              on:click|stopPropagation={() => viewingPlannedPlayerId = player.id}
+                              on:keydown={(event) => handleKeyboardAction(event, () => viewingPlannedPlayerId = player.id)}
+                            >
+                              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                <circle cx="12" cy="12" r="10"></circle>
+                                <line x1="12" y1="16" x2="12" y2="12"></line>
+                                <line x1="12" y1="8" x2="12.01" y2="8"></line>
+                              </svg>
+                            </span>
+                            <div class="roster-item-name" style="flex: unset;">{player.name}</div>
+                          </div>
+                          
+                          <div class="roster-item-stats">
+                            <div style="font-weight: bold; color: {player.activeDurationMs > 0 ? '#34d399' : '#94a3b8'}">
+                              {formatDuration(player.activeDurationMs)}
+                            </div>
                           </div>
                         </div>
+                        
+                        {#if barMode === 'aggregate'}
+                          {#if player.positionSegments?.length > 0}
+                            <div class="player-position-bar" on:click={() => console.log('hi')}>
+                              {#each player.positionSegments as seg}
+                                <div class="pos-segment" style="width: {seg.pct}%; background-color: {groupColors[seg.group]}" title="{seg.group}"></div>
+                              {/each}
+                            </div>
+                          {/if}
+                        {:else}
+                          {#if player.chronoSegments?.length > 0}
+                            <div class="player-position-bar">
+                              {#each player.chronoSegments as seg}
+                                <div class="pos-segment" style="width: {seg.pct}%; background-color: {groupColors[seg.group]}" title="{seg.group}"></div>
+                              {/each}
+                            </div>
+                          {/if}
+                        {/if}
                       </div>
-                      
-                      {#if player.positionSegments?.length > 0}
-                        <div class="player-position-bar">
-                          {#each player.positionSegments as seg}
-                            <div class="pos-segment" style="width: {seg.pct}%; background-color: {groupColors[seg.group]}" title="{seg.group}"></div>
-                          {/each}
-                        </div>
-                      {/if}
-                    </div>
-                  </li>
-                {/each}
-              </ul>
+                    </li>
+                  {/each}
+                </ul>
+              {:else if planTab === 'positions'}
+                 <ul class="list">
+                 {#each planPositionTotals as pos}
+                    <li class="list-item" style="flex-direction: column; align-items: stretch; padding: 0.75rem;">
+                       <div style="display:flex; justify-content: space-between; font-weight: bold; margin-bottom: 0.5rem; color: #f8fafc;">
+                          <span>{pos.name}</span>
+                          <span style="color: #34d399;">{formatDuration(pos.totalMs)}</span>
+                       </div>
+                       {#each pos.players as pt}
+                          <div style="display:flex; justify-content: space-between; font-size: 0.9em; color: #cbd5e1; margin-bottom: 0.2rem; padding-left: 0.5rem; border-left: 2px solid #334155;">
+                             <span>{pt.player.name}</span>
+                             <span>{formatDuration(pt.durationMs)}</span>
+                          </div>
+                       {/each}
+                    </li>
+                 {/each}
+                 </ul>
+              {:else if planTab === 'groups'}
+                 <ul class="list">
+                 {#each planGroupTotals as grp}
+                    <li class="list-item" style="flex-direction: column; align-items: stretch; padding: 0.75rem;">
+                       <div style="display:flex; justify-content: space-between; font-weight: bold; margin-bottom: 0.5rem; color: #f8fafc;">
+                          <div style="display:flex; align-items:center; gap: 0.5rem;">
+                             <div style="width:12px; height:12px; border-radius:2px; background-color:{groupColors[grp.group]}"></div>
+                             {grp.group}
+                          </div>
+                          <span style="color: #34d399;">{formatDuration(grp.totalMs)}</span>
+                       </div>
+                       {#each grp.players as pt}
+                          <div style="display:flex; justify-content: space-between; font-size: 0.9em; color: #cbd5e1; margin-bottom: 0.2rem; padding-left: 0.5rem; border-left: 2px solid #334155;">
+                             <span>{pt.player.name}</span>
+                             <span>{formatDuration(pt.durationMs)}</span>
+                          </div>
+                       {/each}
+                    </li>
+                 {/each}
+                 </ul>
+              {/if}
             </div>
           </div>
         </div>
       {/if}
 
       <div class="modal-actions" style="margin-top: 1rem;">
+        <button class="secondary small" on:click={exportPlanCsv}>Export CSV</button>
         <button class="secondary" on:click={() => showGamePlanModal = false}>Close</button>
       </div>
     </div>
@@ -1561,6 +1944,23 @@
                <div style="display: flex; align-items: center; gap: 0.5rem;">
                  <div class="position-color-bar" style="width: 12px; height: 12px; border-radius: 2px; background-color: {groupColors[pos.group]}"></div>
                  <span>{pos.name} <span class="muted" style="font-size: 0.85em;">({pos.group})</span></span>
+               </div>
+               <span>{formatDuration(pos.durationMs)}</span>
+            </li>
+          {/each}
+        </ul>
+      {:else}
+        <p class="muted">No field time {activePlannedStatsPlayer ? 'planned' : 'yet'}.</p>
+      {/if}
+
+      {#if modalPlayer.positionDetails.length > 0}
+        <h3 style="margin-top: 0; color: #cbd5e1; font-size: 1rem;">Position Groups Played</h3>
+        <ul class="stats-list">
+          {#each getPlayerPositionGroupDetails(modalPlayer) as pos}
+            <li>
+               <div style="display: flex; align-items: center; gap: 0.5rem;">
+                 <div class="position-color-bar" style="width: 12px; height: 12px; border-radius: 2px; background-color: {groupColors[pos.group]}"></div>
+                 <span>{pos.group}</span>
                </div>
                <span>{formatDuration(pos.durationMs)}</span>
             </li>
@@ -1733,13 +2133,18 @@
           <div class="lineup-tools">
             <h3>Roster</h3>
             <div class="sort-controls">
+              <label>Bar:</label>
+              <select bind:value={barMode} style="margin-right: 0.5rem;">
+                 <option value="aggregate">Grouped</option>
+                 <option value="chrono">Timeline</option>
+              </select>
               <label for="roster-sort">Sort:</label>
               <select id="roster-sort" bind:value={lineupRosterSort}>
                 <option value="status">Status</option>
                 <option value="name">Name (A-Z)</option>
-                <option value="total">Total Field Time</option>
-                <option value="stintActive">Current Field Stint</option>
-                <option value="stintBench">Current Bench Stint</option>
+                <option value="total">Total Field</option>
+                <option value="stintActive">Current Field</option>
+                <option value="stintBench">Current Bench</option>
               </select>
             </div>
           </div>
@@ -1814,12 +2219,22 @@
                       </div>
                     </div>
                     
-                    {#if player.positionSegments?.length > 0}
-                      <div class="player-position-bar">
-                        {#each player.positionSegments as seg}
-                          <div class="pos-segment" style="width: {seg.pct}%; background-color: {groupColors[seg.group]}" title="{seg.group}"></div>
-                        {/each}
-                      </div>
+                    {#if barMode === 'aggregate'}
+                      {#if player.positionSegments?.length > 0}
+                        <div class="player-position-bar">
+                          {#each player.positionSegments as seg}
+                            <div class="pos-segment" style="width: {seg.pct}%; background-color: {groupColors[seg.group]}" title="{seg.group}"></div>
+                          {/each}
+                        </div>
+                      {/if}
+                    {:else}
+                      {#if player.chronoSegments?.length > 0}
+                        <div class="player-position-bar">
+                          {#each player.chronoSegments as seg}
+                            <div class="pos-segment" style="width: {seg.pct}%; background-color: {groupColors[seg.group]}" title="{seg.group}"></div>
+                          {/each}
+                        </div>
+                      {/if}
                     {/if}
                   </button>
                 </li>
@@ -2020,6 +2435,27 @@
   :global(*::before),
   :global(*::after) {
     box-sizing: border-box;
+  }
+
+  .toast-container {
+    position: fixed;
+    bottom: 2rem;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 10000;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    pointer-events: none;
+  }
+  .toast {
+    background: rgba(218, 69, 69, 0.9);
+    color: white;
+    padding: 0.75rem 1.5rem;
+    border-radius: 2rem;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+    font-weight: 500;
+    text-align: center;
   }
 
   .hero {
