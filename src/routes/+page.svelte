@@ -9,6 +9,7 @@
     positions: [],
     lineup: {},
     history: [],
+    presets: [],
     playerTimeStats: {}, 
     gameTimeStats: { total: 0, sessionStart: null },
     gameStartedAt: null,
@@ -20,6 +21,7 @@
   let positions = [];
   let lineup = {};
   let history = [];
+  let presets = [];
   let playerTimeStats = {};
   let gameTimeStats = { total: 0, sessionStart: null };
   let gameStartedAt = null;
@@ -45,6 +47,8 @@
   let eventAssist = '';
   let eventCard = 'yellow'; // 'yellow' or 'red'
   let eventPlayer = '';
+  let showPresetsModal = false;
+  let newPresetName = '';
 
   let viewingPlayerId = null; // Used for the player stats modal
 
@@ -72,13 +76,12 @@
         }));
         positions = data.positions ?? defaultState.positions;
         lineup = data.lineup ?? defaultState.lineup;
-        
         // Backwards compatibility: Map old history items to the new 'events' array structure
         history = (data.history ?? []).map(h => {
           if (h.events) return h;
           return { ...h, events: [{ event: h.label || 'Event', playerId: null, detail: '', gameTime: 0 }] };
         });
-        
+        presets = data.presets ?? defaultState.presets;        
         gameStartedAt = data.gameStartedAt ?? defaultState.gameStartedAt;
         gameLive = data.gameLive ?? defaultState.gameLive;
         gameTimeStats = data.gameTimeStats ?? { total: 0, sessionStart: null };
@@ -108,12 +111,51 @@
   }
 
   function saveState() {
-    const state = { roster, positions, lineup, history, playerTimeStats, gameTimeStats, gameStartedAt, gameLive, gameName };
+    const state = { roster, positions, lineup, history, presets, playerTimeStats, gameTimeStats, gameStartedAt, gameLive, gameName };
     localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
   }
 
   $: lastSavedLineup = history[0]?.lineup ?? {};
   $: lastSavedRoster = history[0]?.roster ?? [];
+
+  function saveAsPreset() {
+    const name = newPresetName.trim();
+    if (!name) return alert('Please enter a name for the preset.');
+    
+    presets = [...presets, {
+      id: uniqueId('preset'),
+      name: name,
+      lineup: JSON.parse(JSON.stringify(lineup)) // Deep copy current draft
+    }];
+    
+    newPresetName = '';
+    saveState();
+  }
+
+  function loadPreset(preset) {
+    const loadedLineup = JSON.parse(JSON.stringify(preset.lineup));
+    const validPositionIds = new Set(positions.map(p => p.id));
+    
+    let cleanedLineup = {};
+    // Only keep positions that still exist in the manager
+    for (const posId in loadedLineup) {
+      if (validPositionIds.has(posId)) {
+         cleanedLineup[posId] = loadedLineup[posId];
+      }
+    }
+    
+    lineup = cleanedLineup;
+    ensureLineupSlots(); // Fills new positions with null, and wipes deleted players
+    saveState();
+    showPresetsModal = false;
+  }
+
+  function deletePreset(id) {
+    if(confirm('Are you sure you want to delete this preset?')) {
+      presets = presets.filter(p => p.id !== id);
+      saveState();
+    }
+  }
 
   function commitTime() {
     const currentTime = Date.now();
@@ -993,6 +1035,51 @@
   </div>
 {/if}
 
+{#if showPresetsModal}
+  <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+  <div class="modal-backdrop" on:click={() => showPresetsModal = false}>
+    <div class="modal-panel" on:click|stopPropagation>
+      <h2>Lineup Presets</h2>
+
+      <div style="display: flex; gap: 0.5rem; margin-bottom: 1.5rem;">
+        <input 
+          style="flex: 1; padding: 0.75rem; border-radius: 0.75rem; border: 1px solid #334155; background: #0f172a; color: #f8fafc;" 
+          type="text" 
+          placeholder="New preset name..." 
+          bind:value={newPresetName} 
+          on:keydown={(e) => { if (e.key === 'Enter') saveAsPreset() }}
+        />
+        <button class="primary" on:click={saveAsPreset} disabled={!newPresetName.trim()}>Save Current</button>
+      </div>
+
+      {#if presets.length === 0}
+        <p class="muted">No presets saved yet. Build a lineup and save it here.</p>
+      {:else}
+        <ul class="stats-list timeline-list" style="max-height: 45vh;">
+          {#each presets as preset}
+            <li>
+              <strong style="font-size: 1.05rem;">{preset.name}</strong>
+              <div style="display: flex; gap: 0.5rem;">
+                <button class="secondary small" on:click={() => loadPreset(preset)}>Load</button>
+                <button class="secondary small" style="background:#7f1d1d; min-width: 0;" on:click={() => deletePreset(preset.id)}>
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <line x1="18" y1="6" x2="6" y2="18"></line>
+                    <line x1="6" y1="6" x2="18" y2="18"></line>
+                  </svg>
+                </button>
+              </div>
+            </li>
+          {/each}
+        </ul>
+      {/if}
+
+      <div class="modal-actions">
+        <button class="secondary" on:click={() => showPresetsModal = false}>Close</button>
+      </div>
+    </div>
+  </div>
+{/if}
+
 {#if activeStatsPlayer}
   <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
   <div class="modal-backdrop" on:click={() => viewingPlayerId = null}>
@@ -1091,6 +1178,7 @@
       <div class="lineup-panel-header">
         <h2>Lineup Editor</h2>
         <div>
+          <button class="secondary small" type="button" on:click={() => showPresetsModal = true}>Presets</button>
           <button class="secondary small" style="background:#7f1d1d" type="button" on:click={clearLineup}>Clear</button>
           <button class="secondary small" type="button" on:click={saveCurrentLineup}>Apply</button>
         </div>
