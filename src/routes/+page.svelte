@@ -1188,7 +1188,7 @@
                     on:keydown={(event) => !player.inDraftLineup && handleKeyboardAction(event, () => handleRosterClick(player.id))}
                   >
                     <div class="roster-item-top">
-                      <div style="display: flex; align-items: center; min-width: 0;">.
+                      <div style="display: flex; align-items: center; min-width: 0; gap: 0.5rem; flex: 1;">
                         <span
                           class="info-btn"
                           role="button"
@@ -1203,15 +1203,35 @@
                             <line x1="12" y1="8" x2="12.01" y2="8"></line>
                           </svg>
                         </span>
-                        <div class="roster-item-name">{player.name}</div>
-                      </div>
-                      <div class="roster-item-stats">
-                        <div>Total: {formatDuration(player.activeDurationMs)}</div>
-                        {#if player.inLiveLineup}
-                          <div class="time-active">Field: {formatDuration(player.stintActiveMs)}</div>
-                        {:else}
-                          <div class="time-bench">Bench: {formatDuration(player.stintBenchMs)}</div>
-                        {/if}
+                        <div class="roster-item-name" style="flex: unset;">{player.name}</div>
+                        <div class="player-status-icon">
+                          {#if player.inLiveLineup && player.inDraftLineup}
+                            <!-- Field: Solid Green Dot -->
+                            <svg title="On Field" width="14" height="14" viewBox="0 0 24 24" fill="#34d399">
+                              <circle cx="12" cy="12" r="8"></circle>
+                            </svg>
+
+                          {:else if !player.inLiveLineup && !player.inDraftLineup}
+                            <!-- Bench: Hollow Gray Dot -->
+                            <svg title="On Bench" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#64748b" stroke-width="3">
+                              <circle cx="12" cy="12" r="7"></circle>
+                            </svg>
+
+                          {:else if !player.inLiveLineup && player.inDraftLineup}
+                            <!-- Sub IN: Pulsing Green Right Arrow -->
+                            <svg title="Staged to Sub In" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#34d399" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                              <path d="M5 12h14"></path>
+                              <path d="m12 5 7 7-7 7"></path>
+                            </svg>
+
+                          {:else if player.inLiveLineup && !player.inDraftLineup}
+                            <!-- Sub OUT: Pulsing Red Left Arrow -->
+                            <svg class="sub-pending-icon" title="Staged to Sub Out" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#ef4444" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                              <path d="M19 12H5"></path>
+                              <path d="m12 19-7-7 7-7"></path>
+                            </svg>
+                          {/if}
+                        </div>
                       </div>
                     </div>
                     
@@ -1765,15 +1785,6 @@
     color: #f8fafc;
   }
 
-  .roster-item-stats {
-    display: flex;
-    flex-direction: column;
-    align-items: flex-end;
-    gap: 0.15rem;
-    font-size: 0.85rem;
-    color: #94a3b8;
-  }
-
   .time-active {
     color: #34d399;
   }
@@ -2240,5 +2251,12 @@
   /* Red for opponent team */
   .score-box:last-child {
     color: #ef4444;
+  }
+
+  .player-status-icon {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin-left: 0.25rem;
   }
 </style>
