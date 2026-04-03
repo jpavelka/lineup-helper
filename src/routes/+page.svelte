@@ -345,13 +345,20 @@
     resumeTracking();
     saveState();
   }
-
+  
   function toggleGameLive() {
     if (!gameStartedAt) return;
     commitTime();
     gameLive = !gameLive;
     resumeTracking();
     addHistoryEntry([{ event: gameLive ? 'Game resumed' : 'Game paused', playerId: null, detail: '' }]);
+  }
+  
+  function clearLineup() {
+    if (confirm("Are you sure you want to clear all players from the current lineup?")) {
+      lineup = Object.keys(lineup).reduce((acc, key) => ({ ...acc, [key]: null }), {});
+      saveState();
+    }
   }
 
   function endGame() {
@@ -488,6 +495,13 @@
       if (dropLi) {
         handlePositionSwapRealtime(dropLi.dataset.positionId, touchDrag.id);
       }
+    }
+  }
+
+  function handleKeydown(event) {
+    if (event.key === 'Escape') {
+      if (showEventModal) showEventModal = false;
+      if (viewingPlayerId) viewingPlayerId = null;
     }
   }
 
@@ -706,7 +720,16 @@
     .sort((a, b) => {
       if (lineupRosterSort === 'name') {
         return a.name.localeCompare(b.name);
-      } else if (lineupRosterSort === 'total') {
+      } else if (lineupRosterSort === 'status') {
+         const getRank = (p) => {
+           if (!p.inLiveLineup && !p.inDraftLineup) return 0; // Bench, not staged
+           if (!p.inLiveLineup && p.inDraftLineup) return 1;  // Bench, staged to sub in
+           if (p.inLiveLineup && !p.inDraftLineup) return 2;  // Field, staged to sub out
+           return 3; // Field, staged to stay
+         };
+         const rankA = getRank(a), rankB = getRank(b);
+         return rankA !== rankB ? rankA - rankB : a.name.localeCompare(b.name);
+      }else if (lineupRosterSort === 'total') {
         return b.activeDurationMs - a.activeDurationMs;
       } else if (lineupRosterSort === 'stintActive') {
         return (a.stintBenchMs - a.stintActiveMs) - (b.stintBenchMs - b.stintActiveMs);
@@ -824,17 +847,19 @@
   on:touchend={stopTouchDrag} 
   on:touchcancel={cancelTouchDrag} 
   on:pointerup={stopTouchDrag} 
-  on:pointercancel={cancelTouchDrag} 
+  on:pointercancel={cancelTouchDrag}
+  on:keydown={handleKeydown} 
 />
 
 {#if showEventModal}
+  <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
   <div class="modal-backdrop" on:click={() => showEventModal = false}>
     <div class="modal-panel" on:click|stopPropagation>
       <h2>Add Game Event</h2>
       
       <div class="form-group">
-        <label>Event Type</label>
-        <select bind:value={eventType}>
+        <label for="event-type">Event Type</label>
+        <select id="event-type" bind:value={eventType}>
           <option value="goal">Goal</option>
           <option value="booking">Booking (Card)</option>
         </select>
@@ -842,16 +867,16 @@
 
       {#if eventType === 'goal'}
         <div class="form-group">
-          <label>Team</label>
-          <select bind:value={eventTeam}>
+          <label for="event-team">Team</label>
+          <select id="event-team" bind:value={eventTeam}>
             <option value="mine">Our Team</option>
             <option value="theirs">Opposing Team</option>
           </select>
         </div>
         {#if eventTeam === 'mine'}
           <div class="form-group">
-            <label>Goal Scorer</label>
-            <select bind:value={eventScorer}>
+            <label for="event-scorer">Goal Scorer</label>
+            <select id="event-scorer" bind:value={eventScorer}>
               <option value="">-- Select Player --</option>
               {#each sortedLineupRoster as p}
                 <option value={p.id}>{p.name}</option>
@@ -859,8 +884,8 @@
             </select>
           </div>
           <div class="form-group">
-            <label>Assist (optional)</label>
-            <select bind:value={eventAssist}>
+            <label for="event-assist">Assist (optional)</label>
+            <select id="event-assist" bind:value={eventAssist}>
               <option value="">-- None --</option>
               {#each sortedLineupRoster as p}
                 <option value={p.id}>{p.name}</option>
@@ -870,15 +895,15 @@
         {/if}
       {:else if eventType === 'booking'}
         <div class="form-group">
-          <label>Card</label>
-          <select bind:value={eventCard}>
+          <label for="event-card">Card</label>
+          <select id="event-card" bind:value={eventCard}>
             <option value="yellow">Yellow Card</option>
             <option value="red">Red Card</option>
           </select>
         </div>
         <div class="form-group">
-          <label>Player</label>
-          <select bind:value={eventPlayer}>
+          <label for="event-player">Player</label>
+          <select id="event-player" bind:value={eventPlayer}>
             <option value="">-- Select Player --</option>
             {#each sortedLineupRoster as p}
               <option value={p.id}>{p.name}</option>
@@ -899,6 +924,7 @@
 {/if}
 
 {#if activeStatsPlayer}
+  <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
   <div class="modal-backdrop" on:click={() => viewingPlayerId = null}>
     <div class="modal-panel" on:click|stopPropagation>
       <h2>{activeStatsPlayer.name}</h2>
@@ -985,7 +1011,10 @@
     <section class="panel lineup-panel">
       <div class="lineup-panel-header">
         <h2>Lineup Editor</h2>
-        <button class="secondary small" type="button" style="margin-bottom:8pt" on:click={saveCurrentLineup}>Apply lineup</button>
+        <div>
+          <button class="secondary small" style="background:#7f1d1d" type="button" on:click={clearLineup}>Clear</button>
+          <button class="secondary small" type="button" on:click={saveCurrentLineup}>Apply</button>
+        </div>
       </div>
       <div class="list-columns">
         <div class="list-column lineup-column">
@@ -1058,6 +1087,7 @@
               <label for="roster-sort">Sort:</label>
               <select id="roster-sort" bind:value={lineupRosterSort}>
                 <option value="name">Name (A-Z)</option>
+                <option value="status">Status</option>
                 <option value="total">Total Field Time</option>
                 <option value="stintActive">Current Field Stint</option>
                 <option value="stintBench">Current Bench Stint</option>
@@ -1079,8 +1109,15 @@
                     on:keydown={(event) => !player.inDraftLineup && handleKeyboardAction(event, () => handleRosterClick(player.id))}
                   >
                     <div class="roster-item-top">
-                      <div style="display: flex; align-items: center; min-width: 0;">
-                        <span class="info-btn" role="button" tabindex="0" on:click|stopPropagation={() => viewingPlayerId = player.id} on:pointerdown|stopPropagation>
+                      <div style="display: flex; align-items: center; min-width: 0;">.
+                        <span
+                          class="info-btn"
+                          role="button"
+                          tabindex="0"
+                          on:click|stopPropagation={() => viewingPlayerId = player.id}
+                          on:keydown={(event) => handleKeyboardAction(event, () => viewingPlayerId = player.id)}
+                          on:pointerdown|stopPropagation
+                        >
                           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                             <circle cx="12" cy="12" r="10"></circle>
                             <line x1="12" y1="16" x2="12" y2="12"></line>
@@ -1195,19 +1232,21 @@
                 }}
                 on:dragover|preventDefault
             >
-              <div class="drag-handle" 
-                   draggable="true"
-                   aria-label="Drag to reorder"
-                   on:dragstart={(e) => {
-                     draggedPosId = position.id;
-                     e.dataTransfer.effectAllowed = 'move';
-                     e.dataTransfer.setData('application/x-position', position.id);
-                   }}
-                   on:dragend={() => {
-                     draggedPosId = null;
-                     saveState();
-                   }}
-                   on:pointerdown={(e) => startTouchDrag(e, 'position', position.id)}
+              <div class="drag-handle"
+                  role="button"
+                  tabindex="0"
+                  draggable="true"
+                  aria-label="Drag to reorder"
+                  on:dragstart={(e) => {
+                    draggedPosId = position.id;
+                    e.dataTransfer.effectAllowed = 'move';
+                    e.dataTransfer.setData('application/x-position', position.id);
+                  }}
+                  on:dragend={() => {
+                    draggedPosId = null;
+                    saveState();
+                  }}
+                  on:pointerdown={(e) => startTouchDrag(e, 'position', position.id)}
               >☰</div>
               <div class="position-inputs">
                 <input
@@ -1284,6 +1323,11 @@
     background: #0f172a;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   }
+  :global(*),
+  :global(*::before),
+  :global(*::after) {
+    box-sizing: border-box;
+  }
 
   .hero {
     display: flex;
@@ -1302,12 +1346,6 @@
     gap: 1rem;
     flex-wrap: wrap;
     color: #f8fafc;
-  }
-
-  .hero p {
-    margin: 0.5rem 0 0;
-    max-width: 40rem;
-    color: #cbd5e1;
   }
 
   .hero-actions {
@@ -1665,6 +1703,8 @@
     display: flex;
     flex: 1;
     gap: 0.5rem;
+    min-width: 0;
+    flex-wrap: wrap; 
   }
 
   .list-item input[type="text"] {
