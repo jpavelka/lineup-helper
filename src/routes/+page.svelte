@@ -37,7 +37,7 @@
   let selectedItem = null;
   let touchDrag = null;
   let draggedPosId = null;
-  let lineupRosterSort = 'name'; 
+  let lineupRosterSort = 'status'; 
   let now = Date.now();
 
   let showEditModal = false;
@@ -1735,8 +1735,8 @@
             <div class="sort-controls">
               <label for="roster-sort">Sort:</label>
               <select id="roster-sort" bind:value={lineupRosterSort}>
-                <option value="name">Name (A-Z)</option>
                 <option value="status">Status</option>
+                <option value="name">Name (A-Z)</option>
                 <option value="total">Total Field Time</option>
                 <option value="stintActive">Current Field Stint</option>
                 <option value="stintBench">Current Bench Stint</option>
@@ -1788,15 +1788,15 @@
                             </svg>
 
                           {:else if !player.inLiveLineup && player.inDraftLineup}
-                            <!-- Sub IN: Pulsing Green Right Arrow -->
+                            <!-- Sub IN: Green Right Arrow -->
                             <svg title="Staged to Sub In" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#34d399" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
                               <path d="M5 12h14"></path>
                               <path d="m12 5 7 7-7 7"></path>
                             </svg>
 
                           {:else if player.inLiveLineup && !player.inDraftLineup}
-                            <!-- Sub OUT: Pulsing Red Left Arrow -->
-                            <svg class="sub-pending-icon" title="Staged to Sub Out" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#ef4444" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                            <!-- Sub OUT: Red Left Arrow -->
+                            <svg title="Staged to Sub Out" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#ef4444" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
                               <path d="M19 12H5"></path>
                               <path d="m12 19-7-7 7-7"></path>
                             </svg>
@@ -2883,15 +2883,5 @@
     justify-content: flex-end;
     gap: 5pt;
     margin-bottom: 3pt;
-  }
-
-  .sub-pending-icon {
-    animation: pulse-sub 1.5s infinite;
-  }
-
-  @keyframes pulse-sub {
-    0% { opacity: 0.4; transform: scale(0.95); }
-    50% { opacity: 1; transform: scale(1.1); }
-    100% { opacity: 0.4; transform: scale(0.95); }
   }
 </style>
