@@ -4,6 +4,7 @@
   import { doc, getDoc, setDoc } from 'firebase/firestore';
   import { db } from '$lib/firebase/config';
   import { authStore } from '$lib/stores/authStore';
+  import { generateUUID } from '$lib/utils.js';
 
   const teamId = $page.params.teamId;
   const POS_GROUPS = ['GK', 'DEF', 'MID', 'FWD'];
@@ -69,7 +70,7 @@
     if (!newPlayerName.trim()) return;
 
     const newPlayer = {
-      id: crypto.randomUUID(), // Generate a unique ID for the player
+      id: generateUUID(), // Generate a unique ID for the player
       name: newPlayerName.trim(),
       number: newPlayerNumber.trim() || '-',
       preferredGroups: []

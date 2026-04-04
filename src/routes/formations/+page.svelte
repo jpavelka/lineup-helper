@@ -4,6 +4,7 @@
   import { db } from '$lib/firebase/config';
   import { authStore } from '$lib/stores/authStore';
   import { goto } from '$app/navigation';
+  import { generateUUID } from '$lib/utils.js';
 
   let formations = [];
   let loading = true;
@@ -35,17 +36,17 @@
         size: 11,
         ownerId: $authStore.user.uid,
         positions: [
-          { id: crypto.randomUUID(), name: 'GK', group: 'GK', x: 50, y: 92 },
-          { id: crypto.randomUUID(), name: 'RB', group: 'DEF', x: 85, y: 75 },
-          { id: crypto.randomUUID(), name: 'RCB', group: 'DEF', x: 60, y: 80 },
-          { id: crypto.randomUUID(), name: 'LCB', group: 'DEF', x: 40, y: 80 },
-          { id: crypto.randomUUID(), name: 'LB', group: 'DEF', x: 15, y: 75 },
-          { id: crypto.randomUUID(), name: 'RM', group: 'MID', x: 80, y: 50 },
-          { id: crypto.randomUUID(), name: 'RCM', group: 'MID', x: 60, y: 55 },
-          { id: crypto.randomUUID(), name: 'LCM', group: 'MID', x: 40, y: 55 },
-          { id: crypto.randomUUID(), name: 'LM', group: 'MID', x: 20, y: 50 },
-          { id: crypto.randomUUID(), name: 'RS', group: 'FWD', x: 60, y: 25 },
-          { id: crypto.randomUUID(), name: 'LS', group: 'FWD', x: 40, y: 25 },
+          { id: generateUUID(), name: 'GK', group: 'GK', x: 50, y: 92 },
+          { id: generateUUID(), name: 'RB', group: 'DEF', x: 85, y: 75 },
+          { id: generateUUID(), name: 'RCB', group: 'DEF', x: 60, y: 80 },
+          { id: generateUUID(), name: 'LCB', group: 'DEF', x: 40, y: 80 },
+          { id: generateUUID(), name: 'LB', group: 'DEF', x: 15, y: 75 },
+          { id: generateUUID(), name: 'RM', group: 'MID', x: 80, y: 50 },
+          { id: generateUUID(), name: 'RCM', group: 'MID', x: 60, y: 55 },
+          { id: generateUUID(), name: 'LCM', group: 'MID', x: 40, y: 55 },
+          { id: generateUUID(), name: 'LM', group: 'MID', x: 20, y: 50 },
+          { id: generateUUID(), name: 'RS', group: 'FWD', x: 60, y: 25 },
+          { id: generateUUID(), name: 'LS', group: 'FWD', x: 40, y: 25 },
         ]
       });
       goto(`/formations/${newFormationRef.id}`);
