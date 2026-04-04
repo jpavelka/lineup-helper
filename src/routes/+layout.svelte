@@ -3,6 +3,12 @@
   import { auth } from '$lib/firebase/config';
   import { onAuthStateChanged, signOut } from 'firebase/auth';
   import { authStore } from '$lib/stores/authStore';
+  import { goto } from '$app/navigation';
+
+  // Redirect on logout
+  $: if (!$authStore.loading && !$authStore.user) {
+    goto('/');
+  }
 
   onMount(() => {
     // Listen for Firebase auth changes

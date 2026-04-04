@@ -4,12 +4,12 @@
     signInWithEmailAndPassword, 
     createUserWithEmailAndPassword, 
     GoogleAuthProvider, 
-    signInWithRedirect 
+    signInWithPopup
   } from 'firebase/auth';
-  // ADDED deleteDoc and doc here:
   import { collection, query, where, getDocs, addDoc, deleteDoc, doc } from 'firebase/firestore';
   import { authStore } from '$lib/stores/authStore';
   import { goto } from '$app/navigation';
+  import { onMount } from 'svelte';
 
   // Auth Form State
   let email = '';
@@ -40,8 +40,9 @@
     authError = '';
     const provider = new GoogleAuthProvider();
     try {
-      await signInWithRedirect(auth, provider);
+      await signInWithPopup(auth, provider);
     } catch (error) {
+      console.error("Google login error:", error);
       authError = error.message.replace('Firebase: ', '');
     }
   }
@@ -81,16 +82,12 @@
     }
   }
 
-  // NEW FUNCTION: Delete Team
   async function deleteTeam(teamId, teamName) {
     const isConfirmed = confirm(`Are you sure you want to delete "${teamName}"? This will permanently remove the team and roster.`);
     if (!isConfirmed) return;
 
     try {
-      // Delete from Firestore
       await deleteDoc(doc(db, 'teams', teamId));
-      
-      // Remove from local UI state reactively
       teams = teams.filter(t => t.id !== teamId);
     } catch (error) {
       console.error("Error deleting team:", error);
@@ -100,15 +97,53 @@
 </script>
 
 <svelte:head>
-  <title>Lineup Helper Pro</title>
+  <title>Lineup Pro | Coach Dashboard</title>
 </svelte:head>
 
 {#if !$authStore.user}
-  <!-- ... (KEEP YOUR EXISTING UNAUTHENTICATED HERO/LOGIN VIEW HERE) ... -->
-  <!-- ... (I omitted it here for brevity, keep the div class="hero-container" stuff) ... -->
-  
+  <div class="hero-container">
+    <div class="hero-text">
+      <h1>Coach Smarter,<br>Not Harder.</h1>
+      <p>The ultimate game-day companion for soccer coaches. Manage rosters, track live player minutes, and design tactical formations with ease.</p>
+    </div>
+
+    <div class="auth-card">
+      <h2>{isRegistering ? 'Create Coach Account' : 'Coach Login'}</h2>
+      
+      {#if authError}
+        <div class="error-msg">{authError}</div>
+      {/if}
+
+      <button class="btn-google" on:click={handleGoogleLogin}>
+        <img src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/layout/google.svg" alt="" width="18">
+        Continue with Google
+      </button>
+
+      <div class="divider"><span>OR</span></div>
+
+      <form on:submit={handleEmailAuth}>
+        <div class="form-group">
+          <label for="email">Email Address</label>
+          <input type="email" id="email" bind:value={email} required placeholder="coach@team.com" />
+        </div>
+        <div class="form-group">
+          <label for="password">Password</label>
+          <input type="password" id="password" bind:value={password} required placeholder="••••••••" />
+        </div>
+        <button type="submit" class="btn-primary" style="width: 100%; margin-top: 1rem;">
+          {isRegistering ? 'Sign Up' : 'Sign In'}
+        </button>
+      </form>
+
+      <div class="toggle-auth">
+        {isRegistering ? 'Already have an account?' : "Don't have an account?"}
+        <button class="btn-link" on:click={() => isRegistering = !isRegistering}>
+          {isRegistering ? 'Log In' : 'Create One'}
+        </button>
+      </div>
+    </div>
+  </div>
 {:else}
-  <!-- AUTHENTICATED VIEW: COACH DASHBOARD -->
   <div class="dashboard">
     <header class="dash-header">
       <h1>Coach Dashboard</h1>
@@ -123,7 +158,8 @@
       {:else}
         <div class="grid-layout">
           {#each teams as team}
-            <div class="team-card"><button 
+            <div class="team-card">
+              <button 
                 class="btn-delete-card" 
                 on:click={() => deleteTeam(team.id, team.name)}
                 title="Delete Team"
@@ -323,6 +359,7 @@
   }
 
   .team-card {
+    position: relative;
     background: #111827;
     border: 1px solid #334155;
     border-radius: 1rem;
@@ -339,6 +376,25 @@
     display: flex;
     gap: 0.5rem;
     margin-top: auto;
+  }
+
+  .btn-delete-card {
+    position: absolute;
+    top: 1rem;
+    right: 1rem;
+    background: transparent;
+    border: none;
+    color: #ef4444;
+    font-size: 1.25rem;
+    cursor: pointer;
+    opacity: 0.5;
+    transition: opacity 0.2s;
+    padding: 0.25rem;
+    line-height: 1;
+  }
+
+  .btn-delete-card:hover {
+    opacity: 1;
   }
 
   .quick-action-card {
@@ -391,35 +447,4 @@
     flex: 1;
   }
   .btn-secondary:hover { background: #475569; }
-  .team-card {
-    /* Make sure team-card has position: relative to anchor the delete button */
-    position: relative; 
-    background: #111827;
-    border: 1px solid #334155;
-    border-radius: 1rem;
-    padding: 1.5rem;
-    display: flex;
-    flex-direction: column;
-    gap: 1rem;
-  }
-
-  /* NEW: Delete Button Styles */
-  .btn-delete-card {
-    position: absolute;
-    top: 1rem;
-    right: 1rem;
-    background: transparent;
-    border: none;
-    color: #ef4444;
-    font-size: 1.25rem;
-    cursor: pointer;
-    opacity: 0.5;
-    transition: opacity 0.2s;
-    padding: 0.25rem;
-    line-height: 1;
-  }
-
-  .btn-delete-card:hover {
-    opacity: 1;
-  }
 </style>
