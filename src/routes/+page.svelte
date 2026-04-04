@@ -1,3160 +1,252 @@
 <script>
-  import { onMount } from 'svelte';
-  import { flip } from 'svelte/animate';
-  import { fade } from 'svelte/transition';
+  import { auth, db } from '$lib/firebase/config';
+  import { 
+    signInWithEmailAndPassword, 
+    createUserWithEmailAndPassword, 
+    GoogleAuthProvider, 
+    signInWithRedirect 
+  } from 'firebase/auth';
+  // ADDED deleteDoc and doc here:
+  import { collection, query, where, getDocs, addDoc, deleteDoc, doc } from 'firebase/firestore';
+  import { authStore } from '$lib/stores/authStore';
+  import { goto } from '$app/navigation';
 
-  const STORAGE_KEY = 'lineup-helper-state';
+  // Auth Form State
+  let email = '';
+  let password = '';
+  let isRegistering = false;
+  let authError = '';
 
-  const defaultState = {
-    roster: [],
-    positions: [],
-    lineup: {},
-    history: [],
-    presets: [],
-    gamePlanSequence: [],
-    playerTimeStats: {}, 
-    gameTimeStats: { total: 0, sessionStart: null },
-    gameStartedAt: null,
-    gameLive: false,
-    gameName: ''
-  };
+  // Dashboard State
+  let teams = [];
+  let loadingTeams = true;
 
-  let roster = [];
-  let positions = [];
-  let lineup = {};
-  let history = [];
-  let presets = [];
-  let gamePlanSequence = [];
-  let playerTimeStats = {};
-  let gameTimeStats = { total: 0, sessionStart: null };
-  let gameStartedAt = null;
-  let gameLive = false;
-  let gameName = '';
-  
-  let newPlayerName = '';
-  let newPositionName = '';
-  let showManager = false;
-  let managerTab = 'roster';
-  let selectedItem = null;
-  let touchDrag = null;
-  let draggedPosId = null;
-  let lineupRosterSort = 'status'; 
-  let barMode = 'aggregate'; // 'aggregate' or 'chrono'
-  let planTab = 'players'; // 'players', 'positions', 'groups'
-  let now = Date.now();
-
-  let showEditModal = false;
-  let editingItem = null;
-  let editMin = 0;
-  let editSec = 0;
-  let editCascade = true;
-
-  // Modal State
-  let showEventModal = false;
-  let showTimelineModal = false;
-  let eventType = 'goal';
-  let eventTeam = 'mine';
-  let eventScorer = '';
-  let eventAssist = '';
-  let eventCard = 'yellow';
-  let eventPlayer = '';
-  
-  let showPresetsModal = false;
-  let newPresetName = '';
-  let draggedPresetId = null;
-  let editingPresetId = null;
-  let editingPresetName = '';
-
-  let showGamePlanModal = false;
-  let draggedPlanStepId = null;
-
-  let viewingPlayerId = null; 
-  let viewingPlannedPlayerId = null;
-
-  // Preset Editor Modal
-  let presetEditorObj = null; 
-  let presetEditorSelectedItem = null;
-
-  // Toasts
-  let toasts = [];
-
-  const PALETTE = [
-    '#3b82f6', '#ef4444', '#10b981', '#f59e0b', 
-    '#8b5cf6', '#ec4899', '#06b6d4', '#f97316', 
-    '#84cc16', '#6366f1'
-  ];
-
-  $: groupColors = [...new Set(positions.map(p => (p.parent || p.name).trim() || 'Unknown'))]
-    .reduce((acc, group, idx) => {
-      acc[group] = PALETTE[idx % PALETTE.length];
-      return acc;
-    }, { 'Bench': '#475569' });
-
-  function showToast(msg) {
-    const id = Date.now();
-    toasts = [...toasts, { id, msg }];
-    setTimeout(() => {
-      toasts = toasts.filter(t => t.id !== id);
-    }, 4000);
-  }
-
-  function getGroupForPos(posId) {
-    const posDef = positions.find(p => p.id === posId);
-    return posDef ? (posDef.parent || posDef.name).trim() || 'Unknown' : 'Unknown';
-  }
-
-  function loadState() {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (raw) {
-      try {
-        const data = JSON.parse(raw);
-        roster = (data.roster ?? defaultState.roster).map(p => ({
-          ...p,
-          available: p.available !== false 
-        }));
-        positions = data.positions ?? defaultState.positions;
-        lineup = data.lineup ?? defaultState.lineup;
-        history = (data.history ?? []).map(h => {
-          if (h.events) return h;
-          return { ...h, events: [{ event: h.label || 'Event', playerId: null, detail: '', gameTime: 0 }] };
-        });
-        presets = data.presets ?? defaultState.presets;        
-        gamePlanSequence = data.gamePlanSequence ?? defaultState.gamePlanSequence;
-        gameStartedAt = data.gameStartedAt ?? defaultState.gameStartedAt;
-        gameLive = data.gameLive ?? defaultState.gameLive;
-        gameTimeStats = data.gameTimeStats ?? { total: 0, sessionStart: null };
-        gameName = data.gameName ?? defaultState.gameName;
-        
-        playerTimeStats = data.playerTimeStats ?? {};
-        
-        for (let id in playerTimeStats) {
-          const stat = playerTimeStats[id];
-          if (stat.total !== undefined) {
-            stat.activeTotal = stat.total;
-            delete stat.total;
-          }
-          if (stat.benchTotal === undefined) stat.benchTotal = 0;
-          if (stat.stintActiveTotal === undefined) stat.stintActiveTotal = stat.activeTotal || 0;
-          if (stat.stintBenchTotal === undefined) stat.stintBenchTotal = stat.benchTotal || 0;
-          if (stat.positionTotals === undefined) stat.positionTotals = {};
-        }
-      } catch {
-        Object.assign(this, defaultState);
-      }
-    } else {
-      Object.assign(this, defaultState);
-    }
-    ensureLineupSlots();
-    resumeTracking(); 
-  }
-
-  function saveState() {
-    const state = { roster, positions, lineup, history, presets, gamePlanSequence, playerTimeStats, gameTimeStats, gameStartedAt, gameLive, gameName };
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-  }
-
-  $: lastSavedLineup = history[0]?.lineup ?? {};
-  $: lastSavedRoster = history[0]?.roster ?? [];
-
-  // --- Lineup Names Logic ---
-  function getLineupName(targetLineup, currentPresets, currentPositions) {
-    if (!targetLineup || Object.keys(targetLineup).length === 0) return null;
-    for (let p of currentPresets) {
-      let match = true;
-      for (let pos of currentPositions) {
-        if ((targetLineup[pos.id] || null) !== (p.lineup[pos.id] || null)) {
-          match = false;
-          break;
-        }
-      }
-      if (match) return p.name;
-    }
-    return null;
-  }
-
-  $: currentLineupName = getLineupName(lastSavedLineup, presets, positions);
-  $: stagedLineupName = getLineupName(lineup, presets, positions);
-  $: showLineupNames = (currentLineupName !== null || stagedLineupName !== null) && currentLineupName !== stagedLineupName;
-
-  // --- Presets Logic ---
-  function saveAsPreset() {
-    const name = newPresetName.trim();
-    if (!name) return alert('Please enter a name for the preset.');
-    
-    const existingIndex = presets.findIndex(p => p.name.toLowerCase() === name.toLowerCase());
-    
-    if (existingIndex >= 0) {
-      if (confirm(`A preset named "${name}" already exists. Overwrite it with the current lineup?`)) {
-        presets[existingIndex].lineup = JSON.parse(JSON.stringify(lineup));
-        presets = [...presets];
-        newPresetName = '';
-        saveState();
-      }
-      return;
-    }
-    
-    presets = [...presets, {
-      id: uniqueId('preset'),
-      name: name,
-      lineup: JSON.parse(JSON.stringify(lineup))
-    }];
-    
-    newPresetName = '';
-    saveState();
-  }
-
-  function loadPreset(preset) {
-    const loadedLineup = JSON.parse(JSON.stringify(preset.lineup));
-    const validPositionIds = new Set(positions.map(p => p.id));
-    
-    let cleanedLineup = {};
-    let missingCount = 0;
-    
-    for (const posId in loadedLineup) {
-      if (validPositionIds.has(posId)) {
-         const playerId = loadedLineup[posId];
-         if (playerId) {
-           const player = roster.find(p => p.id === playerId);
-           if (player && player.available) {
-             cleanedLineup[posId] = playerId;
-           } else {
-             cleanedLineup[posId] = null;
-             missingCount++;
-           }
-         } else {
-           cleanedLineup[posId] = null;
-         }
-      }
-    }
-    
-    lineup = cleanedLineup;
-    ensureLineupSlots();
-    saveState();
-    showPresetsModal = false;
-
-    if (missingCount > 0) {
-      showToast(`${missingCount} player${missingCount > 1 ? 's' : ''} currently unavailable in the preset lineup. Position${missingCount > 1 ? 's' : ''} left empty.`);
-    }
-  }
-
-  function deletePreset(id) {
-    if(confirm('Are you sure you want to delete this preset?')) {
-      presets = presets.filter(p => p.id !== id);
-      saveState();
-    }
-  }
-
-  function handlePresetSwap(targetId, srcId) {
-    if (!srcId || srcId === targetId) return;
-    const srcIdx = presets.findIndex(p => p.id === srcId);
-    const targetIdx = presets.findIndex(p => p.id === targetId);
-    if (srcIdx < 0 || targetIdx < 0) return;
-    
-    const newPos = [...presets];
-    const [removed] = newPos.splice(srcIdx, 1);
-    newPos.splice(targetIdx, 0, removed);
-    presets = newPos;
-  }
-
-  function startEditingPreset(preset) {
-    editingPresetId = preset.id;
-    editingPresetName = preset.name;
-  }
-
-  function savePresetName(id) {
-    if (editingPresetId !== id) return; 
-    const newName = editingPresetName.trim();
-    if (!newName) {
-      editingPresetId = null;
-      return;
-    }
-    
-    const targetPreset = presets.find(p => p.id === id);
-    if (newName.toLowerCase() !== targetPreset.name.toLowerCase() && presets.some(p => p.name.toLowerCase() === newName.toLowerCase())) {
-      alert('A preset with this name already exists.');
-      return;
-    }
-    
-    presets = presets.map(p => p.id === id ? { ...p, name: newName } : p);
-    editingPresetId = null;
-    saveState();
-  }
-
-  // --- Preset Editor Modal Logic ---
-  function openPresetEditor(preset) {
-    presetEditorObj = JSON.parse(JSON.stringify(preset));
-    presetEditorSelectedItem = null;
-  }
-
-  function savePresetEditor() {
-    const idx = presets.findIndex(p => p.id === presetEditorObj.id);
-    if (idx >= 0) {
-      presets[idx] = presetEditorObj;
-      presets = [...presets];
-      saveState();
-    }
-    presetEditorObj = null;
-    presetEditorSelectedItem = null;
-  }
-
-  function handlePresetSlotClick(posId) {
-    if (presetEditorSelectedItem) {
-        let newLineup = { ...presetEditorObj.lineup };
-        if (presetEditorSelectedItem.sourceType === 'presetRoster') {
-            newLineup[posId] = presetEditorSelectedItem.id;
-        } else if (presetEditorSelectedItem.sourceType === 'presetSlot') {
-            const src = presetEditorSelectedItem.id;
-            newLineup[src] = presetEditorObj.lineup[posId];
-            newLineup[posId] = presetEditorObj.lineup[src];
-        }
-        presetEditorObj.lineup = newLineup;
-        presetEditorSelectedItem = null;
-    } else {
-        presetEditorSelectedItem = { sourceType: 'presetSlot', id: posId };
-    }
-  }
-
-  function handlePresetRosterClick(playerId) {
-    if (presetEditorSelectedItem && presetEditorSelectedItem.sourceType === 'presetSlot') {
-        let newLineup = { ...presetEditorObj.lineup };
-        newLineup[presetEditorSelectedItem.id] = playerId;
-        presetEditorObj.lineup = newLineup;
-        presetEditorSelectedItem = null;
-    } else {
-        presetEditorSelectedItem = { sourceType: 'presetRoster', id: playerId };
-    }
-  }
-
-  function removePlayerFromPresetSlot(posId) {
-    let newLineup = { ...presetEditorObj.lineup };
-    newLineup[posId] = null;
-    presetEditorObj.lineup = newLineup;
-  }
-
-  function autoFocus(node) {
-    node.focus();
-  }
-
-  // --- Game Plan Logic ---
-  function addPlanStep() {
-    gamePlanSequence = [...gamePlanSequence, { id: uniqueId('plan'), presetId: '', durationMins: 10 }];
-    saveState();
-  }
-
-  function removePlanStep(id) {
-    gamePlanSequence = gamePlanSequence.filter(s => s.id !== id);
-    saveState();
-  }
-
-  function handlePlanStepSwap(targetId, srcId) {
-    if (!srcId || srcId === targetId) return;
-    const srcIdx = gamePlanSequence.findIndex(p => p.id === srcId);
-    const targetIdx = gamePlanSequence.findIndex(p => p.id === targetId);
-    if (srcIdx < 0 || targetIdx < 0) return;
-    
-    const newSeq = [...gamePlanSequence];
-    const [removed] = newSeq.splice(srcIdx, 1);
-    newSeq.splice(targetIdx, 0, removed);
-    gamePlanSequence = newSeq;
-    saveState();
-  }
-
-  $: totalPlanMins = gamePlanSequence.reduce((sum, step) => sum + (step.presetId ? (step.durationMins || 0) : 0), 0);
-
-  $: plannedRosterPlayers = roster.map(player => {
-    let activeMins = 0;
-    let positionTotals = {};
-    let chronoSegments = [];
-
-    gamePlanSequence.forEach(step => {
-      if (!step.presetId || !step.durationMins) return;
-      const preset = presets.find(p => p.id === step.presetId);
-      if (!preset) return;
-
-      const posId = Object.keys(preset.lineup).find(k => preset.lineup[k] === player.id);
-      const group = posId ? getGroupForPos(posId) : 'Bench';
-      const pct = totalPlanMins > 0 ? (step.durationMins / totalPlanMins) * 100 : 0;
-
-      if (posId) {
-        activeMins += step.durationMins;
-        positionTotals[posId] = (positionTotals[posId] || 0) + step.durationMins;
-      }
-      
-      if (pct > 0) {
-        if (chronoSegments.length > 0 && chronoSegments[chronoSegments.length-1].group === group) {
-            chronoSegments[chronoSegments.length-1].pct += pct;
-        } else {
-            chronoSegments.push({ group, pct });
-        }
-      }
-    });
-
-    let benchMins = totalPlanMins - activeMins;
-
-    let positionSegments = [];
-    let positionDetails = [];
-    const activeDurationMs = activeMins * 60 * 1000;
-    const benchDurationMs = benchMins * 60 * 1000;
-    const totalDurationMs = totalPlanMins * 60 * 1000;
-
-    if (totalDurationMs > 0) {
-      for (let posId in positionTotals) {
-        const pMins = positionTotals[posId];
-        const posDef = positions.find(p => p.id === posId);
-        const pName = posDef ? posDef.name : 'Unknown';
-        const pGroup = posDef ? (posDef.parent || posDef.name).trim() || 'Unknown' : 'Unknown';
-
-        positionSegments.push({ posId, group: pGroup, pct: (pMins / totalPlanMins) * 100 });
-        positionDetails.push({ posId, name: pName, group: pGroup, durationMs: pMins * 60 * 1000 });
-      }
-      if (benchMins > 0) {
-        positionSegments.push({ posId: 'bench', group: 'Bench', pct: (benchMins / totalPlanMins) * 100 });
-      }
-    }
-
-    positionDetails.sort((a,b) => b.durationMs - a.durationMs);
-
-    return {
-      ...player,
-      activeDurationMs,
-      benchDurationMs,
-      positionSegments,
-      chronoSegments,
-      positionDetails
-    };
-  }).sort((a, b) => b.activeDurationMs - a.activeDurationMs || a.name.localeCompare(b.name));
-
-  $: planPositionTotals = positions.map(pos => {
-      const players = [];
-      plannedRosterPlayers.forEach(p => {
-          const posDetail = p.positionDetails.find(d => d.posId === pos.id);
-          if (posDetail && posDetail.durationMs > 0) players.push({ player: p, durationMs: posDetail.durationMs });
-      });
-      players.sort((a,b) => b.durationMs - a.durationMs);
-      const totalMs = players.reduce((sum, x) => sum + x.durationMs, 0);
-      return { ...pos, players, totalMs };
-  }).filter(pos => pos.totalMs > 0).sort((a,b) => b.totalMs - a.totalMs);
-
-  $: planGroupTotals = Object.entries(
-       plannedRosterPlayers.reduce((acc, p) => {
-           p.positionDetails.forEach(d => {
-               if(!acc[d.group]) acc[d.group] = { group: d.group, players: {}, totalMs: 0 };
-               acc[d.group].players[p.id] = (acc[d.group].players[p.id]||0) + d.durationMs;
-               acc[d.group].totalMs += d.durationMs;
-           });
-           return acc;
-       }, {})
-  ).map(([group, data]) => {
-       const players = Object.entries(data.players).map(([pId, ms]) => ({
-           player: plannedRosterPlayers.find(p=>p.id===pId),
-           durationMs: ms
-       })).sort((a,b) => b.durationMs - a.durationMs);
-       return { group, players, totalMs: data.totalMs };
-  }).sort((a,b) => b.totalMs - a.totalMs);
-
-  function exportPlanCsv() {
-    if (gamePlanSequence.length === 0) {
-        showToast("Game plan is empty.");
-        return;
-    }
-    let rows = [];
-    
-    // Table 1: Chronological Steps
-    rows.push(["CHRONOLOGICAL SEQUENCE"]);
-    rows.push(["Step", "Duration (mins)", "Position", "Player"]);
-    gamePlanSequence.forEach((step, idx) => {
-        const preset = presets.find(p => p.id === step.presetId);
-        if(preset) {
-            positions.forEach(pos => {
-                const pId = preset.lineup[pos.id];
-                const pName = getPlayerNameFromRoster(pId, roster);
-                if(pName) rows.push([idx+1, step.durationMins, pos.name, pName]);
-            });
-        }
-    });
-    rows.push([]);
-    
-    // Table 2: Player vs Position
-    rows.push(["PLAYER VS POSITION"]);
-    const posHeaders = positions.map(p => p.name);
-    rows.push(["Player", ...posHeaders, "Bench", "Total"]);
-    plannedRosterPlayers.forEach(p => {
-        const row = [p.name];
-        positions.forEach(pos => {
-            const detail = p.positionDetails.find(d => d.posId === pos.id);
-            row.push(detail ? (detail.durationMs / 60000).toFixed(1) : "0");
-        });
-        row.push((p.benchDurationMs / 60000).toFixed(1));
-        row.push(((p.activeDurationMs + p.benchDurationMs) / 60000).toFixed(1));
-        rows.push(row);
-    });
-    rows.push([]);
-    
-    // Table 3: Player vs Position Group
-    rows.push(["PLAYER VS POSITION GROUP"]);
-    const groups = [...new Set(positions.map(p => getGroupForPos(p.id)))];
-    rows.push(["Player", ...groups, "Bench", "Total"]);
-    plannedRosterPlayers.forEach(p => {
-        const row = [p.name];
-        groups.forEach(g => {
-            const ms = p.positionDetails.filter(d => d.group === g).reduce((sum, d) => sum + d.durationMs, 0);
-            row.push((ms / 60000).toFixed(1));
-        });
-        row.push((p.benchDurationMs / 60000).toFixed(1));
-        row.push(((p.activeDurationMs + p.benchDurationMs) / 60000).toFixed(1));
-        rows.push(row);
-    });
-
-    const csv = rows.map(r => r.map(csvEscape).join(',')).join('\n');
-    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.setAttribute('download', `game-plan-export.csv`);
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    URL.revokeObjectURL(url);
-  }
-
-  $: activePlannedStatsPlayer = viewingPlannedPlayerId ? plannedRosterPlayers.find(p => p.id === viewingPlannedPlayerId) : null;
-
-
-  // --- Base Tracker Logic ---
-  function commitTime() {
-    const currentTime = Date.now();
-    if (gameTimeStats.sessionStart) {
-      gameTimeStats.total += currentTime - gameTimeStats.sessionStart;
-      gameTimeStats.sessionStart = null;
-    }
-    const activeIds = new Set(Object.values(lastSavedLineup).filter(Boolean));
-    for (const id in playerTimeStats) {
-      const stats = playerTimeStats[id];
-      if (stats && stats.sessionStart) {
-        const elapsed = currentTime - stats.sessionStart;
-        if (activeIds.has(id)) {
-          stats.activeTotal += elapsed;
-          stats.stintActiveTotal += elapsed;
-          const posId = Object.keys(lastSavedLineup).find(k => lastSavedLineup[k] === id);
-          if (posId) {
-            if (!stats.positionTotals) stats.positionTotals = {};
-            stats.positionTotals[posId] = (stats.positionTotals[posId] || 0) + elapsed;
-          }
-        } else {
-          stats.benchTotal += elapsed;
-          stats.stintBenchTotal += elapsed;
-        }
-        stats.sessionStart = null;
-      }
-    }
-    playerTimeStats = { ...playerTimeStats };
-  }
-
-  function getCurrentGameTime() {
-    return gameTimeStats.total + (gameLive && gameTimeStats.sessionStart ? Date.now() - gameTimeStats.sessionStart : 0);
-  }
-
-  function resumeTracking() {
-    const currentTime = Date.now();
-    if (gameLive && !gameTimeStats.sessionStart) {
-      gameTimeStats.sessionStart = currentTime;
-    }
-    roster.forEach(player => {
-      if (!playerTimeStats[player.id]) {
-        playerTimeStats[player.id] = { activeTotal: 0, benchTotal: 0, stintActiveTotal: 0, stintBenchTotal: 0, sessionStart: null, positionTotals: {} };
-      }
-    });
-    if (gameLive) {
-      roster.forEach(player => {
-        if (playerTimeStats[player.id] && !playerTimeStats[player.id].sessionStart) {
-          playerTimeStats[player.id].sessionStart = currentTime;
-        }
-      });
-    }
-    playerTimeStats = { ...playerTimeStats };
-  }
-
-  function updateLineup(newLineup) {
-    lineup = newLineup;
-    saveState();
-  }
-
-  function saveCurrentLineup() {
-    if (!gameStartedAt) {
-      alert("The first lineup will be applied when the 'Start game' button is pressed.");
-      return;
-    }
-    const hasEmpty = positions.some(p => !lineup[p.id]);
-    if (hasEmpty) {
-      const proceed = confirm("One or more positions are empty. Are you sure you want to apply this lineup?");
-      if (!proceed) return;
-    } else {
-      const proceed = confirm("Are you sure you want to apply this lineup?");
-      if (!proceed) return;
-    }
-    commitTime(); 
-    const oldActiveIds = new Set(Object.values(lastSavedLineup).filter(Boolean));
-    const newActiveIds = new Set(Object.values(lineup).filter(Boolean));
-    roster.forEach(player => {
-      const id = player.id;
-      if (!playerTimeStats[id]) return;
-      const wasActive = oldActiveIds.has(id);
-      const isActive = newActiveIds.has(id);
-      if (wasActive !== isActive) {
-        playerTimeStats[id].stintBenchTotal = 0;
-        playerTimeStats[id].stintActiveTotal = 0;
-      }
-    });
-    const currentGameTime = getCurrentGameTime();
-    const events = [];
-    positions.forEach(pos => {
-      const oldPlayerId = lastSavedLineup[pos.id];
-      const newPlayerId = lineup[pos.id];
-      if (oldPlayerId !== newPlayerId) {
-        if (oldPlayerId) {
-          events.push({ event: 'Exits lineup', playerId: oldPlayerId, detail: pos.name, gameTime: currentGameTime });
-        }
-        if (newPlayerId) {
-          events.push({ event: 'Enters lineup', playerId: newPlayerId, detail: pos.name, gameTime: currentGameTime });
-        }
-      }
-    });
-    if (events.length === 0) {
-      events.push({ event: 'Lineup snapshot', playerId: null, detail: 'No changes', gameTime: currentGameTime });
-    }
-    const entry = {
-      id: uniqueId('history'),
-      created: new Date().toISOString(),
-      lineup: JSON.parse(JSON.stringify(lineup)),
-      positions: JSON.parse(JSON.stringify(positions)),
-      roster: JSON.parse(JSON.stringify(roster)),
-      events
-    };
-    history = [entry, ...history];
-    resumeTracking(); 
-    saveState();
-  }
-
-  function addHistoryEntry(events) {
-    const activeLineup = history.length > 0 ? history[0].lineup : lineup; 
-    const currentGameTime = getCurrentGameTime();
-    const eventsWithTime = events.map(e => ({ ...e, gameTime: e.gameTime ?? currentGameTime }));
-    const entry = {
-      id: uniqueId('history'),
-      created: new Date().toISOString(),
-      lineup: JSON.parse(JSON.stringify(activeLineup)),
-      positions: JSON.parse(JSON.stringify(positions)),
-      roster: JSON.parse(JSON.stringify(roster)),
-      events: eventsWithTime
-    };
-    history = [entry, ...history];
-    saveState();
-  }
-
-  function openEventModal() {
-    eventType = 'goal';
-    eventTeam = 'mine';
-    eventScorer = '';
-    eventAssist = '';
-    eventCard = 'yellow';
-    eventPlayer = '';
-    showEventModal = true;
-  }
-
-  function saveGameEvent() {
-    const events = [];
-    let currentScore = { ...score }; 
-    if (eventType === 'goal') {
-      if (eventTeam === 'theirs') {
-        currentScore.theirs += 1;
-        events.push({ event: 'Goal conceded', playerId: null, detail: '', scoreAtTime: { ...currentScore } });
+  // --- Auth Functions ---
+  async function handleEmailAuth(e) {
+    e.preventDefault();
+    authError = '';
+    try {
+      if (isRegistering) {
+        await createUserWithEmailAndPassword(auth, email, password);
       } else {
-        currentScore.mine += 1;
-        events.push({ event: 'Goal scored', playerId: eventScorer, detail: '', scoreAtTime: { ...currentScore } });
-        if (eventAssist) {
-          events.push({ event: 'Goal assisted', playerId: eventAssist, detail: '' });
-        }
+        await signInWithEmailAndPassword(auth, email, password);
       }
-    } else if (eventType === 'booking') {
-      const cardType = eventCard === 'yellow' ? 'Yellow card' : 'Red card';
-      events.push({ event: cardType, playerId: eventPlayer, detail: '' });
-    }
-    addHistoryEntry(events);
-    showEventModal = false;
-  }
-
-  function ensureLineupSlots() {
-    positions.forEach((position) => {
-      if (!(position.id in lineup)) lineup[position.id] = null;
-    });
-    const validRosterIds = new Set(roster.map((player) => player.id));
-    Object.keys(lineup).forEach((posId) => {
-      if (lineup[posId] && !validRosterIds.has(lineup[posId])) lineup[posId] = null;
-    });
-  }
-
-  function startGame() {
-    if (history.length > 0) return;
-    const hasEmpty = positions.some(p => !lineup[p.id]);
-    if (hasEmpty) {
-      const proceed = confirm("One or more positions are empty. Are you sure you want to start the game with this lineup?");
-      if (!proceed) return;
-    }
-    commitTime();
-    gameStartedAt = Date.now();
-    gameTimeStats = { total: 0, sessionStart: null };
-    for (let id in playerTimeStats) {
-      playerTimeStats[id] = { activeTotal: 0, benchTotal: 0, stintActiveTotal: 0, stintBenchTotal: 0, sessionStart: null, positionTotals: {} };
-    }
-    const startEvents = [{ event: 'Game started', playerId: null, detail: '', gameTime: 0 }];
-    positions.forEach(pos => {
-      const playerId = lineup[pos.id];
-      if (playerId) {
-        startEvents.push({ event: 'Enters lineup', playerId, detail: pos.name, gameTime: 0 });
-      }
-    });
-    const entry = {
-      id: uniqueId('history'),
-      created: new Date().toISOString(),
-      lineup: JSON.parse(JSON.stringify(lineup)),
-      positions: JSON.parse(JSON.stringify(positions)),
-      roster: JSON.parse(JSON.stringify(roster)),
-      events: startEvents
-    };
-    history = [entry, ...history];
-    gameLive = true;
-    resumeTracking();
-    saveState();
-  }
-  
-  function toggleGameLive() {
-    if (!gameStartedAt) return;
-    commitTime();
-    gameLive = !gameLive;
-    resumeTracking();
-    addHistoryEntry([{ event: gameLive ? 'Game resumed' : 'Game paused', playerId: null, detail: '' }]);
-  }
-  
-  function clearLineup() {
-    if (confirm("Are you sure you want to clear all players from the current lineup?")) {
-      lineup = Object.keys(lineup).reduce((acc, key) => ({ ...acc, [key]: null }), {});
-      saveState();
+    } catch (error) {
+      authError = error.message.replace('Firebase: ', '');
     }
   }
 
-  function endGame() {
-    if (!confirm("Are you sure you want to end the game?")) return;
-    commitTime();
-    gameStartedAt = null;
-    gameLive = false;
-    resumeTracking();
-    addHistoryEntry([{ event: 'Game stopped', playerId: null, detail: '' }]);
+  async function handleGoogleLogin() {
+    authError = '';
+    const provider = new GoogleAuthProvider();
+    try {
+      await signInWithRedirect(auth, provider);
+    } catch (error) {
+      authError = error.message.replace('Firebase: ', '');
+    }
   }
 
-  function uniqueId(prefix) {
-    return `${prefix}-${Math.random().toString(36).slice(2, 10)}`;
+  // --- Dashboard Functions ---
+  $: if ($authStore.user) {
+    loadUserTeams();
   }
 
-  function addPlayer() {
-    const name = newPlayerName.trim();
-    if (!name) return;
-    roster = [...roster, { id: uniqueId('player'), name, available: true }]; 
-    newPlayerName = '';
-    resumeTracking();
-    saveState();
+  async function loadUserTeams() {
+    loadingTeams = true;
+    try {
+      const q = query(
+        collection(db, 'teams'), 
+        where('ownerId', '==', $authStore.user.uid)
+      );
+      const querySnapshot = await getDocs(q);
+      teams = querySnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    } catch (e) {
+      console.error("Error loading teams:", e);
+    } finally {
+      loadingTeams = false;
+    }
   }
 
-  function updatePlayerName(id, name) {
-    roster = roster.map((player) => (player.id === id ? { ...player, name } : player));
-    saveState();
-  }
-
-  function removePlayer(id) {
-    roster = roster.filter((player) => player.id !== id);
-    let newLineup = { ...lineup };
-    Object.keys(newLineup).forEach(posId => {
-      if (newLineup[posId] === id) newLineup[posId] = null;
-    });
-    delete playerTimeStats[id];
-    updateLineup(newLineup);
-  }
-
-  function togglePlayerAvailability(id, available) {
-    roster = roster.map((player) => (player.id === id ? { ...player, available } : player));
-    if (!available) {
-      let newLineup = { ...lineup };
-      let changed = false;
-      Object.keys(newLineup).forEach(posId => {
-        if (newLineup[posId] === id) {
-          newLineup[posId] = null;
-          changed = true;
-        }
+  async function createNewTeam() {
+    try {
+      const newTeamRef = await addDoc(collection(db, 'teams'), {
+        name: 'New Team',
+        ownerId: $authStore.user.uid,
+        roster: []
       });
-      if (changed) updateLineup(newLineup);
-    }
-    saveState();
-  }
-
-  function addPosition() {
-    const name = newPositionName.trim();
-    if (!name) return;
-    const id = uniqueId('position');
-    positions = [...positions, { id, name, parent: '' }];
-    lineup = { ...lineup, [id]: null };
-    newPositionName = '';
-    saveState();
-  }
-
-  function updatePositionName(id, name) {
-    positions = positions.map((position) => (position.id === id ? { ...position, name } : position));
-    saveState();
-  }
-
-  function updatePositionParent(id, parent) {
-    positions = positions.map((position) => (position.id === id ? { ...position, parent } : position));
-    saveState();
-  }
-
-  function removePosition(id) {
-    positions = positions.filter((position) => position.id !== id);
-    const { [id]: _, ...rest } = lineup;
-    updateLineup(rest);
-  }
-
-  function handlePositionSwapRealtime(targetId, srcId) {
-    if (!srcId || srcId === targetId) return;
-    const srcIdx = positions.findIndex(p => p.id === srcId);
-    const targetIdx = positions.findIndex(p => p.id === targetId);
-    if (srcIdx < 0 || targetIdx < 0) return;
-    const newPos = [...positions];
-    const [removed] = newPos.splice(srcIdx, 1);
-    newPos.splice(targetIdx, 0, removed);
-    positions = newPos;
-  }
-
-  function onDragStart(event, sourceType, id) {
-    event.dataTransfer.setData(`application/x-${sourceType}`, id);
-    event.dataTransfer.effectAllowed = 'move';
-  }
-
-  function selectItem(sourceType, id) {
-    if (selectedItem && selectedItem.sourceType === sourceType && selectedItem.id === id) {
-      selectedItem = null;
-      return;
-    }
-    selectedItem = { sourceType, id };
-  }
-
-  function setManagerTab(tab) {
-    managerTab = tab;
-    selectedItem = null;
-  }
-
-  function startTouchDrag(event, sourceType, id) {
-    if (event.pointerType !== 'touch') return;
-    if (sourceType === 'position') {
-      event.preventDefault(); 
-      event.stopPropagation();
-    }
-    touchDrag = { sourceType, id };
-  }
-
-  function cancelTouchDrag() {
-    touchDrag = null;
-    if (draggedPosId) draggedPosId = null;
-  }
-
-  function handleTouchMove(event) {
-    if (!touchDrag) return;
-    if (touchDrag.sourceType === 'position') {
-      event.preventDefault(); 
-      const x = event.touches[0].clientX;
-      const y = event.touches[0].clientY;
-      const targetElement = document.elementFromPoint(x, y);
-      const dropLi = targetElement?.closest('[data-position-id]');
-      if (dropLi) {
-        handlePositionSwapRealtime(dropLi.dataset.positionId, touchDrag.id);
-      }
+      goto(`/teams/${newTeamRef.id}`);
+    } catch (e) {
+      console.error("Error creating team:", e);
+      alert("Failed to create a new team.");
     }
   }
 
-  function handleKeydown(event) {
-    if (event.key === 'Escape') {
-      if (showEventModal) showEventModal = false;
-      if (viewingPlayerId) viewingPlayerId = null;
-      if (viewingPlannedPlayerId) viewingPlannedPlayerId = null;
-      if (showTimelineModal) showTimelineModal = false;
-      if (showPresetsModal) showPresetsModal = false;
-      if (showGamePlanModal) showGamePlanModal = false;
-      if (showEditModal) showEditModal = false;
-      if (editingPresetId) editingPresetId = null;
-      if (presetEditorObj) { presetEditorObj = null; presetEditorSelectedItem = null; }
-    }
-  }
+  // NEW FUNCTION: Delete Team
+  async function deleteTeam(teamId, teamName) {
+    const isConfirmed = confirm(`Are you sure you want to delete "${teamName}"? This will permanently remove the team and roster.`);
+    if (!isConfirmed) return;
 
-  function stopTouchDrag(event) {
-    if (!touchDrag) return;
-    if (touchDrag.sourceType === 'position') {
-      saveState(); 
-    } else {
-      let x = event.clientX;
-      let y = event.clientY;
-      if (event.type === 'touchend' && event.changedTouches?.length) {
-        x = event.changedTouches[0].clientX;
-        y = event.changedTouches[0].clientY;
-      }
-      const targetElement = document.elementFromPoint(x, y);
-      const dropTarget = targetElement?.closest('[data-drop-target]');
-      if (dropTarget) {
-        handlePointerDrop(dropTarget.dataset.dropTarget, dropTarget.dataset.dropId ?? null);
-      }
-    }
-    touchDrag = null;
-    draggedPosId = null;
-  }
-
-  function handlePointerDrop(targetType, targetId) {
-    if (!touchDrag) return;
-    const payload = touchDrag;
-    let newLineup = { ...lineup };
-    if (payload.sourceType === 'roster' && targetType === 'slot') {
-      newLineup[targetId] = payload.id;
-    } else if (payload.sourceType === 'slot' && targetType === 'slot') {
-      const sourcePos = payload.id;
-      const targetPos = targetId;
-      newLineup[sourcePos] = lineup[targetPos];
-      newLineup[targetPos] = lineup[sourcePos];
-    } else if (payload.sourceType === 'slot' && targetType === 'roster') {
-      newLineup[payload.id] = null;
-    }
-    updateLineup(newLineup);
-  }
-
-  function handleTapDrop(targetType, targetId) {
-    if (!selectedItem) return;
-    const payload = selectedItem;
-    selectedItem = null;
-    let newLineup = { ...lineup };
-    if (payload.sourceType === 'roster' && targetType === 'slot') {
-      newLineup[targetId] = payload.id;
-    } else if (payload.sourceType === 'slot' && targetType === 'slot') {
-      const sourcePos = payload.id;
-      const targetPos = targetId;
-      newLineup[sourcePos] = lineup[targetPos];
-      newLineup[targetPos] = lineup[sourcePos];
-    } else if (payload.sourceType === 'slot' && targetType === 'roster') {
-      newLineup[payload.id] = targetId; 
-    }
-    updateLineup(newLineup);
-  }
-
-  function handleSlotClick(posId) {
-    if (selectedItem) {
-      handleTapDrop('slot', posId);
-    } else {
-      selectItem('slot', posId);
-    }
-  }
-
-  function handleRosterClick(playerId) {
-    if (selectedItem && selectedItem.sourceType === 'slot') {
-      handleTapDrop('roster', playerId);
-    } else {
-      selectItem('roster', playerId);
-    }
-  }
-
-  function handleKeyboardAction(event, callback) {
-    if (event.key === 'Enter' || event.key === ' ') {
-      event.preventDefault();
-      callback();
-    }
-  }
-
-  function removeFromLineup(positionId) {
-    updateLineup({ ...lineup, [positionId]: null });
-  }
-
-  function undoSub(positionId) {
-    const prevPlayerId = lastSavedLineup[positionId] || null;
-    let newLineup = { ...lineup };
-    if (prevPlayerId) {
-      const existingPos = Object.keys(newLineup).find(pos => newLineup[pos] === prevPlayerId);
-      if (existingPos) {
-        newLineup[existingPos] = null;
-      }
-    }
-    newLineup[positionId] = prevPlayerId;
-    updateLineup(newLineup);
-  }
-
-  function handleDrop(event, targetType, targetId) {
-    const playerSrcId = event.dataTransfer.getData('application/x-roster');
-    const slotSrcId = event.dataTransfer.getData('application/x-slot');
-    let newLineup = { ...lineup };
-    if (playerSrcId && targetType === 'slot') {
-      newLineup[targetId] = playerSrcId;
-    } else if (slotSrcId && targetType === 'slot') {
-      newLineup[slotSrcId] = lineup[targetId];
-      newLineup[targetId] = lineup[slotSrcId];
-    } else if (slotSrcId && targetType === 'roster') {
-      newLineup[slotSrcId] = null;
-    }
-    if (playerSrcId || slotSrcId) {
-      updateLineup(newLineup);
-    }
-  }
-
-  function getPlayerNameFromRoster(id, rosterList) {
-    if (!id) return '';
-    const player = rosterList.find((item) => item.id === id);
-    return player ? player.name : 'Unknown player';
-  }
-
-  function getPlayerStatusText(id, players, desc=false) {
-    const p = players.find(p => p.id === id);
-    if (!p) return '';
-    if (p.inLiveLineup) return `${desc ? 'Field: ' : ''}${formatDuration(p.stintActiveMs)}`;
-    return `${desc ? 'Bench: ' : ''}${formatDuration(p.stintBenchMs)}`;
-  }
-
-  function formatDuration(durationMs) {
-    const totalSeconds = Math.max(0, Math.floor(durationMs / 1000));
-    const minutes = Math.floor(totalSeconds / 60);
-    const seconds = totalSeconds % 60;
-    return `${minutes}:${seconds.toString().padStart(2, '0')}`;
-  }
-
-  function openEditModal(item) {
-    if (gameLive) {
-      commitTime();
-      addHistoryEntry([{ event: 'Timeline sync', playerId: null, detail: 'Sync before edit' }]);
-    }
-    editingItem = JSON.parse(JSON.stringify(item));
-    const tMs = editingItem.events[0]?.gameTime || 0;
-    const totalSec = Math.floor(tMs / 1000);
-    editMin = Math.floor(totalSec / 60);
-    editSec = totalSec % 60;
-    editCascade = true;
-    showEditModal = true;
-  }
-
-  function saveEdit() {
-    const originalTimeMs = history.find(h => h.id === editingItem.id)?.events[0]?.gameTime || 0;
-    const newTimeMs = (editMin * 60 + editSec) * 1000;
-    const delta = newTimeMs - originalTimeMs;
-    const itemCreatedDate = new Date(editingItem.created);
-
-    history = history.map(h => {
-      if (h.id === editingItem.id) {
-         editingItem.events.forEach(e => e.gameTime = newTimeMs);
-         return editingItem;
-      }
-      if (editCascade && delta !== 0) {
-         const hDate = new Date(h.created);
-         if (hDate > itemCreatedDate) {
-            const shifted = { ...h };
-            shifted.events.forEach(e => {
-               e.gameTime = Math.max(0, (e.gameTime || 0) + delta);
-            });
-            return shifted;
-         }
-      }
-      return h;
-    });
-
-    recalculateStatsFromHistory();
-    showEditModal = false;
-  }
-
-  function recalculateStatsFromHistory() {
-    let newTotal = 0;
-    let newPlayerStats = {};
-    roster.forEach(p => {
-      newPlayerStats[p.id] = { 
-        activeTotal: 0, benchTotal: 0, stintActiveTotal: 0, stintBenchTotal: 0, 
-        sessionStart: null, positionTotals: {} 
-      };
-    });
-
-    let ascHistory = [...history].sort((a, b) => {
-      const aT = a.events[0]?.gameTime || 0;
-      const bT = b.events[0]?.gameTime || 0;
-      if (aT === bT) return new Date(a.created) - new Date(b.created);
-      return aT - bT;
-    });
-
-    let lastTime = 0;
-    let isLive = false;
-    let curLineup = {};
-
-    ascHistory.forEach(item => {
-      const t = item.events[0]?.gameTime || 0;
-      const delta = Math.max(0, t - lastTime);
-
-      if (isLive && delta > 0) {
-        newTotal += delta;
-        const actives = new Set(Object.values(curLineup).filter(Boolean));
-        roster.forEach(p => {
-          if (actives.has(p.id)) {
-            newPlayerStats[p.id].activeTotal += delta;
-            newPlayerStats[p.id].stintActiveTotal += delta;
-            const pos = Object.keys(curLineup).find(k => curLineup[k] === p.id);
-            if (pos) newPlayerStats[p.id].positionTotals[pos] = (newPlayerStats[p.id].positionTotals[pos] || 0) + delta;
-          } else {
-            newPlayerStats[p.id].benchTotal += delta;
-            newPlayerStats[p.id].stintBenchTotal += delta;
-          }
-        });
-      }
-
-      const events = item.events.map(e => e.event);
-      if (events.includes('Game started') || events.includes('Game resumed')) isLive = true;
-      if (events.includes('Game paused') || events.includes('Game stopped')) isLive = false;
-
-      const oldIds = new Set(Object.values(curLineup).filter(Boolean));
-      const newIds = new Set(Object.values(item.lineup).filter(Boolean));
-      roster.forEach(p => {
-        if (oldIds.has(p.id) !== newIds.has(p.id)) {
-          newPlayerStats[p.id].stintActiveTotal = 0;
-          newPlayerStats[p.id].stintBenchTotal = 0;
-        }
-      });
-
-      curLineup = item.lineup;
-      lastTime = t;
-    });
-
-    gameTimeStats.total = newTotal;
-    if (gameLive) {
-      const now = Date.now();
-      gameTimeStats.sessionStart = now;
-      roster.forEach(p => newPlayerStats[p.id].sessionStart = now);
-    } else {
-      gameTimeStats.sessionStart = null;
-    }
-    
-    playerTimeStats = newPlayerStats;
-    history = ascHistory.reverse(); 
-    saveState();
-  }
-
-  $: liveGameTime = gameTimeStats.total + (gameLive && gameTimeStats.sessionStart ? now - gameTimeStats.sessionStart : 0);
-
-  $: playerChronoSegments = (() => {
-    let chrono = {};
-    roster.forEach(p => chrono[p.id] = []);
-    const totalTimeMs = Math.max(1, liveGameTime);
-    
-    let ascHistory = [...history].sort((a,b) => {
-      const aT = a.events[0]?.gameTime || 0;
-      const bT = b.events[0]?.gameTime || 0;
-      if (aT === bT) return new Date(a.created) - new Date(b.created);
-      return aT - bT;
-    });
-
-    let lastTime = 0;
-    let currentLineup = {};
-    let isLive = false;
-
-    ascHistory.forEach(item => {
-        const t = item.events[0]?.gameTime || 0;
-        const delta = Math.max(0, t - lastTime);
-
-        if (isLive && delta > 0) {
-            roster.forEach(p => {
-                const posId = Object.keys(currentLineup).find(k => currentLineup[k] === p.id);
-                const group = posId ? getGroupForPos(posId) : 'Bench';
-                const pct = (delta / totalTimeMs) * 100;
-                if(pct > 0) {
-                    let arr = chrono[p.id];
-                    if(arr.length > 0 && arr[arr.length-1].group === group) arr[arr.length-1].pct += pct;
-                    else arr.push({ group, pct });
-                }
-            });
-        }
-
-        const events = item.events.map(e => e.event);
-        if (events.includes('Game started') || events.includes('Game resumed')) isLive = true;
-        if (events.includes('Game paused') || events.includes('Game stopped')) isLive = false;
-
-        currentLineup = item.lineup;
-        lastTime = t;
-    });
-
-    if (gameLive && liveGameTime > lastTime) {
-        const delta = liveGameTime - lastTime;
-        roster.forEach(p => {
-            const posId = Object.keys(currentLineup).find(k => currentLineup[k] === p.id);
-            const group = posId ? getGroupForPos(posId) : 'Bench';
-            const pct = (delta / totalTimeMs) * 100;
-            if(pct > 0) {
-                let arr = chrono[p.id];
-                if(arr.length > 0 && arr[arr.length-1].group === group) arr[arr.length-1].pct += pct;
-                else arr.push({ group, pct });
-            }
-        });
-    }
-    return chrono;
-  })();
-
-  $: rosterPlayers = roster.map((player) => {
-    const stats = playerTimeStats[player.id];
-    let activeSession = 0;
-    let benchSession = 0;
-    const inLiveLineup = Object.values(lastSavedLineup).includes(player.id);
-    const inDraftLineup = Object.values(lineup).includes(player.id);
-    
-    let currentPositionTotals = { ...(stats?.positionTotals || {}) };
-
-    if (stats && stats.sessionStart && gameLive) {
-      const elapsed = Math.max(0, now - stats.sessionStart);
-      if (inLiveLineup) {
-        activeSession = elapsed;
-        const livePosId = Object.keys(lastSavedLineup).find(p => lastSavedLineup[p] === player.id);
-        if (livePosId) {
-           currentPositionTotals[livePosId] = (currentPositionTotals[livePosId] || 0) + elapsed;
-        }
-      } else {
-        benchSession = elapsed;
-      }
-    }
-    
-    const activeDurationMs = (stats ? stats.activeTotal : 0) + activeSession;
-    const benchDurationMs = (stats ? stats.benchTotal : 0) + benchSession;
-    const totalDurationMs = activeDurationMs + benchDurationMs;
-    
-    let positionSegments = [];
-    let positionDetails = [];
-
-    if (totalDurationMs > 0) {
-      for (let posId in currentPositionTotals) {
-        const pTime = currentPositionTotals[posId];
-        if (pTime > 0) {
-           const posDef = positions.find(p => p.id === posId);
-           const pName = posDef ? posDef.name : 'Unknown';
-           const pGroup = posDef ? (posDef.parent || posDef.name).trim() || 'Unknown' : 'Unknown';
-           
-           positionSegments.push({ posId, group: pGroup, pct: (pTime / totalDurationMs) * 100 });
-           positionDetails.push({ posId, name: pName, group: pGroup, durationMs: pTime });
-        }
-      }
+    try {
+      // Delete from Firestore
+      await deleteDoc(doc(db, 'teams', teamId));
       
-      if (benchDurationMs > 0) {
-        positionSegments.push({ posId: 'bench', group: 'Bench', pct: (benchDurationMs / totalDurationMs) * 100 });
-      }
-    }
-    
-    positionDetails.sort((a,b) => b.durationMs - a.durationMs);
-
-    return {
-      ...player,
-      activeDurationMs,
-      benchDurationMs,
-      stintActiveMs: (stats ? stats.stintActiveTotal || 0 : 0) + activeSession,
-      stintBenchMs: (stats ? stats.stintBenchTotal || 0 : 0) + benchSession,
-      inLiveLineup,
-      inDraftLineup,
-      positionSegments,
-      chronoSegments: playerChronoSegments[player.id] || [],
-      positionDetails
-    };
-  });
-
-  $: sortedManagerRoster = [...roster].sort((a,b) => {
-    return a.name.localeCompare(b.name);
-  });
-
-  $: sortedLineupRoster = [...rosterPlayers]
-    .filter(p => p.available) 
-    .sort((a, b) => {
-      if (lineupRosterSort === 'name') {
-        return a.name.localeCompare(b.name);
-      } else if (lineupRosterSort === 'status') {
-         const getRank = (p) => {
-           if (!p.inLiveLineup && !p.inDraftLineup) return 0; 
-           if (!p.inLiveLineup && p.inDraftLineup) return 1;  
-           if (p.inLiveLineup && !p.inDraftLineup) return 2;  
-           return 3; 
-         };
-         const rankA = getRank(a), rankB = getRank(b);
-         return rankA !== rankB ? rankA - rankB : a.name.localeCompare(b.name);
-      }else if (lineupRosterSort === 'total') {
-        return b.activeDurationMs - a.activeDurationMs;
-      } else if (lineupRosterSort === 'stintActive') {
-        return (a.stintBenchMs - a.stintActiveMs) - (b.stintBenchMs - b.stintActiveMs);
-      } else if (lineupRosterSort === 'stintBench') {
-        return (b.stintBenchMs - b.stintActiveMs) - (a.stintBenchMs - a.stintActiveMs);
-      }
-      return 0;
-    });
-
-  $: activeStatsPlayer = viewingPlayerId ? rosterPlayers.find(p => p.id === viewingPlayerId) : null;
-
-  $: score = history.reduce((acc, item) => {
-    item.events.forEach(ev => {
-      if (ev.event === 'Goal scored') acc.mine++;
-      if (ev.event === 'Goal conceded') acc.theirs++;
-    });
-    return acc;
-  }, { mine: 0, theirs: 0 });
-
-  $: goalTimeline = [...history].reverse().flatMap(item => 
-    item.events
-      .filter(e => e.event === 'Goal scored' || e.event === 'Goal conceded')
-      .map(e => ({
-        id: item.id + '-' + e.event,
-        gameTime: e.gameTime || 0,
-        event: e.event,
-        playerId: e.playerId,
-        roster: item.roster,
-        scoreAtTime: e.scoreAtTime || { mine: 0, theirs: 0 }
-      }))
-  );
-
-  function hasSavedDifference(positionId, currentLineup, savedLineup, currentRoster, savedRoster, historyList) {
-    if (!historyList || historyList.length === 0) return false;
-    const currentName = currentLineup[positionId] ? getPlayerNameFromRoster(currentLineup[positionId], currentRoster) : '';
-    const savedName = savedLineup[positionId] ? getPlayerNameFromRoster(savedLineup[positionId], savedRoster) : '';
-    return currentName !== savedName;
-  }
-
-  function csvEscape(value) {
-    const stringValue = String(value ?? '');
-    return `"${stringValue.replace(/"/g, '""')}"`;
-  }
-
-  function exportHistoryCsv() {
-    if (!history.length) return;
-    const rows = [['Event', 'Timestamp', 'Game Time', 'Player', 'Detail']];
-    
-    [...history].reverse().forEach((item) => {
-      const timestamp = new Date(item.created).toLocaleString();
-      item.events.forEach(ev => {
-        const playerName = ev.playerId ? getPlayerNameFromRoster(ev.playerId, item.roster) : '';
-        const scoreStr = ev.scoreAtTime ? `Score: ${ev.scoreAtTime.mine}-${ev.scoreAtTime.theirs}` : '';
-        rows.push([
-          ev.event,
-          timestamp,
-          formatDuration(ev.gameTime || 0),
-          playerName,
-          (ev.detail || '') + scoreStr
-        ]);
-      });
-    });
-
-    const csv = rows.map((row) => row.map(csvEscape).join(',')).join('\n');
-    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    const safeGameName = gameName.trim() ? gameName.trim().replace(/[^a-z0-9]/gi, '_').toLowerCase() : 'lineup';
-    link.setAttribute('download', `${safeGameName}-history.csv`);
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    URL.revokeObjectURL(url);
-  }
-
-  function recallLineup(entry) {
-    const newLineup = JSON.parse(JSON.stringify(entry.lineup));
-    positions = JSON.parse(JSON.stringify(entry.positions));
-    roster = JSON.parse(JSON.stringify(entry.roster));
-    updateLineup(newLineup);
-    ensureLineupSlots();
-    saveState();
-  }
-
-  function isLineupRecallable(item) {
-    const nonRecallableEvents = [
-      'Goal scored', 'Goal conceded', 'Goal assisted', 'Yellow card', 'Red card', 'Game resumed', 'Game paused', 'Game stopped'
-    ];
-    return !item.events.some(e => nonRecallableEvents.includes(e.event));
-  }
-
-  function removeHistoryItem(id) {
-    history = history.filter((item) => item.id !== id);
-    saveState();
-  }
-
-  function clearEvents() {
-    const proceed = confirm('Are you sure you want to remove all history items, reset all timers to 0, and end the current game?');
-    if (proceed) {
-      history = [];
-      gameTimeStats = { total: 0, sessionStart: null };
-      for (let id in playerTimeStats) {
-        playerTimeStats[id] = {
-          activeTotal: 0,
-          benchTotal: 0,
-          stintActiveTotal: 0,
-          stintBenchTotal: 0,
-          sessionStart: null,
-          positionTotals: {}
-        };
-      }
-      gameStartedAt = null;
-      gameLive = false;
-      gameName = ''; 
-      saveState();
+      // Remove from local UI state reactively
+      teams = teams.filter(t => t.id !== teamId);
+    } catch (error) {
+      console.error("Error deleting team:", error);
+      alert("Failed to delete team.");
     }
   }
-
-  function getPlayerPositionGroupDetails(p) {
-    const groupMap = {};
-    p.positionDetails.forEach(d => {
-      if (!groupMap[d.group]) groupMap[d.group] = 0;
-      groupMap[d.group] += d.durationMs;
-    });
-    const sortedGroups = Object.keys(groupMap).sort((a,b) => groupMap[b] - groupMap[a]);
-    return sortedGroups.map(g => ({group: g, durationMs: groupMap[g]}));
-  }
-
-  onMount(() => {
-    loadState();
-    const timer = setInterval(() => {
-      now = Date.now();
-    }, 1000);
-    return () => clearInterval(timer);
-  });
 </script>
 
-<svelte:window 
-  on:touchmove|nonpassive={handleTouchMove}
-  on:touchend={stopTouchDrag} 
-  on:touchcancel={cancelTouchDrag} 
-  on:pointerup={stopTouchDrag} 
-  on:pointercancel={cancelTouchDrag}
-  on:keydown={handleKeydown} 
-/>
+<svelte:head>
+  <title>Lineup Helper Pro</title>
+</svelte:head>
 
-<div class="toast-container">
-  {#each toasts as toast (toast.id)}
-     <div class="toast" transition:fade>{toast.msg}</div>
-  {/each}
-</div>
+{#if !$authStore.user}
+  <!-- ... (KEEP YOUR EXISTING UNAUTHENTICATED HERO/LOGIN VIEW HERE) ... -->
+  <!-- ... (I omitted it here for brevity, keep the div class="hero-container" stuff) ... -->
+  
+{:else}
+  <!-- AUTHENTICATED VIEW: COACH DASHBOARD -->
+  <div class="dashboard">
+    <header class="dash-header">
+      <h1>Coach Dashboard</h1>
+      <button class="btn-primary" on:click={createNewTeam}>+ Create New Team</button>
+    </header>
 
-{#if showEventModal}
-  <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
-  <div class="modal-backdrop" on:click={() => showEventModal = false}>
-    <div class="modal-panel" on:click|stopPropagation>
-      <h2>Add Game Event</h2>
+    <section class="teams-section">
+      <h2>My Teams</h2>
       
-      <div class="form-group">
-        <label for="event-type">Event Type</label>
-        <select id="event-type" bind:value={eventType}>
-          <option value="goal">Goal</option>
-          <option value="booking">Booking (Card)</option>
-        </select>
-      </div>
-
-      {#if eventType === 'goal'}
-        <div class="form-group">
-          <label for="event-team">Team</label>
-          <select id="event-team" bind:value={eventTeam}>
-            <option value="mine">Our Team</option>
-            <option value="theirs">Opposing Team</option>
-          </select>
-        </div>
-        {#if eventTeam === 'mine'}
-          <div class="form-group">
-            <label for="event-scorer">Goal Scorer</label>
-            <select id="event-scorer" bind:value={eventScorer}>
-              <option value="">-- Select Player --</option>
-              {#each sortedLineupRoster as p}
-                <option value={p.id}>{p.name}</option>
-              {/each}
-            </select>
-          </div>
-          <div class="form-group">
-            <label for="event-assist">Assist (optional)</label>
-            <select id="event-assist" bind:value={eventAssist}>
-              <option value="">-- None --</option>
-              {#each sortedLineupRoster as p}
-                <option value={p.id}>{p.name}</option>
-              {/each}
-            </select>
-          </div>
-        {/if}
-      {:else if eventType === 'booking'}
-        <div class="form-group">
-          <label for="event-card">Card</label>
-          <select id="event-card" bind:value={eventCard}>
-            <option value="yellow">Yellow Card</option>
-            <option value="red">Red Card</option>
-          </select>
-        </div>
-        <div class="form-group">
-          <label for="event-player">Player</label>
-          <select id="event-player" bind:value={eventPlayer}>
-            <option value="">-- Select Player --</option>
-            {#each sortedLineupRoster as p}
-              <option value={p.id}>{p.name}</option>
-            {/each}
-          </select>
-        </div>
-      {/if}
-
-      <div class="modal-actions">
-        <button class="secondary" on:click={() => showEventModal = false}>Cancel</button>
-        <button class="primary" on:click={saveGameEvent} disabled={
-          (eventType === 'goal' && eventTeam === 'mine' && !eventScorer) ||
-          (eventType === 'booking' && !eventPlayer)
-        }>Save Event</button>
-      </div>
-    </div>
-  </div>
-{/if}
-
-{#if showTimelineModal}
-  <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
-  <div class="modal-backdrop" on:click={() => showTimelineModal = false}>
-    <div class="modal-panel" on:click|stopPropagation>
-      <h2>Goal Timeline</h2>
-      
-      {#if goalTimeline.length === 0}
-        <p class="muted">No goals have been scored yet.</p>
+      {#if loadingTeams}
+        <p class="muted">Loading your teams...</p>
       {:else}
-        <ul class="stats-list timeline-list">
-          {#each goalTimeline as goal}
-            <li>
-              <div style="display: flex; flex-direction: column; gap: 0.25rem;">
-                <strong>{formatDuration(goal.gameTime)} - {goal.event === 'Goal scored' ? 'Our Goal' : 'Opponent Goal'}</strong>
-                <span class="muted">
-                  {goal.event === 'Goal scored' ? getPlayerNameFromRoster(goal.playerId, goal.roster) : 'Opponent'}
-                </span>
+        <div class="grid-layout">
+          {#each teams as team}
+            <div class="team-card"><button 
+                class="btn-delete-card" 
+                on:click={() => deleteTeam(team.id, team.name)}
+                title="Delete Team"
+              >
+                ✕
+              </button>
+              <h3>{team.name}</h3>
+              <p class="muted">{team.roster?.length || 0} Players on Roster</p>
+              <div class="team-actions">
+                <a href="/teams/{team.id}" class="btn-secondary">Manage Team</a>
+                <a href="/teams/{team.id}/schedule" class="btn-secondary">Schedule</a>
               </div>
-              <div class="score-timeline-box">
-                <span style="color: #34d399;">{goal.scoreAtTime.mine}</span>
-                <span style="color: #475569; margin: 0 0.2rem;">-</span>
-                <span style="color: #ef4444;">{goal.scoreAtTime.theirs}</span>
-              </div>
-            </li>
-          {/each}
-        </ul>
-      {/if}
-
-      <div class="modal-actions">
-        <button class="secondary" on:click={() => showTimelineModal = false}>Close</button>
-      </div>
-    </div>
-  </div>
-{/if}
-
-<!-- PRESETS MODAL -->
-{#if showPresetsModal}
-  <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
-  <div class="modal-backdrop" on:click={() => showPresetsModal = false}>
-    <div class="modal-panel" on:click|stopPropagation>
-      <h2>Lineup Presets</h2>
-
-      <div style="display: flex; gap: 0.5rem; margin-bottom: 1.5rem;">
-        <input 
-          style="flex: 1; padding: 0.75rem; border-radius: 0.75rem; border: 1px solid #334155; background: #0f172a; color: #f8fafc;" 
-          type="text" 
-          placeholder="New preset name..." 
-          bind:value={newPresetName} 
-          on:keydown={(e) => { if (e.key === 'Enter') saveAsPreset() }}
-        />
-        <button class="primary" on:click={saveAsPreset} disabled={!newPresetName.trim()}>Save Current</button>
-      </div>
-
-      {#if presets.length === 0}
-        <p class="muted">No presets saved yet. Build a lineup and save it here.</p>
-      {:else}
-        <ul class="stats-list timeline-list presets-list" style="max-height: 45vh;">
-          {#each presets as preset (preset.id)}
-            <li class:is-dragging={draggedPresetId === preset.id}
-                animate:flip={{ duration: 250 }}
-                on:dragenter={() => { if (draggedPresetId) handlePresetSwap(preset.id, draggedPresetId); }}
-                on:dragover|preventDefault>
-                
-              <div class="drag-handle" 
-                   role="button" tabindex="0" draggable="true"
-                   on:dragstart={(e) => { draggedPresetId = preset.id; e.dataTransfer.effectAllowed = 'move'; }}
-                   on:dragend={() => { draggedPresetId = null; saveState(); }}>☰</div>
-
-              <div style="flex: 1; display: flex; align-items: center; min-width: 0; margin-left: 0.5rem;">
-                {#if editingPresetId === preset.id}
-                  <input type="text" bind:value={editingPresetName} use:autoFocus
-                         on:keydown={(e) => { if (e.key === 'Enter') savePresetName(preset.id); if (e.key === 'Escape') editingPresetId = null; }}
-                         on:blur={() => savePresetName(preset.id)}
-                         style="width: 100%; padding: 0.25rem 0.5rem; border-radius: 0.25rem; background: #0f172a; color: white; border: 1px solid #2563eb;" />
-                {:else}
-                  <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
-                  <strong class="preset-name-text" 
-                          on:click={() => startEditingPreset(preset)}
-                          title="Click to edit name">{preset.name}</strong>
-                {/if}
-              </div>
-
-              <div style="display: flex; gap: 0.5rem; margin-left: 0.5rem;">
-                <button class="secondary small" on:click={() => openPresetEditor(preset)}>Edit</button>
-                <button class="secondary small" on:click={() => loadPreset(preset)}>Load</button>
-                <button class="secondary small" style="background:#7f1d1d; min-width: 0; padding: 0.5rem;" on:click={() => deletePreset(preset.id)}>
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                    <line x1="18" y1="6" x2="6" y2="18"></line>
-                    <line x1="6" y1="6" x2="18" y2="18"></line>
-                  </svg>
-                </button>
-              </div>
-            </li>
-          {/each}
-        </ul>
-      {/if}
-
-      <div class="modal-actions">
-        <button class="secondary" on:click={() => showPresetsModal = false}>Close</button>
-      </div>
-    </div>
-  </div>
-{/if}
-
-<!-- PRESET EDITOR MODAL -->
-{#if presetEditorObj}
-  <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
-  <div class="modal-backdrop preset-editor-backdrop" on:click={() => { presetEditorObj = null; presetEditorSelectedItem = null; }} style="z-index: 1002;">
-    <div class="modal-panel large-modal preset-editor-panel" on:click|stopPropagation style="max-height: 95vh; display: flex; flex-direction: column;">
-      <h2>Editing Preset: {presetEditorObj.name}</h2>
-      
-      <div class="list-columns" style="flex: 1; min-height: 0; overflow: hidden;">
-        <div class="list-column lineup-column" style="display: flex; flex-direction: column;">
-          <h3 style="margin-top:0;">Lineup Slots</h3>
-          <div class="scroll-box" style="flex: 1;">
-            <ul class="lineup-list">
-              {#each positions as position}
-                <li>
-                  <div class="lineup-item"
-                        class:selected={presetEditorSelectedItem?.sourceType === 'presetSlot' && presetEditorSelectedItem?.id === position.id}
-                        class:empty-slot={!presetEditorObj.lineup[position.id]}
-                        on:click={() => handlePresetSlotClick(position.id)}
-                        role="button" tabindex="0" on:keydown={(e) => handleKeyboardAction(e, () => handlePresetSlotClick(position.id))}>
-                    <div class="lineup-row">
-                        <div class="position-badge">
-                          <span class="position-name">{position.name}</span>
-                          <div class="position-color-bar" style="background-color: {groupColors[(position.parent || position.name).trim() || 'Unknown']}"></div>
-                        </div>
-                        <span class="player-name">
-                          {#if presetEditorObj.lineup[position.id]}
-                              {getPlayerNameFromRoster(presetEditorObj.lineup[position.id], roster)}
-                          {:else}
-                              <span class="slot-empty">Tap player, then tap here</span>
-                          {/if}
-                        </span>
-                        <div class="lineup-item-actions">
-                          {#if presetEditorObj.lineup[position.id]}
-                              <button class="remove-lineup" on:click|stopPropagation={() => removePlayerFromPresetSlot(position.id)}>Remove</button>
-                          {/if}
-                        </div>
-                    </div>
-                  </div>
-                </li>
-              {/each}
-            </ul>
-          </div>
-        </div>
-
-        <div class="list-column roster-column" style="display: flex; flex-direction: column;">
-          <h3 style="margin-top:0;">Available Players</h3>
-          <div class="scroll-box" style="flex: 1;">
-            <ul class="list">
-              {#each roster.filter(p => p.available).sort((a,b) => a.name.localeCompare(b.name)) as player}
-                {@const isDrafted = Object.values(presetEditorObj.lineup).includes(player.id)}
-                <li>
-                  <button class="list-item roster-list-item"
-                      class:selected={presetEditorSelectedItem?.sourceType === 'presetRoster' && presetEditorSelectedItem?.id === player.id}
-                      disabled={isDrafted}
-                      on:click={() => !isDrafted && handlePresetRosterClick(player.id)}>
-                    <div class="roster-item-top">
-                        <div class="roster-item-name">{player.name}</div>
-                        {#if isDrafted}
-                          <svg title="In Preset Lineup" width="14" height="14" viewBox="0 0 24 24" fill="#34d399"><circle cx="12" cy="12" r="8"></circle></svg>
-                        {/if}
-                    </div>
-                  </button>
-                </li>
-              {/each}
-            </ul>
-          </div>
-        </div>
-      </div>
-
-      <div class="modal-actions" style="margin-top: 1rem;">
-        <button class="secondary" on:click={() => { presetEditorObj = null; presetEditorSelectedItem = null; }}>Cancel</button>
-        <button class="primary" on:click={savePresetEditor}>Save Changes</button>
-      </div>
-    </div>
-  </div>
-{/if}
-
-
-<!-- GAME PLAN MODAL -->
-{#if showGamePlanModal}
-  <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
-  <div class="modal-backdrop" on:click={() => showGamePlanModal = false} style="z-index: 999;">
-    <div class="modal-panel large-modal" on:click|stopPropagation style="max-height: 95vh; display: flex; flex-direction: column;">
-      <h2>Game Plan</h2>
-      {#if presets.length === 0}
-        <p class="muted">You need to create some presets in the Lineup Editor first!</p>
-      {:else}
-        <div class="grid-layout" style="flex: 1;">
-          <!-- Left Side: Sequence Builder -->
-          <div class="panel" style="display: flex; flex-direction: column;">
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
-              <h3 style="margin: 0; color: #f8fafc;">Rotation Sequence</h3>
-              <button class="secondary small" on:click={addPlanStep}>+ Add Step</button>
             </div>
-
-            <ul class="list scroll-box" style="flex: 1;">
-              {#each gamePlanSequence as step, idx (step.id)}
-                <li class="list-item"
-                    style="padding: 0.5rem;"
-                    class:is-dragging={draggedPlanStepId === step.id}
-                    animate:flip={{ duration: 250 }}
-                    on:dragenter={() => { if (draggedPlanStepId) handlePlanStepSwap(step.id, draggedPlanStepId); }}
-                    on:dragover|preventDefault>
-                  
-                  <div class="drag-handle" 
-                       role="button" tabindex="0" draggable="true"
-                       on:dragstart={(e) => { draggedPlanStepId = step.id; e.dataTransfer.effectAllowed = 'move'; }}
-                       on:dragend={() => { draggedPlanStepId = null; saveState(); }}>☰</div>
-
-                  <div style="display: flex; flex: 1; gap: 0.5rem; align-items: center; flex-wrap: wrap;">
-                    <div style="display: flex; align-items: center;">
-                      <span style="font-weight: bold; color: #64748b; width: 20px;">{idx + 1}.</span>
-                      <select bind:value={step.presetId} on:change={saveState} style="flex: 1; padding: 0.5rem; border-radius: 0.5rem; background: #0f172a; color: white; border: 1px solid #334155;">
-                        <option value="">-- Select Preset --</option>
-                        {#each presets as preset}
-                          <option value={preset.id}>{preset.name}</option>
-                        {/each}
-                      </select>
-                    </div>
-                    <div style="display: flex; align-items: center; gap: 0.25rem;">
-                      <input type="number" min="1" max="120" bind:value={step.durationMins} on:change={saveState} style="width: 60px; padding: 0.5rem; border-radius: 0.5rem; background: #0f172a; color: white; border: 1px solid #334155; text-align: center;" />
-                      <span class="muted">mins</span>
-                    </div>
-                  </div>
-
-                  <button class="mini" style="margin-left: 0.5rem;" on:click={() => removePlanStep(step.id)}>×</button>
-                </li>
-              {/each}
-              {#if gamePlanSequence.length === 0}
-                <p class="muted" style="padding: 1rem 0;">Click '+ Add Step' to start building your game plan.</p>
-              {/if}
-            </ul>
-          </div>
-
-          <!-- Right Side: Generated Report -->
-          <div class="panel list-column" style="display: flex; flex-direction: column;">
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
-              <h3 style="margin: 0; color: #f8fafc;">Estimated Playing Time</h3>
-            </div>
-
-            <div class="tabs" style="margin-bottom: 0.5rem;">
-               <button class="tab-button {planTab === 'players' ? 'active' : ''}" style="padding: 0.5rem;" on:click={() => planTab='players'}>Players</button>
-               <button class="tab-button {planTab === 'positions' ? 'active' : ''}" style="padding: 0.5rem;" on:click={() => planTab='positions'}>Positions</button>
-               <button class="tab-button {planTab === 'groups' ? 'active' : ''}" style="padding: 0.5rem;" on:click={() => planTab='groups'}>Groups</button>
-            </div>
-
-            <div class="scroll-box" style="flex: 1;">
-              {#if planTab === 'players'}
-                <div class="sort-controls" style="margin-bottom: 0.5rem; justify-content: flex-end;">
-                  <label>Bar Mode:</label>
-                  <select bind:value={barMode}>
-                    <option value="aggregate">Grouped</option>
-                    <option value="chrono">Timeline</option>
-                  </select>
-                </div>
-                <ul class="list">
-                  {#each plannedRosterPlayers as player (player.id)}
-                    <li>
-                      <div class="list-item roster-list-item" style="cursor: default; touch-action: auto;">
-                        <div class="roster-item-top">
-                          <div style="display: flex; align-items: center; min-width: 0; gap: 0.5rem; flex: 1;">
-                            <span
-                              class="info-btn"
-                              role="button"
-                              tabindex="0"
-                              on:click|stopPropagation={() => viewingPlannedPlayerId = player.id}
-                              on:keydown={(event) => handleKeyboardAction(event, () => viewingPlannedPlayerId = player.id)}
-                            >
-                              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                <circle cx="12" cy="12" r="10"></circle>
-                                <line x1="12" y1="16" x2="12" y2="12"></line>
-                                <line x1="12" y1="8" x2="12.01" y2="8"></line>
-                              </svg>
-                            </span>
-                            <div class="roster-item-name" style="flex: unset;">{player.name}</div>
-                          </div>
-                          
-                          <div class="roster-item-stats">
-                            <div style="font-weight: bold; color: {player.activeDurationMs > 0 ? '#34d399' : '#94a3b8'}">
-                              {formatDuration(player.activeDurationMs)}
-                            </div>
-                          </div>
-                        </div>
-                        
-                        {#if barMode === 'aggregate'}
-                          {#if player.positionSegments?.length > 0}
-                            <div class="player-position-bar" on:click={() => console.log('hi')}>
-                              {#each player.positionSegments as seg}
-                                <div class="pos-segment" style="width: {seg.pct}%; background-color: {groupColors[seg.group]}" title="{seg.group}"></div>
-                              {/each}
-                            </div>
-                          {/if}
-                        {:else}
-                          {#if player.chronoSegments?.length > 0}
-                            <div class="player-position-bar">
-                              {#each player.chronoSegments as seg}
-                                <div class="pos-segment" style="width: {seg.pct}%; background-color: {groupColors[seg.group]}" title="{seg.group}"></div>
-                              {/each}
-                            </div>
-                          {/if}
-                        {/if}
-                      </div>
-                    </li>
-                  {/each}
-                </ul>
-              {:else if planTab === 'positions'}
-                 <ul class="list">
-                 {#each planPositionTotals as pos}
-                    <li class="list-item" style="flex-direction: column; align-items: stretch; padding: 0.75rem;">
-                       <div style="display:flex; justify-content: space-between; font-weight: bold; margin-bottom: 0.5rem; color: #f8fafc;">
-                          <span>{pos.name}</span>
-                          <span style="color: #34d399;">{formatDuration(pos.totalMs)}</span>
-                       </div>
-                       {#each pos.players as pt}
-                          <div style="display:flex; justify-content: space-between; font-size: 0.9em; color: #cbd5e1; margin-bottom: 0.2rem; padding-left: 0.5rem; border-left: 2px solid #334155;">
-                             <span>{pt.player.name}</span>
-                             <span>{formatDuration(pt.durationMs)}</span>
-                          </div>
-                       {/each}
-                    </li>
-                 {/each}
-                 </ul>
-              {:else if planTab === 'groups'}
-                 <ul class="list">
-                 {#each planGroupTotals as grp}
-                    <li class="list-item" style="flex-direction: column; align-items: stretch; padding: 0.75rem;">
-                       <div style="display:flex; justify-content: space-between; font-weight: bold; margin-bottom: 0.5rem; color: #f8fafc;">
-                          <div style="display:flex; align-items:center; gap: 0.5rem;">
-                             <div style="width:12px; height:12px; border-radius:2px; background-color:{groupColors[grp.group]}"></div>
-                             {grp.group}
-                          </div>
-                          <span style="color: #34d399;">{formatDuration(grp.totalMs)}</span>
-                       </div>
-                       {#each grp.players as pt}
-                          <div style="display:flex; justify-content: space-between; font-size: 0.9em; color: #cbd5e1; margin-bottom: 0.2rem; padding-left: 0.5rem; border-left: 2px solid #334155;">
-                             <span>{pt.player.name}</span>
-                             <span>{formatDuration(pt.durationMs)}</span>
-                          </div>
-                       {/each}
-                    </li>
-                 {/each}
-                 </ul>
-              {/if}
-            </div>
-          </div>
-        </div>
-      {/if}
-
-      <div class="modal-actions" style="margin-top: 1rem;">
-        <button class="secondary small" on:click={exportPlanCsv}>Export CSV</button>
-        <button class="secondary" on:click={() => showGamePlanModal = false}>Close</button>
-      </div>
-    </div>
-  </div>
-{/if}
-
-{#if showEditModal && editingItem}
-  <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
-  <div class="modal-backdrop" on:click={() => showEditModal = false} style="z-index: 1000;">
-    <div class="modal-panel" on:click|stopPropagation>
-      <h2>Edit Timeline Event</h2>
-      
-      <div class="form-group">
-        <label>Game Time (Min : Sec)</label>
-        <div style="display: flex; gap: 0.5rem; align-items: center;">
-          <input type="number" min="0" bind:value={editMin} style="width: 80px; padding: 0.75rem; border-radius: 0.5rem; background: #0f172a; border: 1px solid #334155; color: white; text-align: center;" />
-          <span style="color: white; font-weight: bold;">:</span>
-          <input type="number" min="0" max="59" bind:value={editSec} style="width: 80px; padding: 0.75rem; border-radius: 0.5rem; background: #0f172a; border: 1px solid #334155; color: white; text-align: center;" />
-        </div>
-      </div>
-
-      <div class="form-group" style="flex-direction: row; align-items: center; gap: 0.75rem; margin-top: 0.5rem;">
-        <input type="checkbox" id="edit-cascade" bind:checked={editCascade} style="width: 1.25rem; height: 1.25rem; accent-color: #2563eb;" />
-        <label for="edit-cascade" style="margin: 0; cursor: pointer; line-height: 1.4;">
-          Shift all subsequent events by the same amount 
-          <br/><small class="muted">(Keeps the rest of the game chronological)</small>
-        </label>
-      </div>
-
-      <hr style="border: none; border-top: 1px solid #334155; margin: 1.5rem 0;" />
-
-      {#each editingItem.events as ev}
-        {#if ['Goal scored', 'Goal assisted', 'Yellow card', 'Red card'].includes(ev.event)}
-          <div class="form-group">
-            <label>{ev.event} Player</label>
-            <select bind:value={ev.playerId}>
-              <option value="">-- Unknown / None --</option>
-              {#each roster as p}
-                <option value={p.id}>{p.name}</option>
-              {/each}
-            </select>
-          </div>
-        {/if}
-      {/each}
-
-      <div class="modal-actions">
-        <button class="secondary" on:click={() => showEditModal = false}>Cancel</button>
-        <button class="primary" on:click={saveEdit}>Save Changes</button>
-      </div>
-    </div>
-  </div>
-{/if}
-
-<!-- SHARED DETAIL MODAL FOR BOTH REGULAR ROSTER AND GAME PLAN -->
-{#if activeStatsPlayer || activePlannedStatsPlayer}
-  {@const modalPlayer = activePlannedStatsPlayer || activeStatsPlayer}
-  <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
-  <div class="modal-backdrop" on:click={() => { viewingPlayerId = null; viewingPlannedPlayerId = null; }} style="z-index: 1001;">
-    <div class="modal-panel" on:click|stopPropagation>
-      <h2 style="display: flex; justify-content: space-between; align-items: center;">
-        {modalPlayer.name}
-        {#if activePlannedStatsPlayer}
-           <span class="status-chip live" style="font-size: 0.75rem; background: #6366f1;">PLAN REPORT</span>
-        {/if}
-      </h2>
-      
-      <div class="stats-list-totals">
-        <div>
-          <span>Total {activePlannedStatsPlayer ? 'Planned Field' : 'Field'} Time</span>
-          <span style="font-weight: bold; color: #34d399;">{formatDuration(modalPlayer.activeDurationMs)}</span>
-        </div>
-        <div>
-          <span>Total {activePlannedStatsPlayer ? 'Planned Bench' : 'Bench'} Time</span>
-          <span style="font-weight: bold; color: #94a3b8;">{formatDuration(modalPlayer.benchDurationMs)}</span>
-        </div>
-      </div>
-
-      {#if modalPlayer.positionDetails.length > 0}
-        <h3 style="margin-top: 0; color: #cbd5e1; font-size: 1rem;">Positions Played</h3>
-        <ul class="stats-list">
-          {#each modalPlayer.positionDetails as pos}
-            <li>
-               <div style="display: flex; align-items: center; gap: 0.5rem;">
-                 <div class="position-color-bar" style="width: 12px; height: 12px; border-radius: 2px; background-color: {groupColors[pos.group]}"></div>
-                 <span>{pos.name} <span class="muted" style="font-size: 0.85em;">({pos.group})</span></span>
-               </div>
-               <span>{formatDuration(pos.durationMs)}</span>
-            </li>
           {/each}
-        </ul>
-      {:else}
-        <p class="muted">No field time {activePlannedStatsPlayer ? 'planned' : 'yet'}.</p>
-      {/if}
-
-      {#if modalPlayer.positionDetails.length > 0}
-        <h3 style="margin-top: 0; color: #cbd5e1; font-size: 1rem;">Position Groups Played</h3>
-        <ul class="stats-list">
-          {#each getPlayerPositionGroupDetails(modalPlayer) as pos}
-            <li>
-               <div style="display: flex; align-items: center; gap: 0.5rem;">
-                 <div class="position-color-bar" style="width: 12px; height: 12px; border-radius: 2px; background-color: {groupColors[pos.group]}"></div>
-                 <span>{pos.group}</span>
-               </div>
-               <span>{formatDuration(pos.durationMs)}</span>
-            </li>
-          {/each}
-        </ul>
-      {:else}
-        <p class="muted">No field time {activePlannedStatsPlayer ? 'planned' : 'yet'}.</p>
-      {/if}
-      
-      <div class="modal-actions">
-        <button class="secondary" on:click={() => { viewingPlayerId = null; viewingPlannedPlayerId = null; }}>Close</button>
-      </div>
-    </div>
-  </div>
-{/if}
-
-<section class="hero">
-  <div>
-    <h1>Lineup Helper
-    <div style="display: flex; gap: 0.5rem; flex-wrap: wrap;">
-      <button class="secondary" on:click={() => (showManager = !showManager)}>
-        {showManager ? 'Show lineup editor' : 'Edit roster/positions'}
-      </button>
-      {#if !showManager}
-        <button class="secondary" style="background-color: #6366f1;" on:click={() => showGamePlanModal = true}>
-          Game Plan
-        </button>
-      {/if}
-    </div>
-    </h1>
-  </div>
-  <div class="hero-actions">
-    {#if !showManager}
-      <div class="game-status">
-        {#if !gameStartedAt}
-          <input 
-            type="text" 
-            placeholder="Game name (optional)" 
-            bind:value={gameName} 
-            class="game-name-input" 
-            aria-label="Game name"
-            disabled={history.length > 0} 
-          />
-          <button class="secondary" type="button" on:click={startGame} disabled={history.length > 0}>Start game</button>
           
-          {#if history.length > 0}
-            <button class="secondary small clear-events" type="button" on:click={clearEvents}>Clear previous game</button>
-          {/if}
-        {:else}
-          <div>
-            <span class="status-label">Game:</span>
-            <span class="game-name-display">{gameName || 'Unnamed'}</span>
-          </div>
-          <div class="game-status-info">
-            <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
-            <span class="status-label">Time:</span>
-            <span class="game-clock">{formatDuration(liveGameTime)}</span>
-            <div class="scoreboard" on:click={() => showTimelineModal = true} title="Click to view Goal Timeline">
-              <span class="score-box">{score.mine}</span>
-              <span class="score-separator">-</span>
-              <span class="score-box">{score.theirs}</span>
+          {#if teams.length === 0}
+            <div class="team-card empty-teams" style="text-align: center; justify-content: center; border-style: dashed;">
+              <p class="muted">You don't have any teams yet.</p>
+              <button class="btn-primary" style="margin-top: 1rem;" on:click={createNewTeam}>
+                Create Your First Team
+              </button>
             </div>
-            <span class="status-chip {gameLive ? 'live' : 'stopped'}">{gameLive ? 'Live' : 'Paused'}</span>
+          {/if}
+        </div>
+      {/if}
+    </section>
+
+    <section class="quick-actions-section">
+      <h2>Quick Actions</h2>
+      <div class="grid-layout">
+        <a href="/formations" class="quick-action-card">
+          <div class="icon">⚽</div>
+          <div class="details">
+            <h3>Global Formations</h3>
+            <p>Build and edit tactical formations (e.g., 4-3-3, 3-5-2) to use across all your teams.</p>
           </div>
-          <div>
-            <button class="secondary small" type="button" on:click={toggleGameLive}>
-              {gameLive ? 'Pause' : 'Resume'}
-            </button>
-            <button class="secondary small warning" type="button" on:click={endGame}>Game over</button>
-          </div>
-        {/if}
+        </a>
       </div>
-    {/if}
+    </section>
   </div>
-</section>
-
-<div class="grid-layout">
-  {#if !showManager}
-    <section class="panel lineup-panel">
-      <div class="lineup-panel-header" style="display: flex; flex-direction: column; gap: 0.25rem;">
-        <h2>
-          Lineup Editor
-          {#if showLineupNames}
-            <div class="lineup-names-display">
-              <span class={currentLineupName === null ? "lineup-name-null" : ""}>
-                {currentLineupName || 'manual lineup'}
-              </span>
-               ➔ 
-              <span class={stagedLineupName === null ? "lineup-name-null" : ""}>
-                {stagedLineupName || 'manual lineup'}
-              </span>
-            </div>
-          {/if}
-        </h2>
-      </div>
-      <div class='lineup-action-buttons-panel'>
-        <button class="secondary small" style="background:#7f1d1d" type="button" on:click={clearLineup}>Clear</button>
-        <button class="secondary small" type="button" on:click={() => showPresetsModal = true}>Presets</button>
-        <button class="secondary small" type="button" on:click={saveCurrentLineup}>Apply</button>
-      </div>
-      <div class="list-columns">
-        <div class="list-column lineup-column">
-          <div class="scroll-box">
-            <ul class="lineup-list">
-              {#each positions as position (position.id)}
-                <li>
-                  <div class="lineup-item"
-                    class:selected={selectedItem?.sourceType === 'slot' && selectedItem?.id === position.id}
-                    class:changed={hasSavedDifference(position.id, lineup, lastSavedLineup, roster, lastSavedRoster, history)}
-                    class:empty-slot={!lineup[position.id]}
-                    role="button"
-                    tabindex="0"
-                    data-drop-target="slot"
-                    data-drop-id={position.id}
-                    on:pointerdown={(event) => startTouchDrag(event, 'slot', position.id)}
-                    on:dragover|preventDefault
-                    on:drop={(event) => handleDrop(event, 'slot', position.id)}
-                    on:click={() => handleSlotClick(position.id)}
-                    on:keydown={(event) => handleKeyboardAction(event, () => handleSlotClick(position.id))}>
-                    
-                    <div class="lineup-row">
-                      <div class="position-badge">
-                        <span class="position-name">{position.name}</span>
-                        <div class="position-color-bar" style="background-color: {groupColors[(position.parent || position.name).trim() || 'Unknown']}"></div>
-                      </div>
-                      <span class="player-name">
-                        {#if lineup[position.id]}
-                          {#if lastSavedLineup[position.id] && lastSavedLineup[position.id] !== lineup[position.id]}
-                            {#if Object.values(lastSavedLineup).includes(lineup[position.id])}
-                              Switch: {getPlayerNameFromRoster(lineup[position.id], roster)}
-                            {:else}
-                              Sub: {getPlayerNameFromRoster(lineup[position.id], roster)}
-                            {/if}
-                          {:else}
-                            {getPlayerNameFromRoster(lineup[position.id], roster)} ({getPlayerStatusText(lineup[position.id], rosterPlayers)})
-                          {/if}
-                          <span class="previous-lineup-note">                            
-                            {#if lastSavedLineup[position.id] && lastSavedLineup[position.id] !== lineup[position.id]}
-                              For: {getPlayerNameFromRoster(lastSavedLineup[position.id], lastSavedRoster)}
-                              ({getPlayerStatusText(lastSavedLineup[position.id], rosterPlayers)})
-                            {/if}
-                          </span>
-                        {:else}
-                          <span class="slot-empty">Drop/Tap player here</span>
-                          {#if lastSavedLineup[position.id]}
-                            <span class="previous-lineup-note">Last: {getPlayerNameFromRoster(lastSavedLineup[position.id], lastSavedRoster)}</span>
-                          {/if}
-                        {/if}
-                      </span>
-                      <div class="lineup-item-actions">
-                        {#if history.length > 0 && lineup[position.id] !== (lastSavedLineup[position.id] || null)}
-                          <button class="undo-sub" type="button" on:pointerdown|stopPropagation on:click|stopPropagation={() => undoSub(position.id)}>
-                            Undo
-                          </button>
-                        {:else if lineup[position.id]}
-                          <button class="remove-lineup" type="button" on:pointerdown|stopPropagation on:click|stopPropagation={() => removeFromLineup(position.id)}>
-                            Remove
-                          </button>
-                        {/if}
-                      </div>
-                    </div>
-                  </div>
-                </li>
-              {/each}
-            </ul>
-          </div>
-        </div>
-
-        <div class="list-column roster-column">
-          <div class="lineup-tools">
-            <h3>Roster</h3>
-            <div class="sort-controls">
-              <label>Bar:</label>
-              <select bind:value={barMode} style="margin-right: 0.5rem;">
-                 <option value="aggregate">Grouped</option>
-                 <option value="chrono">Timeline</option>
-              </select>
-              <label for="roster-sort">Sort:</label>
-              <select id="roster-sort" bind:value={lineupRosterSort}>
-                <option value="status">Status</option>
-                <option value="name">Name (A-Z)</option>
-                <option value="total">Total Field</option>
-                <option value="stintActive">Current Field</option>
-                <option value="stintBench">Current Bench</option>
-              </select>
-            </div>
-          </div>
-          <div class="scroll-box">
-            <ul class="list">
-              {#each sortedLineupRoster as player (player.id)}
-                <li>
-                  <button class="list-item roster-list-item"
-                    class:selected={selectedItem?.sourceType === 'roster' && selectedItem?.id === player.id}
-                    disabled={player.inDraftLineup}
-                    type="button"
-                    draggable={!player.inDraftLineup}
-                    on:pointerdown={(event) => !player.inDraftLineup && startTouchDrag(event, 'roster', player.id)}
-                    on:dragstart={(event) => !player.inDraftLineup && onDragStart(event, 'roster', player.id)}
-                    on:click={() => !player.inDraftLineup && handleRosterClick(player.id)}
-                    on:keydown={(event) => !player.inDraftLineup && handleKeyboardAction(event, () => handleRosterClick(player.id))}
-                  >
-                    <div class="roster-item-top">
-                      <div style="display: flex; align-items: center; min-width: 0; gap: 0.5rem; flex: 1;">
-                        <span
-                          class="info-btn"
-                          role="button"
-                          tabindex="0"
-                          on:click|stopPropagation={() => viewingPlayerId = player.id}
-                          on:keydown={(event) => handleKeyboardAction(event, () => viewingPlayerId = player.id)}
-                          on:pointerdown|stopPropagation
-                        >
-                          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                            <circle cx="12" cy="12" r="10"></circle>
-                            <line x1="12" y1="16" x2="12" y2="12"></line>
-                            <line x1="12" y1="8" x2="12.01" y2="8"></line>
-                          </svg>
-                        </span>
-                        <div class="roster-item-name" style="flex: unset;">{player.name}</div>
-                        <div class="player-status-icon">
-                          {#if player.inLiveLineup && player.inDraftLineup}
-                            <!-- Field: Solid Green Dot -->
-                            <svg title="On Field" width="14" height="14" viewBox="0 0 24 24" fill="#34d399">
-                              <circle cx="12" cy="12" r="8"></circle>
-                            </svg>
-
-                          {:else if !player.inLiveLineup && !player.inDraftLineup}
-                            <!-- Bench: Hollow Gray Dot -->
-                            <svg title="On Bench" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#64748b" stroke-width="3">
-                              <circle cx="12" cy="12" r="7"></circle>
-                            </svg>
-
-                          {:else if !player.inLiveLineup && player.inDraftLineup}
-                            <!-- Sub IN: Green Right Arrow -->
-                            <svg title="Staged to Sub In" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#34d399" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-                              <path d="M5 12h14"></path>
-                              <path d="m12 5 7 7-7 7"></path>
-                            </svg>
-
-                          {:else if player.inLiveLineup && !player.inDraftLineup}
-                            <!-- Sub OUT: Red Left Arrow -->
-                            <svg title="Staged to Sub Out" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#ef4444" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-                              <path d="M19 12H5"></path>
-                              <path d="m12 19-7-7 7-7"></path>
-                            </svg>
-                          {/if}
-                        </div>
-                      </div>
-                      
-                      <div class="roster-item-stats">
-                        <div>Field total: {formatDuration(player.activeDurationMs)}</div>
-                        {#if player.inLiveLineup}
-                          <div class="time-active">Field stint: {formatDuration(player.stintActiveMs)}</div>
-                        {:else}
-                          <div class="time-bench">Bench stint: {formatDuration(player.stintBenchMs)}</div>
-                        {/if}
-                      </div>
-                    </div>
-                    
-                    {#if barMode === 'aggregate'}
-                      {#if player.positionSegments?.length > 0}
-                        <div class="player-position-bar">
-                          {#each player.positionSegments as seg}
-                            <div class="pos-segment" style="width: {seg.pct}%; background-color: {groupColors[seg.group]}" title="{seg.group}"></div>
-                          {/each}
-                        </div>
-                      {/if}
-                    {:else}
-                      {#if player.chronoSegments?.length > 0}
-                        <div class="player-position-bar">
-                          {#each player.chronoSegments as seg}
-                            <div class="pos-segment" style="width: {seg.pct}%; background-color: {groupColors[seg.group]}" title="{seg.group}"></div>
-                          {/each}
-                        </div>
-                      {/if}
-                    {/if}
-                  </button>
-                </li>
-              {/each}
-              {#if sortedLineupRoster.length === 0}
-                <li class="muted">No players have been added yet.</li>
-              {/if}
-            </ul>
-          </div>
-        </div>
-      </div>
-    </section>
-  {/if}
-
-  {#if showManager}
-    <section class="panel manager-tabs">
-      <div class="tabs">
-        <button class="tab-button {managerTab === 'roster' ? 'active' : ''}" type="button" on:click={() => setManagerTab('roster')}>
-          Roster
-        </button>
-        <button class="tab-button {managerTab === 'positions' ? 'active' : ''}" type="button" on:click={() => setManagerTab('positions')}>
-          Positions
-        </button>
-      </div>
-    </section>
-
-    <div class="manager-editor">
-      <section class="panel roster-panel tab-panel {managerTab === 'roster' ? 'active' : ''}">
-        <div style="display: flex; justify-content: space-between; align-items: baseline;">
-          <h2>Roster</h2>
-          <span class="muted" style="font-size: 0.85rem;">(Uncheck to hide from game)</span>
-        </div>
-        
-        <form class="inline-form" on:submit|preventDefault={addPlayer}>
-          <input
-            type="text"
-            placeholder="Add player name"
-            bind:value={newPlayerName}
-            aria-label="New player name"
-          />
-          <button type="submit">Add</button>
-        </form>
-
-        <ul class="list">
-          {#each sortedManagerRoster as player (player.id)}
-            <li class="list-item" class:unavailable={!player.available}>
-              <input
-                type="checkbox"
-                class="availability-toggle"
-                checked={player.available}
-                on:change={(e) => togglePlayerAvailability(player.id, e.target.checked)}
-                title="Available for game"
-                aria-label="Toggle availability"
-              />
-              <input
-                type="text"
-                value={player.name}
-                on:click|stopPropagation
-                on:change={(event) => updatePlayerName(player.id, event.target.value)}
-                aria-label="Player name"
-              />
-              <button class="mini" on:click|stopPropagation={() => removePlayer(player.id)} aria-label="Remove player">×</button>
-            </li>
-          {/each}
-        </ul>
-      </section>
-
-      <section class="panel positions-panel tab-panel {managerTab === 'positions' ? 'active' : ''}">
-        <h2>Positions</h2>
-        <form class="inline-form" on:submit|preventDefault={addPosition}>
-          <input
-            type="text"
-            placeholder="Add position name"
-            bind:value={newPositionName}
-            aria-label="New position name"
-          />
-          <button type="submit">Add</button>
-        </form>
-
-        <ul class="list">
-          {#each positions as position (position.id)}
-            <li class="list-item"
-                animate:flip={{ duration: 250 }}
-                class:is-dragging={draggedPosId === position.id || touchDrag?.id === position.id}
-                data-position-id={position.id}
-                on:dragenter={(e) => {
-                  if (draggedPosId) handlePositionSwapRealtime(position.id, draggedPosId);
-                }}
-                on:dragover|preventDefault
-            >
-              <div class="drag-handle"
-                  role="button"
-                  tabindex="0"
-                  draggable="true"
-                  aria-label="Drag to reorder"
-                  on:dragstart={(e) => {
-                    draggedPosId = position.id;
-                    e.dataTransfer.effectAllowed = 'move';
-                    e.dataTransfer.setData('application/x-position', position.id);
-                  }}
-                  on:dragend={() => {
-                    draggedPosId = null;
-                    saveState();
-                  }}
-                  on:pointerdown={(e) => startTouchDrag(e, 'position', position.id)}
-              >☰</div>
-              <div class="position-inputs">
-                <input
-                  type="text"
-                  value={position.name}
-                  on:change={(event) => updatePositionName(position.id, event.target.value)}
-                  aria-label="Position name"
-                />
-                <input
-                  type="text"
-                  value={position.parent || ''}
-                  placeholder="Group (e.g. DEF)"
-                  on:change={(event) => updatePositionParent(position.id, event.target.value)}
-                  aria-label="Position group"
-                />
-              </div>
-              <button class="mini" on:click={() => removePosition(position.id)} aria-label="Remove position">×</button>
-            </li>
-          {/each}
-        </ul>
-      </section>
-    </div>
-  {/if}
-
-  {#if !showManager}
-    <section class="panel history-panel">
-      <div class="history-tools">
-        <h2>Game Events</h2>
-        <div style="display: flex; gap: 0.5rem; align-items: center;">
-          <button class="secondary small" type="button" on:click={openEventModal}>+ Add Event</button>
-          <button class="secondary small" type="button" on:click={exportHistoryCsv}>Export CSV</button>
-          <button disabled={history.length === 0} class="secondary small clear-events" type="button" on:click={clearEvents}>Clear</button>
-        </div>
-      </div>
-    {#if history.length === 0}
-      <p class="muted">No game events yet. Start, pause, resume, or stop the game to record events.</p>
-    {:else}
-      <div class="scroll-box">
-        <div class="history-list">
-          {#each history as item (item.id)}
-            <article class="history-item">
-              <div class="history-item-events">
-                <div class="muted" style="margin-bottom: 0.25rem;">{new Date(item.created).toLocaleTimeString()}</div>
-                {#each item.events as ev}
-                  <div>
-                    <span class="muted" style="margin-right: 0.4rem; font-variant-numeric: tabular-nums;">
-                      [{formatDuration(ev.gameTime || 0)}]
-                    </span>
-                    <strong>{ev.event}</strong>
-                    {#if ev.playerId}
-                      - <span style="color: #cbd5e1;">{getPlayerNameFromRoster(ev.playerId, item.roster)}</span>
-                    {/if}
-                    {#if ev.detail}
-                      <span class="muted" style="margin-left: 0.25rem;">({ev.detail})</span>
-                    {/if}
-                    <!-- Render Score inside goal events -->
-                    {#if (ev.event === 'Goal scored' || ev.event === 'Goal conceded') && ev.scoreAtTime}
-                      <span class="muted" style="margin-left: 0.25rem;">
-                        (Score: {ev.scoreAtTime.mine} - {ev.scoreAtTime.theirs})
-                      </span>
-                    {/if}
-                  </div>
-                {/each}
-              </div>
-              <div class="history-actions">
-                {#if isLineupRecallable(item)}
-                  <button on:click={() => recallLineup(item)}>Recall Lineup</button>
-                {/if}
-                <button class="secondary small" on:click={() => openEditModal(item)} title="Edit Event" style="padding: 0.5rem;">
-                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path>
-                    <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path>
-                  </svg>
-                </button>
-                <button class="mini" on:click={() => removeHistoryItem(item.id)}>×</button>
-              </div>
-            </article>
-          {/each}
-        </div>
-      </div>
-    {/if}
-  </section>
-  {/if}
-</div>
+{/if}
 
 <style>
-  :global(body) {
-    margin: 0;
-    background: #0f172a;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-  }
-  :global(*),
-  :global(*::before),
-  :global(*::after) {
-    box-sizing: border-box;
+  /* --- Login/Hero Styles --- */
+  .hero-container {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: center;
+    gap: 4rem;
+    min-height: 80vh;
   }
 
-  .toast-container {
-    position: fixed;
-    bottom: 2rem;
-    left: 50%;
-    transform: translateX(-50%);
-    z-index: 10000;
-    display: flex;
-    flex-direction: column;
-    gap: 0.5rem;
-    pointer-events: none;
+  .hero-text {
+    flex: 1;
+    min-width: 300px;
+    max-width: 500px;
   }
-  .toast {
-    background: rgba(218, 69, 69, 0.9);
-    color: white;
-    padding: 0.75rem 1.5rem;
-    border-radius: 2rem;
-    box-shadow: 0 4px 12px rgba(0,0,0,0.3);
-    font-weight: 500;
+
+  .hero-text h1 {
+    font-size: clamp(2.5rem, 5vw, 4rem);
+    margin-bottom: 1rem;
+    line-height: 1.1;
+    background: linear-gradient(to right, #3b82f6, #06b6d4);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+
+  .hero-text p {
+    font-size: 1.1rem;
+    color: #94a3b8;
+    line-height: 1.6;
+  }
+
+  .auth-card {
+    background: #111827;
+    border: 1px solid #334155;
+    padding: 2.5rem;
+    border-radius: 1.5rem;
+    width: 100%;
+    max-width: 400px;
+    box-shadow: 0 20px 40px rgba(0,0,0,0.4);
+  }
+
+  .auth-card h2 {
+    margin-top: 0;
+    margin-bottom: 1.5rem;
     text-align: center;
   }
 
-  .hero {
-    display: flex;
-    justify-content: space-between;
-    gap: 1rem;
-    align-items: flex-start;
-    margin-bottom: 1rem;
-    flex-wrap: wrap;
-  }
-
-  h1 {
-    margin: 0;
-    font-size: clamp(2rem, 3vw, 2.6rem);
-    display: flex;
-    align-items: center;
-    gap: 1rem;
-    flex-wrap: wrap;
-    color: #f8fafc;
-  }
-
-  .hero-actions {
-    display: flex;
-    gap: 0.75rem;
-    flex-wrap: wrap;
-    align-items: center;
-  }
-
-  .game-status {
-    display: flex;
-    align-items: center;
-    gap: 0.75rem;
-    flex-wrap: wrap;
-  }
-
-  .game-name-input {
-    padding: 0.75rem 0.9rem;
-    border-radius: 0.75rem;
-    border: 1px solid #334155;
-    background: #0f172a;
-    color: #e2e8f0;
-    min-width: 200px;
-  }
-
-  .game-name-display {
-    font-weight: 600;
-    color: #f8fafc;
-    margin-right: 0.5rem;
-  }
-
-  .game-status-info {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    color: #cbd5e1;
-    font-size: 0.95rem;
-  }
-  
-  .game-clock {
-    font-variant-numeric: tabular-nums;
-    font-weight: 600;
-    margin-right: 0.25rem;
-  }
-
-  .status-chip {
-    padding: 0.25rem 0.6rem;
-    border-radius: 999px;
-    font-size: 0.85rem;
-    color: white;
-    font-weight: bold;
-  }
-
-  .status-chip.live {
-    background: #16a34a;
-  }
-
-  .status-chip.stopped {
-    background: #f59e0b;
-  }
-
-  .secondary {
-    background: #475569;
-    border: none;
-    color: white;
-    padding: 0.85rem 1rem;
-    border-radius: 0.75rem;
-    cursor: pointer;
-  }
-  
-  .secondary:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
-  }
-
-  .secondary.warning {
-    background: #b91c1c;
-  }
-
-  .primary {
-    background: #2563eb;
-    border: none;
-    color: white;
-    padding: 0.85rem 1rem;
-    border-radius: 0.75rem;
-    cursor: pointer;
-  }
-  .primary:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
-  }
-
-  .grid-layout {
-    display: grid;
-    gap: 1rem;
-    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-  }
-
-  .lineup-panel {
-    display: grid;
-  }
-
-  .list-columns {
-    display: grid;
-    gap: 1rem;
-    grid-template-columns: minmax(270px, 1.3fr) minmax(220px, 0.9fr);
-    align-items: start;
-  }
-
-  .list-column {
-    display: grid;
-    gap: 0.75rem;
-    align-self: start;
-  }
-
-  .lineup-tools {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    gap: 0.75rem;
-    flex-wrap: wrap;
-    margin-bottom: 0.75rem;
-  }
-
-  .lineup-tools h3 {
-    margin: 0;
-    color: #f8fafc;
-  }
-
-  .history-tools {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    gap: 0.75rem;
-    flex-wrap: wrap;
-    margin-bottom: 0.75rem;
-  }
-
-  .history-tools h2 {
-    margin: 0;
-  }
-
-  .sort-controls {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    font-size: 0.9rem;
-    color: #94a3b8;
-  }
-
-  .sort-controls select {
-    background: #1e293b;
-    color: #e2e8f0;
-    border: 1px solid #334155;
-    border-radius: 0.5rem;
-    padding: 0.25rem 0.5rem;
-    font-size: 0.9rem;
-    cursor: pointer;
-    outline: none;
-  }
-
-  .scroll-box {
-    max-height: min(65vh, 540px);
-    overflow: auto;
-    padding-right: 0.25rem;
-    border: 1pt solid #334155;
-    border-radius: 1rem;
-    padding: 4pt;
-  }
-
-  .scroll-box::-webkit-scrollbar {
-    width: 10px;
-  }
-
-  .scroll-box::-webkit-scrollbar-thumb {
-    background: #475569;
-    border-radius: 999px;
-  }
-
-  @media (max-width: 720px) {
-    .list-columns {
-      grid-template-columns: 1fr;
-    }
-    .list-column {
-      min-height: 0;
-    }
-    .list-column .scroll-box {
-      max-height: 36vh;
-    }
-  }
-
-  .scroll-box::-webkit-scrollbar-track {
-    background: transparent;
-  }
-
-  .panel {
-    background: #111827;
-    border: 1px solid #334155;
-    border-radius: 1rem;
-    padding: 1rem;
-    box-shadow: 0 10px 30px rgba(15, 23, 42, 0.35);
-  }
-
-  h2 {
-    margin-top: 0;
-    color: #f8fafc;
-  }
-
-  .inline-form {
-    display: flex;
-    gap: 0.75rem;
-    flex-wrap: wrap;
-    margin-bottom: 1rem;
-  }
-
-  .inline-form input {
-    flex: 1;
-    min-width: 0;
-    padding: 0.75rem 0.9rem;
-    border-radius: 0.75rem;
-    border: 1px solid #334155;
-    background: #0f172a;
-    color: #e2e8f0;
-    margin-top: 5pt;
-  }
-
-  .inline-form button,
-  .secondary.small {
-    background: #2563eb;
-    border: none;
-    padding: 0.75rem 1rem;
-    border-radius: 0.75rem;
-    color: white;
-    cursor: pointer;
-  }
-
-  .secondary.small {
-    padding: 0.5rem 0.8rem;
-    font-size: 0.9rem;
-  }
-
-  .list {
-    list-style: none;
-    margin: 0;
-    padding: 0;
-    display: grid;
-    gap: 0.75rem;
-  }
-
-  .list-item {
-    display: flex;
-    align-items: center;
-    gap: 0.75rem;
-    padding: 0.8rem 1rem;
-    border-radius: 0.9rem;
-    border: 1px solid #334155;
-    background: #1f2937;
-    color: #f8fafc;
-    text-align: left;
+  .btn-google {
     width: 100%;
-    touch-action: manipulation;
-    transition: box-shadow 150ms ease, opacity 150ms ease;
-  }
-
-  .list-item.is-dragging {
-    opacity: 0.6;
-    box-shadow: inset 0 0 0 2px #3b82f6;
-    z-index: 10;
-  }
-
-  .list-item:disabled {
-    opacity: 0.45;
-    cursor: default;
-    background: #0f172a;
-    border-color: #1e293b;
-  }
-  
-  .list-item.unavailable {
-    background: #0f172a;
-    border-color: #1e293b;
-  }
-  
-  .list-item.unavailable input[type="text"] {
-    text-decoration: line-through;
-    opacity: 0.45;
-  }
-
-  .availability-toggle {
-    width: 1.25rem;
-    height: 1.25rem;
-    cursor: pointer;
-    accent-color: #2563eb;
-    margin: 0;
-  }
-
-  .roster-list-item {
-    display: block;
-    padding: 0.6rem 0.8rem;
-  }
-
-  .roster-item-top {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-  }
-  
-  .info-btn {
     display: flex;
     align-items: center;
     justify-content: center;
-    padding: 0.35rem;
-    margin-right: 0.5rem;
-    color: #94a3b8;
-    background: transparent;
-    border-radius: 50%;
-    cursor: pointer;
-    transition: background 150ms ease, color 150ms ease;
-  }
-  
-  .info-btn:hover {
-    color: #e2e8f0;
-    background: #334155;
-  }
-
-  .roster-item-name {
-    font-weight: 500;
-    text-align: left;
-    flex: 1;
-    min-width: 0;
-    color: #f8fafc;
-  }
-
-  .roster-item-stats {
-    display: flex;
-    flex-direction: column;
-    align-items: flex-end;
-    gap: 0.15rem;
-    font-size: 0.85rem;
-    color: #94a3b8;
-  }
-
-  .time-active {
-    color: #34d399;
-  }
-
-  .time-bench {
-    color: #94a3b8;
-  }
-
-  .player-position-bar {
-    display: flex;
-    height: 5px;
-    width: 100%;
-    border-radius: 3px;
-    overflow: hidden;
-    margin-top: 0.4rem;
-    background: #334155;
-  }
-
-  .pos-segment {
-    height: 100%;
-  }
-
-  .position-inputs {
-    display: flex;
-    flex: 1;
-    gap: 0.5rem;
-    min-width: 0;
-    flex-wrap: wrap; 
-  }
-
-  .list-item input[type="text"] {
-    flex: 1;
-    min-width: 0;
+    gap: 0.75rem;
+    background: white;
+    color: #1e293b;
     border: none;
-    background: transparent;
-    color: #f8fafc;
+    padding: 0.75rem;
+    border-radius: 0.75rem;
+    font-weight: 600;
     font-size: 1rem;
-  }
-
-  .list-item input[type="text"]:focus {
-    outline: none;
-  }
-
-  .mini {
-    background: #334155;
-    border: 1px solid #475569;
-    color: #cbd5e1;
-    border-radius: 999px;
     cursor: pointer;
-    min-width: 2.5rem;
-    min-height: 2.5rem;
+    transition: background 0.2s;
   }
 
-  .drag-handle {
-    cursor: grab;
-    padding: 0.5rem;
-    margin-left: -0.5rem;
+  .btn-google:hover { background: #f1f5f9; }
+
+  .divider {
+    display: flex;
+    align-items: center;
+    text-align: center;
+    margin: 1.5rem 0;
     color: #64748b;
-    user-select: none;
-    touch-action: none;
+    font-size: 0.85rem;
   }
-
-  .drag-handle:active {
-    cursor: grabbing;
-  }
-
-  .manager-tabs {
-    padding: 0.75rem 1rem 0.5rem;
-    margin-bottom: 0.5rem;
-    background: #111827;
-    border: 1px solid #334155;
-    border-radius: 1rem;
-  }
-
-  .tabs {
-    display: flex;
-    gap: 0.5rem;
-  }
-
-  .tab-button {
-    flex: 1;
-    border: 1px solid #334155;
-    background: #0f172a;
-    color: #cbd5e1;
-    border-radius: 0.85rem;
-    padding: 0.75rem 1rem;
-    cursor: pointer;
-  }
-
-  .tab-button.active {
-    background: #2563eb;
-    border-color: #2563eb;
-    color: white;
-  }
-
-  .manager-editor {
-    display: grid;
-    gap: 1rem;
-  }
-
-  .tab-panel {
-    display: none;
-  }
-
-  .tab-panel.active {
-    display: block;
-  }
-
-  @media (min-width: 860px) {
-    .manager-tabs {
-      display: none;
-    }
-    .manager-editor {
-      grid-template-columns: 1fr 1fr;
-    }
-    .tab-panel {
-      display: block;
-    }
-  }
-
-  .lineup-list {
-    list-style: none;
-    margin: 0;
-    padding: 0;
-    display: grid;
-    gap: 0.75rem;
-  }
-
-  .lineup-item {
-    padding: 0.25rem;
-    border-radius: 0.9rem;
-    border: 1px solid #334155;
-    background: #0f172a;
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0.75rem;
-    align-items: center;
-    min-height: 3rem;
-    touch-action: manipulation;
-    transition: background 160ms ease, border-color 160ms ease, box-shadow 160ms ease;
-    position: relative;
-    cursor: pointer;
-  }
-
-  .lineup-item.empty-slot {
-    border-color: #475569;
-    background: rgba(203, 86, 59, 0.18);
-  }
-
-  .lineup-item.empty-slot .position-name {
-    color: #94a3b8;
-  }
-
-  .lineup-item.empty-slot .slot-empty {
-    color: #fd0101;
-    font-style: italic;
-  }
-
-  .lineup-item.selected, .list-item.selected {
-    border-color: #3b82f6;
-    box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.4);
-    background: rgba(37, 99, 235, 0.15);
-  }
-
-  .lineup-item.changed {
-    border-color: #60a5fa;
-    background: rgba(37, 99, 235, 0.22);
-    box-shadow: inset 0 0 0 1px rgba(96, 165, 250, 0.35), 0 0 0 1px rgba(96, 165, 250, 0.12);
-  }
-
-  .lineup-item.changed::before {
+  .divider::before, .divider::after {
     content: '';
-    position: absolute;
-    left: 0;
-    top: 0.35rem;
-    height: calc(100% - 0.7rem);
-    width: 0.25rem;
-    background: #60a5fa;
-    border-radius: 999px;
-  }
-
-  .lineup-item.changed.empty-slot {
-    background: rgba(37, 99, 235, 0.12);
-  }
-
-  .lineup-item.changed .position-name {
-    color: #60a5fa;
-  }
-
-  .lineup-row {
-    display: flex;
     flex: 1;
-    flex-wrap: wrap;
-    gap: 0.75rem;
-    align-items: center;
-    min-width: 0;
+    border-bottom: 1px solid #334155;
   }
-
-  .position-badge {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    min-width: 3.5rem;
-    gap: 0.2rem;
-  }
-
-  .position-name {
-    font-weight: 700;
-    color: #e2e8f0;
-  }
-
-  .position-color-bar {
-    width: 100%;
-    height: 3px;
-    border-radius: 2px;
-  }
-
-  .player-name {
-    color: #cbd5e1;
-    flex: 1;
-    min-width: 0;
-  }
-
-  .lineup-item-actions {
-    display: flex;
-    gap: 0.5rem;
-  }
-
-  .remove-lineup, .undo-sub {
-    border: none;
-    color: white;
-    padding: 0.55rem 0.9rem;
-    border-radius: 0.75rem;
-    cursor: pointer;
-  }
-
-  .remove-lineup {
-    background: #7f1d1d;
-  }
-
-  .undo-sub {
-    background: #475569;
-  }
-
-  .slot-empty {
-    color: #94a3b8;
-  }
-
-  .previous-lineup-note {
-    display: block;
-    margin-top: 0.15rem;
-    color: #94a3b8;
-    font-size: 0.88rem;
-  }
-
-  .history-list {
-    display: grid;
-    gap: 0.75rem;
-  }
-
-  .history-item {
-    display: flex;
-    justify-content: space-between;
-    gap: 1rem;
-    align-items: center;
-    padding: 0.85rem 1rem;
-    border-radius: 1rem;
-    border: 1px solid #334155;
-    background: #0f172a;
-  }
-  
-  .history-item-events {
-    display: flex;
-    flex-direction: column;
-    gap: 0.15rem;
-    color: #f8fafc;
-  }
-
-  .history-actions {
-    display: flex;
-    gap: 0.5rem;
-  }
-
-  .history-actions button {
-    border: none;
-    border-radius: 0.75rem;
-    padding: 0.65rem 0.85rem;
-    cursor: pointer;
-  }
-
-  .history-actions button:first-child {
-    background: #2563eb;
-    color: white;
-  }
-
-  .muted {
-    color: #94a3b8;
-    font-size: 0.95rem;
-  }
-
-  .secondary.small.clear-events {
-    background-color: #7f1d1d;
-  }
-
-  /* Modal Styles */
-  .modal-backdrop {
-    position: fixed;
-    top: 0; left: 0; right: 0; bottom: 0;
-    background: rgba(0, 0, 0, 0.75);
-    display: flex;
-    justify-content: center;
-    align-items: center;
-    z-index: 1000;
-    padding: 1rem;
-  }
-
-  .modal-panel {
-    background: #111827;
-    border: 1px solid #334155;
-    border-radius: 1rem;
-    padding: 1.5rem;
-    width: 100%;
-    max-width: 400px;
-    box-shadow: 0 20px 40px rgba(0, 0, 0, 0.5);
-    max-height: 90vh;
-    display: flex;
-    flex-direction: column;
-    overflow-y: auto;
-  }
-
-  .large-modal {
-    max-width: 800px;
-  }
-
-  .modal-panel h2 {
-    margin-top: 0;
-    margin-bottom: 1.5rem;
-    color: #f8fafc;
-  }
+  .divider span { padding: 0 1rem; }
 
   .form-group {
     display: flex;
@@ -3164,160 +256,170 @@
   }
 
   .form-group label {
-    color: #cbd5e1;
     font-size: 0.9rem;
-    font-weight: 500;
+    color: #cbd5e1;
   }
 
-  .form-group select {
-    padding: 0.75rem 0.9rem;
+  .form-group input {
+    padding: 0.75rem;
     border-radius: 0.75rem;
     border: 1px solid #334155;
     background: #0f172a;
-    color: #e2e8f0;
+    color: white;
     font-size: 1rem;
+  }
+  .form-group input:focus {
     outline: none;
+    border-color: #3b82f6;
   }
 
-  .form-group select:focus {
-    border-color: #2563eb;
-  }
-
-  .modal-actions {
-    display: flex;
-    justify-content: flex-end;
-    gap: 0.75rem;
-    margin-top: 1.5rem;
-  }
-
-  /* Stats List UI inside Modal */
-  .stats-list-totals {
-    display: flex;
-    flex-direction: column;
-    gap: 0.5rem;
-    margin-bottom: 1.5rem;
-  }
-
-  .stats-list-totals div {
-    display: flex;
-    justify-content: space-between;
-    background: #0f172a;
-    padding: 0.75rem 1rem;
+  .error-msg {
+    background: rgba(239, 68, 68, 0.1);
+    color: #ef4444;
+    padding: 0.75rem;
     border-radius: 0.5rem;
-    border: 1px solid #334155;
-    color: #f8fafc;
-  }
-
-  .stats-list {
-    list-style: none;
-    padding: 0;
-    margin: 0 0 1.5rem 0;
-    display: flex;
-    flex-direction: column;
-    gap: 0.5rem;
-  }
-  
-  .timeline-list {
-    overflow-y: auto;
-    margin-bottom: 0;
-    padding-right: 0.5rem;
-  }
-
-  .stats-list li {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    background: #1f2937;
-    padding: 0.75rem 1rem;
-    border-radius: 0.5rem;
-    border: 1px solid #334155;
-    color: #f8fafc;
-  }
-  
-  .score-timeline-box {
-    background: #000;
-    padding: 0.4rem 0.6rem;
-    border-radius: 0.5rem;
-    font-family: 'Courier New', Courier, monospace;
-    font-weight: bold;
-    font-size: 1.1rem;
-  }
-
-  .lineup-panel-header {
-    display: flex;
-    justify-content: space-between;
-  }
-
-  .lineup-names-display {
-    font-size: 0.95rem;
-    color: #94a3b8;
-    margin-top: 0.1rem;
-    font-weight: 500;
-  }
-
-  .lineup-name-null {
-    font-style: italic;
-  }
-
-  .preset-name-text {
-    font-size: 1.05rem;
-    cursor: text;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    display: block;
-    padding: 0.2rem 0;
-  }
-  .preset-name-text:hover {
-    color: #60a5fa;
-  }
-
-  .presets-list li {
-    padding: 0.5rem 0.75rem;
-  }
-
-  .scoreboard {
-    display: flex;
-    align-items: center;
-    gap: 0.25rem;
-    margin: 0 1rem;
-    background: #000;
-    padding: 0.2rem 0.6rem;
-    border-radius: 0.5rem;
-    border: 1px solid #334155;
-    font-family: 'Courier New', Courier, monospace;
-    cursor: pointer;
-    transition: box-shadow 0.2s ease;
-  }
-  
-  .scoreboard:hover {
-    box-shadow: 0 0 8px rgba(255, 255, 255, 0.2);
-  }
-
-  .score-box {
-    color: #f8fafc;
-    font-size: 1.2rem;
-    font-weight: bold;
-    min-width: 1.2rem;
+    font-size: 0.9rem;
+    margin-bottom: 1rem;
     text-align: center;
   }
 
-  .score-separator {
-    color: #475569;
-    font-weight: bold;
+  .toggle-auth {
+    margin-top: 1.5rem;
+    text-align: center;
+    font-size: 0.9rem;
+    color: #94a3b8;
   }
 
-  .player-status-icon {
+  .btn-link {
+    background: none;
+    border: none;
+    color: #3b82f6;
+    cursor: pointer;
+    font-weight: 600;
+  }
+  .btn-link:hover { text-decoration: underline; }
+
+  /* --- Dashboard Styles --- */
+  .dash-header {
     display: flex;
+    justify-content: space-between;
     align-items: center;
-    justify-content: center;
-    margin-left: 0.25rem;
+    margin-bottom: 2.5rem;
+    flex-wrap: wrap;
+    gap: 1rem;
   }
 
-  .lineup-action-buttons-panel {
+  .dash-header h1 { margin: 0; }
+
+  .teams-section, .quick-actions-section {
+    margin-bottom: 3rem;
+  }
+
+  .grid-layout {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+    gap: 1.5rem;
+    margin-top: 1.5rem;
+  }
+
+  .team-card {
+    background: #111827;
+    border: 1px solid #334155;
+    border-radius: 1rem;
+    padding: 1.5rem;
     display: flex;
-    justify-content: flex-end;
-    gap: 5pt;
-    margin-bottom: 3pt;
+    flex-direction: column;
+    gap: 1rem;
+  }
+
+  .team-card h3 { margin: 0; font-size: 1.25rem; }
+  .muted { color: #94a3b8; margin: 0; }
+
+  .team-actions {
+    display: flex;
+    gap: 0.5rem;
+    margin-top: auto;
+  }
+
+  .quick-action-card {
+    background: #111827;
+    border: 1px solid #334155;
+    border-radius: 1rem;
+    padding: 1.5rem;
+    display: flex;
+    gap: 1rem;
+    text-decoration: none;
+    color: inherit;
+    transition: transform 0.2s, border-color 0.2s;
+  }
+
+  .quick-action-card:hover {
+    transform: translateY(-2px);
+    border-color: #3b82f6;
+  }
+
+  .quick-action-card .icon {
+    font-size: 2rem;
+  }
+
+  .quick-action-card h3 { margin: 0 0 0.25rem 0; color: #3b82f6;}
+  .quick-action-card p { margin: 0; color: #94a3b8; font-size: 0.9rem; line-height: 1.4;}
+
+  /* Shared Buttons */
+  .btn-primary {
+    background: #2563eb;
+    color: white;
+    border: none;
+    padding: 0.75rem 1.5rem;
+    border-radius: 0.75rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.2s;
+  }
+  .btn-primary:hover { background: #1d4ed8; }
+
+  .btn-secondary {
+    background: #334155;
+    color: white;
+    border: none;
+    padding: 0.5rem 1rem;
+    border-radius: 0.5rem;
+    font-size: 0.9rem;
+    cursor: pointer;
+    text-decoration: none;
+    text-align: center;
+    flex: 1;
+  }
+  .btn-secondary:hover { background: #475569; }
+  .team-card {
+    /* Make sure team-card has position: relative to anchor the delete button */
+    position: relative; 
+    background: #111827;
+    border: 1px solid #334155;
+    border-radius: 1rem;
+    padding: 1.5rem;
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+  }
+
+  /* NEW: Delete Button Styles */
+  .btn-delete-card {
+    position: absolute;
+    top: 1rem;
+    right: 1rem;
+    background: transparent;
+    border: none;
+    color: #ef4444;
+    font-size: 1.25rem;
+    cursor: pointer;
+    opacity: 0.5;
+    transition: opacity 0.2s;
+    padding: 0.25rem;
+    line-height: 1;
+  }
+
+  .btn-delete-card:hover {
+    opacity: 1;
   }
 </style>
