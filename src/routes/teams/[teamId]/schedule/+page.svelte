@@ -56,6 +56,7 @@
       opponent: '',
       date: new Date().toISOString().slice(0, 16), // current datetime for datetime-local input
       location: '',
+      homeAway: 'home',
       status: 'scheduled',
       availablePlayers: allPlayerIds
     };
@@ -64,8 +65,8 @@
 
   function openEditModal(game) {
     editingGame = JSON.parse(JSON.stringify(game)); // Deep copy to prevent live unsaved edits
-    // Ensure availablePlayers array exists
     if (!editingGame.availablePlayers) editingGame.availablePlayers = [];
+    if (!editingGame.homeAway) editingGame.homeAway = 'home';
     showModal = true;
   }
 
@@ -111,6 +112,8 @@
     }
   }
 
+  const HA_LABELS = { home: '🏠 Home', away: '✈️ Away', neutral: '⚖️ Neutral', 'n/a': 'N/A' };
+
   function formatDate(dateString) {
     if (!dateString) return 'TBD';
     const d = new Date(dateString);
@@ -144,8 +147,11 @@
               <span class="day">{new Date(game.date).getDate()}</span>
             </div>
             <div class="details">
-              <h3>vs. {game.opponent || 'TBD'}</h3>
+              <a href="/games/{game.id}" class="game-link">
+                <h3>vs. {game.opponent || 'TBD'}</h3>
+              </a>
               <p class="muted">
+                {#if game.homeAway && game.homeAway !== 'n/a'}<span class="ha-badge ha-{game.homeAway}">{HA_LABELS[game.homeAway] ?? game.homeAway}</span>{/if}
                 📍 {game.location || 'Location TBD'} • ⏰ {new Date(game.date).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit'})}
               </p>
               <p class="availability-status">
@@ -193,6 +199,15 @@
           <div class="form-group">
             <label>Location</label>
             <input type="text" bind:value={editingGame.location} placeholder="e.g. Field 4" />
+          </div>
+          <div class="form-group">
+            <label>Home or Away</label>
+            <div class="ha-toggle">
+              <button type="button" class:active={editingGame.homeAway === 'home'} on:click={() => editingGame.homeAway = 'home'}>🏠 Home</button>
+              <button type="button" class:active={editingGame.homeAway === 'away'} on:click={() => editingGame.homeAway = 'away'}>✈️ Away</button>
+              <button type="button" class:active={editingGame.homeAway === 'neutral'} on:click={() => editingGame.homeAway = 'neutral'}>⚖️ Neutral</button>
+              <button type="button" class:active={editingGame.homeAway === 'n/a'} on:click={() => editingGame.homeAway = 'n/a'}>N/A</button>
+            </div>
           </div>
         </div>
 
@@ -301,6 +316,8 @@
   }
 
   .details h3 { margin: 0 0 0.25rem 0; font-size: 1.25rem; color: #e2e8f0; }
+  .game-link { text-decoration: none; color: inherit; display: block; width: fit-content; }
+  .game-link:hover h3 { color: #3b82f6; }
   .details .muted { margin: 0; color: #94a3b8; font-size: 0.95rem; }
   .availability-status {
     margin: 0.5rem 0 0 0;
@@ -410,6 +427,17 @@
     padding-top: 1rem;
     border-top: 1px solid #334155;
   }
+
+  /* Home/Away toggle */
+  .ha-toggle { display: flex; background: #0f172a; border-radius: 0.5rem; padding: 0.2rem; gap: 0; border: 1px solid #334155; }
+  .ha-toggle button { flex: 1; background: transparent; border: none; color: #64748b; padding: 0.5rem 1rem; border-radius: 0.35rem; cursor: pointer; font-size: 0.9rem; font-weight: 600; transition: all 0.15s; }
+  .ha-toggle button.active { background: #334155; color: #f8fafc; }
+
+  /* Home/Away badge on game card */
+  .ha-badge { display: inline-block; font-size: 0.8rem; margin-right: 0.5rem; font-weight: 600; color: #94a3b8; }
+  .ha-home { color: #10b981; }
+  .ha-away { color: #f59e0b; }
+  .ha-neutral { color: #818cf8; }
 
   /* Buttons */
   .btn-primary {

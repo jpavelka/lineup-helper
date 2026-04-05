@@ -166,7 +166,9 @@
               >
                 ✕
               </button>
-              <h3>{team.name}</h3>
+              <a href="/teams/{team.id}" class="team-link">
+                <h3>{team.name}</h3>
+              </a>
               <p class="muted">{team.roster?.length || 0} Players on Roster</p>
               <div class="team-actions">
                 <a href="/teams/{team.id}" class="btn-secondary">Manage Team</a>
@@ -370,6 +372,8 @@
   }
 
   .team-card h3 { margin: 0; font-size: 1.25rem; }
+  .team-link { text-decoration: none; color: inherit; display: block; width: fit-content; }
+  .team-link:hover h3 { color: #3b82f6; }
   .muted { color: #94a3b8; margin: 0; }
 
   .team-actions {

@@ -20,7 +20,9 @@
     try {
       const q = query(collection(db, 'formations'), where('ownerId', '==', $authStore.user.uid));
       const querySnapshot = await getDocs(q);
-      formations = querySnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      formations = querySnapshot.docs
+        .map(doc => ({ id: doc.id, ...doc.data() }))
+        .filter(f => f.name); // Filter out any corrupt/unnamed formations
     } catch (e) {
       console.error("Error loading formations:", e);
     } finally {
@@ -33,8 +35,8 @@
       // Create a default 4-4-2 formation
       const newFormationRef = await addDoc(collection(db, 'formations'), {
         name: 'New Formation',
-        size: 11,
         ownerId: $authStore.user.uid,
+        groups: ['GK', 'DEF', 'MID', 'FWD'],
         positions: [
           { id: generateUUID(), name: 'GK', group: 'GK', x: 50, y: 92 },
           { id: generateUUID(), name: 'RB', group: 'DEF', x: 85, y: 75 },
@@ -83,9 +85,11 @@
       {#each formations as form}
         <div class="formation-card">
           <button class="btn-delete-card" on:click={() => deleteFormation(form.id, form.name)}>✕</button>
-          <h3>{form.name}</h3>
-          <p class="muted">{form.positions?.length || 0} Positions • {form.size}v{form.size}</p>
-          <a href="/formations/{form.id}" class="btn-secondary">Edit on Field</a>
+          <a href="/formations/{form.id}" class="formation-link">
+            <h3>{form.name}</h3>
+          </a>
+          <p class="muted">{form.positions?.length || 0} Positions</p>
+          <a href="/formations/{form.id}" class="btn-secondary">Edit</a>
         </div>
       {/each}
 
@@ -121,4 +125,7 @@
     color: #ef4444; font-size: 1.25rem; cursor: pointer; opacity: 0.5; transition: opacity 0.2s;
   }
   .btn-delete-card:hover { opacity: 1; }
+
+  .formation-link { text-decoration: none; color: inherit; display: block; width: fit-content; }
+  .formation-link:hover h3 { color: #3b82f6; }
 </style>
