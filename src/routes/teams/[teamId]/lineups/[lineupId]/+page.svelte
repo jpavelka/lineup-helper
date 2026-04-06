@@ -18,6 +18,7 @@
   let hasUnsavedChanges = false;
 
   let selectedItem = null; // { type: 'slot'|'bench', id: string }
+  let typeaheadQuery = '';
   let pitchView = false;
   let showCompareModal = false;
   let selectedComparePos = null; // posId being edited in compare modal
@@ -36,6 +37,7 @@
       }
     };
     window.addEventListener('beforeunload', handleBeforeUnload);
+
     return () => window.removeEventListener('beforeunload', handleBeforeUnload);
   });
 
@@ -77,7 +79,10 @@
     saveStatus = 'Unsaved changes';
   }
 
+  $: duplicateName = otherLineups.some(l => l.name.trim().toLowerCase() === lineup?.name?.trim().toLowerCase());
+
   async function saveLineup() {
+    if (duplicateName) return;
     saveStatus = 'Saving...';
     try {
       await updateDoc(doc(db, 'lineups', lineupId), {
@@ -119,7 +124,7 @@
       newPlayers[targetId] = payload.id;
     } 
     else if (payload.type === 'slot' && targetType === 'bench') {
-      newPlayers[payload.id] = null; // Clearing slot if dropped on bench
+      newPlayers[payload.id] = targetId; // Assign bench player to the selected slot
     }
     else if (payload.type === 'slot' && targetType === 'slot') {
       const temp = newPlayers[payload.id];
@@ -132,6 +137,35 @@
     markChanged();
   }
 
+  function selectNextSlot(fromPosId, reverse = false) {
+    const positions = formation?.positions || [];
+    const currentIndex = positions.findIndex(p => p.id === fromPosId);
+    const ordered = reverse
+      ? [...positions.slice(0, currentIndex).reverse(), ...positions.slice(currentIndex + 1).reverse()]
+      : [...positions.slice(currentIndex + 1), ...positions.slice(0, currentIndex)];
+    const next = ordered[0];
+    if (next) { selectedItem = { type: 'slot', id: next.id }; typeaheadQuery = ''; }
+    else { selectedItem = null; typeaheadQuery = ''; }
+  }
+
+  function handleKeydown(e) {
+    if (!selectedItem || selectedItem.type !== 'slot') return;
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+    if (e.key === 'Escape') { selectedItem = null; typeaheadQuery = ''; return; }
+    if (e.key === 'Tab') { e.preventDefault(); selectNextSlot(selectedItem.id, e.shiftKey); return; }
+    if (e.key === 'Backspace') { typeaheadQuery = typeaheadQuery.slice(0, -1); return; }
+    if (e.key === 'Enter') {
+      if (typeaheadFilteredPlayers.length > 0) {
+        const posId = selectedItem.id;
+        executeSwap('bench', typeaheadFilteredPlayers[0].id);
+        typeaheadQuery = '';
+        selectNextSlot(posId);
+      }
+      return;
+    }
+    if (e.key.length === 1) { e.preventDefault(); typeaheadQuery += e.key; }
+  }
+
   function getPlayerName(playerId) {
     if (!playerId) return null;
     const player = team.roster.find(p => p.id === playerId);
@@ -140,6 +174,10 @@
 
   $: activePlayerIds = Object.values(lineup?.players || {}).filter(id => id !== null);
   $: benchPlayers = team?.roster.filter(p => !activePlayerIds.includes(p.id)) || [];
+  $: typeaheadFilteredPlayers = typeaheadQuery
+    ? benchPlayers.filter(p => p.name.toLowerCase().includes(typeaheadQuery.toLowerCase())).sort((a, b) => a.name.localeCompare(b.name))
+    : [];
+  $: if (!selectedItem || selectedItem.type !== 'slot') typeaheadQuery = '';
 
   // Comparison: per-player appearance counts across selected lineups + current
   $: selectedOtherLineups = otherLineups.filter(l => selectedLineupIds.has(l.id));
@@ -164,6 +202,8 @@
 
 </script>
 
+<svelte:window on:keydown={handleKeydown} />
+
 <svelte:head>
   <title>Edit Lineup | Lineup Pro</title>
 </svelte:head>
@@ -176,14 +216,18 @@
       <div class="title-group">
         <a href="/teams/{teamId}" class="back-link">← Back to Team</a>
         <div class="name-edit">
-          <input type="text" bind:value={lineup.name} on:input={markChanged} />
-          <span class="formation-name muted">{lineup.formationName}</span>
+          <input type="text" bind:value={lineup.name} on:input={markChanged} class:name-duplicate={duplicateName} />
+          {#if duplicateName}
+            <span class="name-error">A lineup with this name already exists</span>
+          {:else}
+            <span class="formation-name muted">{lineup.formationName}</span>
+          {/if}
         </div>
       </div>
       <div class="header-actions">
         <span class="save-status" class:unsaved={hasUnsavedChanges}>{saveStatus}</span>
         <button class="btn-compare" on:click={() => showCompareModal = true}>Compare Lineups</button>
-        <button class="btn-save" class:active={hasUnsavedChanges} on:click={saveLineup}>Save Changes</button>
+        <button class="btn-save" class:active={hasUnsavedChanges && !duplicateName} disabled={duplicateName} on:click={saveLineup}>Save Changes</button>
       </div>
     </header>
 
@@ -267,12 +311,25 @@
           <span class="count">{benchPlayers.length} Available</span>
         </div>
 
+        {#if typeaheadQuery}
+          <div class="typeahead-bar">
+            <span class="typeahead-label">Filter:</span>
+            <span class="typeahead-query">{typeaheadQuery}</span>
+            <span class="typeahead-hint">Enter to assign · Backspace to clear</span>
+          </div>
+        {/if}
+
+        {#if typeaheadQuery && typeaheadFilteredPlayers.length === 0}
+          <div class="typeahead-no-match">No matches for "{typeaheadQuery}"</div>
+        {/if}
+
         <div class="bench-list">
-          {#each benchPlayers.sort((a,b) => a.name.localeCompare(b.name)) as player}
+          {#each (typeaheadQuery ? typeaheadFilteredPlayers : benchPlayers.sort((a,b) => a.name.localeCompare(b.name))) as player, i}
             <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
-            <div 
+            <div
               class="bench-card"
               class:selected={selectedItem?.type === 'bench' && selectedItem?.id === player.id}
+              class:typeahead-top={typeaheadQuery && i === 0}
               on:click={() => handleBenchClick(player.id)}
             >
               <span class="player-number">{player.number}</span>
@@ -458,6 +515,8 @@
     padding: 0; outline: none; border-bottom: 2px solid transparent; transition: border 0.2s;
   }
   .name-edit input:focus { border-color: #3b82f6; }
+  .name-edit input.name-duplicate { border-color: #ef4444; }
+  .name-error { font-size: 0.85rem; color: #ef4444; }
 
   .formation-name { font-size: 1rem; font-weight: 500; }
   
@@ -541,6 +600,13 @@
   }
   .bench-card:hover { background: #334155; }
   .bench-card.selected { border-color: #3b82f6; background: rgba(59, 130, 246, 0.1); }
+  .bench-card.typeahead-top { border-color: #10b981; background: rgba(16, 185, 129, 0.1); }
+
+  .typeahead-bar { display: flex; align-items: center; gap: 0.5rem; padding: 0.4rem 0.6rem; background: #1e293b; border-radius: 0.4rem; margin-bottom: 0.5rem; flex-wrap: wrap; }
+  .typeahead-label { font-size: 0.75rem; color: #64748b; }
+  .typeahead-query { font-size: 0.9rem; font-weight: 600; color: #f8fafc; font-family: monospace; min-width: 1ch; }
+  .typeahead-hint { font-size: 0.7rem; color: #475569; margin-left: auto; }
+  .typeahead-no-match { font-size: 0.85rem; color: #64748b; padding: 0.5rem 0.25rem; text-align: center; }
   
   .player-number { font-weight: 700; color: #94a3b8; width: 18px; font-size: 0.8rem; }
   .player-name { flex: 1; font-weight: 600; color: #f8fafc; font-size: 0.85rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }

@@ -1,7 +1,7 @@
 <script>
   import { page } from '$app/stores';
   import { onMount } from 'svelte';
-  import { doc, getDoc, setDoc, collection, query, where, getDocs, deleteDoc } from 'firebase/firestore';
+  import { doc, getDoc, setDoc, collection, query, where, getDocs, deleteDoc, updateDoc, writeBatch } from 'firebase/firestore';
   import { db } from '$lib/firebase/config';
   import { authStore } from '$lib/stores/authStore';
   import { generateUUID } from '$lib/utils.js';
@@ -64,11 +64,53 @@
     try {
       const q = query(collection(db, 'lineups'), where('teamId', '==', teamId));
       const querySnapshot = await getDocs(q);
-      lineups = querySnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      lineups = querySnapshot.docs
+        .map(doc => ({ id: doc.id, ...doc.data() }))
+        .sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0) || a.name.localeCompare(b.name));
     } catch (error) {
       console.error("Error loading lineups:", error);
     }
   }
+
+  let dragIndex = null;
+  let dragOverIndex = null;
+
+  function onDragStart(i) { dragIndex = i; }
+  function onDragOver(i) { dragOverIndex = i; }
+
+  async function commitReorder() {
+    if (dragIndex === null || dragOverIndex === null || dragIndex === dragOverIndex) {
+      dragIndex = null; dragOverIndex = null; return;
+    }
+    const reordered = [...lineups];
+    const [moved] = reordered.splice(dragIndex, 1);
+    reordered.splice(dragOverIndex, 0, moved);
+    lineups = reordered;
+    dragIndex = null; dragOverIndex = null;
+
+    const batch = writeBatch(db);
+    reordered.forEach((l, i) => batch.update(doc(db, 'lineups', l.id), { sortOrder: i }));
+    await batch.commit();
+  }
+
+  function onDrop() { commitReorder(); }
+
+  function onTouchStart(e, i) {
+    dragIndex = i;
+  }
+
+  function onTouchMove(e) {
+    e.preventDefault();
+    const touch = e.touches[0];
+    const el = document.elementFromPoint(touch.clientX, touch.clientY);
+    const item = el?.closest('[data-lineup-index]');
+    if (item) {
+      const idx = parseInt(item.dataset.lineupIndex);
+      if (!isNaN(idx)) dragOverIndex = idx;
+    }
+  }
+
+  function onTouchEnd() { commitReorder(); }
 
   async function saveTeamToDb(dataToSave) {
     saveStatus = 'Saving...';
@@ -181,7 +223,60 @@
 
     <div class="grid-layout">
 
-      <!-- Left Column: Tactical Lineups -->
+      <!-- Left Column: Roster -->
+      <div class="panel roster-panel">
+        <button class="accordion-header" on:click={() => rosterOpen = !rosterOpen}>
+          <h2>Current Roster</h2>
+          <div class="accordion-right">
+            <span class="count-badge">{team.roster?.length || 0} Players</span>
+            <span class="chevron" class:open={rosterOpen}>▼</span>
+          </div>
+        </button>
+
+        {#if rosterOpen}
+          <!-- Add Player Form -->
+          <form on:submit|preventDefault={addPlayer} class="add-player-form">
+            <div class="form-row">
+              <input type="text" placeholder="Player Name" bind:value={newPlayerName} required />
+              <input type="text" placeholder="#" bind:value={newPlayerNumber} class="number-input" />
+              <button type="submit" class="btn-primary small">+ Add</button>
+            </div>
+          </form>
+
+          <!-- Roster List -->
+          {#if !team.roster || team.roster.length === 0}
+            <div class="empty-state"><p>Your roster is empty. Add players using the form above.</p></div>
+          {:else}
+            <ul class="roster-list">
+              {#each team.roster.sort((a, b) => a.name.localeCompare(b.name)) as player (player.id)}
+                <li class="roster-item">
+                  {#if editingPlayerId === player.id}
+                    <div class="edit-row">
+                      <input type="text" class="edit-name" bind:value={editName} placeholder="Player Name" required />
+                      <input type="text" class="edit-number" bind:value={editNumber} placeholder="#" />
+                      <div class="edit-actions">
+                        <button class="btn-save" on:click={() => saveEdit(player.id)}>✓</button>
+                        <button class="btn-cancel" on:click={cancelEdit}>✕</button>
+                      </div>
+                    </div>
+                  {:else}
+                    <div class="player-info">
+                      <span class="player-number">{player.number}</span>
+                      <span class="player-name">{player.name}</span>
+                    </div>
+                    <div class="player-controls">
+                      <button class="btn-icon" on:click={() => startEdit(player)} title="Edit player">✎</button>
+                      <button class="btn-remove" on:click={() => removePlayer(player.id)}>✕</button>
+                    </div>
+                  {/if}
+                </li>
+              {/each}
+            </ul>
+          {/if}
+        {/if}
+      </div>
+
+      <!-- Right Column: Tactical Lineups -->
       <div class="panel">
         <button class="accordion-header" on:click={() => lineupsOpen = !lineupsOpen}>
           <h2>Tactical Lineups</h2>
@@ -193,10 +288,24 @@
 
         {#if lineupsOpen}
           <div class="lineup-list">
-            {#each lineups as lineup}
-              <div class="lineup-item">
+            {#each lineups as lineup, i}
+              <!-- svelte-ignore a11y-no-static-element-interactions -->
+              <div
+                class="lineup-item"
+                class:drag-over={dragOverIndex === i}
+                draggable="true"
+                data-lineup-index={i}
+                on:dragstart={() => onDragStart(i)}
+                on:dragover|preventDefault={() => onDragOver(i)}
+                on:drop|preventDefault={onDrop}
+                on:dragend={() => { dragIndex = null; dragOverIndex = null; }}
+                on:touchstart|passive={(e) => onTouchStart(e, i)}
+                on:touchmove={onTouchMove}
+                on:touchend={onTouchEnd}
+              >
+                <span class="drag-handle" title="Drag to reorder">⠿</span>
                 <div class="lineup-info">
-                  <a href="/teams/{teamId}/lineups/{lineup.id}"  class="lineup-link">
+                  <a href="/teams/{teamId}/lineups/{lineup.id}" class="lineup-link">
                     <span class="lineup-name">{lineup.name}</span>
                   </a>
                   <span class="muted small">{lineup.formationName || 'Custom Formation'}</span>
@@ -211,84 +320,6 @@
               <div class="empty-state mini">No lineups yet.</div>
             {/if}
           </div>
-        {/if}
-      </div>
-
-      <!-- Right Column: Roster -->
-      <div class="panel roster-panel">
-        <button class="accordion-header" on:click={() => rosterOpen = !rosterOpen}>
-          <h2>Current Roster</h2>
-          <div class="accordion-right">
-            <span class="count-badge">{team.roster?.length || 0} Players</span>
-            <span class="chevron" class:open={rosterOpen}>▼</span>
-          </div>
-        </button>
-
-        {#if rosterOpen}
-          <!-- Add Player Form -->
-          <form on:submit|preventDefault={addPlayer} class="add-player-form">
-            <div class="form-row">
-              <input
-                type="text"
-                placeholder="Player Name"
-                bind:value={newPlayerName}
-                required
-              />
-              <input
-                type="text"
-                placeholder="#"
-                bind:value={newPlayerNumber}
-                class="number-input"
-              />
-              <button type="submit" class="btn-primary small">+ Add</button>
-            </div>
-          </form>
-
-          <!-- Roster List -->
-          {#if !team.roster || team.roster.length === 0}
-            <div class="empty-state">
-              <p>Your roster is empty. Add players using the form above.</p>
-            </div>
-          {:else}
-            <ul class="roster-list">
-              {#each team.roster.sort((a, b) => a.name.localeCompare(b.name)) as player (player.id)}
-                <li class="roster-item">
-                  {#if editingPlayerId === player.id}
-                    <!-- Inline Edit Row -->
-                    <div class="edit-row">
-                      <input
-                        type="text"
-                        class="edit-name"
-                        bind:value={editName}
-                        placeholder="Player Name"
-                        required
-                      />
-                      <input
-                        type="text"
-                        class="edit-number"
-                        bind:value={editNumber}
-                        placeholder="#"
-                      />
-                      <div class="edit-actions">
-                        <button class="btn-save" on:click={() => saveEdit(player.id)}>✓</button>
-                        <button class="btn-cancel" on:click={cancelEdit}>✕</button>
-                      </div>
-                    </div>
-                  {:else}
-                    <!-- Normal Row -->
-                    <div class="player-info">
-                      <span class="player-number">{player.number}</span>
-                      <span class="player-name">{player.name}</span>
-                    </div>
-                    <div class="player-controls">
-                      <button class="btn-icon" on:click={() => startEdit(player)} title="Edit player">✎</button>
-                      <button class="btn-remove" on:click={() => removePlayer(player.id)}>✕</button>
-                    </div>
-                  {/if}
-                </li>
-              {/each}
-            </ul>
-          {/if}
         {/if}
       </div>
 
@@ -386,6 +417,13 @@
     gap: 1.5rem;
   }
 
+  @media (max-width: 799px) {
+    .lineup-list, .roster-list {
+      max-height: 40vh;
+      overflow-y: auto;
+    }
+  }
+
   @media (min-width: 800px) {
     .grid-layout {
       grid-template-columns: 350px 1fr;
@@ -447,13 +485,16 @@
 
   .lineup-item {
     display: flex;
-    justify-content: space-between;
     align-items: center;
+    gap: 0.5rem;
     background: #1e293b;
     border: 1px solid #334155;
     padding: 0.75rem 1rem;
     border-radius: 0.75rem;
+    cursor: grab;
   }
+  .lineup-item.drag-over { border-color: #3b82f6; background: rgba(59,130,246,0.1); }
+  .drag-handle { color: #475569; font-size: 1.1rem; cursor: grab; flex-shrink: 0; }
 
   .lineup-info {
     display: flex;
@@ -467,6 +508,7 @@
   .lineup-actions {
     display: flex;
     gap: 0.5rem;
+    margin-left: auto;
   }
 
   /* Add Player Form */

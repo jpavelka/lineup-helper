@@ -23,6 +23,7 @@
   let statsModalPlayer = null;
   let statsBarMode = 'grouped'; // 'grouped' | 'timeline'
   let planBarMode = 'grouped'; // 'grouped' | 'timeline'
+  let planSort = 'name'; // 'name' | 'time'
   let showPlanStatsModal = false;
   let planStatsModalPlayer = null;
   let savedLineups = [];
@@ -67,7 +68,7 @@
         .sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0) || a.name.localeCompare(b.name));
 
       const lineupsSnap = await getDocs(query(collection(db, 'lineups'), where('teamId', '==', game.teamId)));
-      savedLineups = lineupsSnap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => a.name.localeCompare(b.name));
+      savedLineups = lineupsSnap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0) || a.name.localeCompare(b.name));
 
       // Pre-populate formation from team default if not already set on this game
       if (!game.formationId && team?.defaultFormationId) {
@@ -364,13 +365,15 @@
       </div>
 
       <!-- Top Right: Post-Game Notes -->
-      <div class="panel">
-        <h2>Post-Game Review</h2>
-        <div class="form-group">
-          <label>Post-Game Notes</label>
-          <textarea bind:value={game.postNotes} on:blur={saveGameNotes} rows="6" placeholder="What went well? What needs work?"></textarea>
+      {#if game.status === 'completed'}
+        <div class="panel">
+          <h2>Post-Game Review</h2>
+          <div class="form-group">
+            <label>Post-Game Notes</label>
+            <textarea bind:value={game.postNotes} on:blur={saveGameNotes} rows="6" placeholder="What went well? What needs work?"></textarea>
+          </div>
         </div>
-      </div>
+      {/if}
     </div>
 
     <!-- Game Plan -->
@@ -426,15 +429,21 @@
           <div class="panel-title-row">
             <h2>Player Plan</h2>
             <div class="panel-title-right">
-              <div class="bar-mode-toggle">
-                <button class:active={planBarMode === 'grouped'} on:click={() => planBarMode = 'grouped'}>Grouped</button>
-                <button class:active={planBarMode === 'timeline'} on:click={() => planBarMode = 'timeline'}>Timeline</button>
-              </div>
               {#if game.status !== 'completed'}
                 <button class="btn-toggle" on:click={() => editingAvailability = !editingAvailability}>
                   {editingAvailability ? 'Done' : 'Edit Availability'}
                 </button>
               {/if}
+            </div>
+          </div>
+          <div class="plan-controls">
+            <div class="bar-mode-toggle">
+              <button class:active={planSort === 'name'} on:click={() => planSort = 'name'}>A–Z</button>
+              <button class:active={planSort === 'time'} on:click={() => planSort = 'time'}>Time</button>
+            </div>
+            <div class="bar-mode-toggle">
+              <button class:active={planBarMode === 'grouped'} on:click={() => planBarMode = 'grouped'}>Grouped</button>
+              <button class:active={planBarMode === 'timeline'} on:click={() => planBarMode = 'timeline'}>Timeline</button>
             </div>
           </div>
 
@@ -468,7 +477,7 @@
                   </tr>
                 </thead>
                 <tbody>
-                  {#each playerPlan as p}
+                  {#each [...playerPlan].sort((a, b) => planSort === 'time' ? (b.activeMs - a.activeMs) || a.name.localeCompare(b.name) : a.name.localeCompare(b.name)) as p}
                     {@const barTotal = p.activeMs + p.benchMs}
                     {@const groupEntries = Object.entries(p.groupMs || {}).sort((a, b) => b[1] - a[1])}
                     {@const planSegs = playerPlanTimelines[p.id] ?? []}
@@ -769,6 +778,7 @@
   .panel-title-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.75rem; }
   .panel-title-row h2 { margin: 0; border: none; padding: 0; }
   .panel-title-right { display: flex; align-items: center; gap: 0.5rem; }
+  .plan-controls { display: flex; gap: 0.5rem; margin-bottom: 0.75rem; }
   .bar-mode-toggle { display: flex; background: #0f172a; border-radius: 0.4rem; padding: 0.15rem; }
   .bar-mode-toggle button { background: transparent; border: none; color: #64748b; padding: 0.2rem 0.5rem; border-radius: 0.3rem; cursor: pointer; font-size: 0.72rem; font-weight: 600; }
   .bar-mode-toggle button.active { background: #334155; color: #f8fafc; }

@@ -84,7 +84,7 @@
     team = teamSnap.data();
 
     const lineupsSnap = await getDocs(query(collection(db, 'lineups'), where('teamId', '==', game.teamId)));
-    savedLineups = lineupsSnap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => a.name.localeCompare(b.name));
+    savedLineups = lineupsSnap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0) || a.name.localeCompare(b.name));
 
     if (game.formationId) {
       const formSnap = await getDoc(doc(db, 'formations', game.formationId));
@@ -614,7 +614,9 @@
               <div class="player-info">
                 {#if pendingSub}
                   {#if pendingSub.playerInId}
-                    <span class="player-name sub-name-in">{getPlayerName(pendingSub.playerInId)}</span>
+                    {@const fromPosId = Object.entries(game.lineup).find(([, pid]) => pid === pendingSub.playerInId)?.[0]}
+                    {@const fromPosName = fromPosId ? formation.positions.find(p => p.id === fromPosId)?.name : null}
+                    <span class="player-name sub-name-in">{getPlayerName(pendingSub.playerInId)}{#if fromPosName}&nbsp;<span class="pos-move">({fromPosName}→{pendingSub.posName})</span>{/if}</span>
                   {/if}
                   {#if pendingSub.playerOutId}
                     {@const movingToSub = pendingSubs.find(s => s.playerInId === pendingSub.playerOutId)}
@@ -995,6 +997,7 @@
   .slot-card.selected, .bench-card.selected { border-color: #3b82f6; background: rgba(59,130,246,0.15); box-shadow: 0 0 10px rgba(59,130,246,0.3); }
   .slot-card.has-pending { border-color: #f59e0b; background: rgba(245,158,11,0.08); }
   .sub-name-in { color: #34d399; }
+  .pos-move { font-size: 0.78rem; opacity: 0.8; font-weight: 400; }
   .sub-name-move { color: #fb923c; font-size: 0.8rem; }
   .sub-name-bench { color: #f87171; font-size: 0.8rem; text-decoration: line-through; }
 

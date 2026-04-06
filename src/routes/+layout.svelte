@@ -118,8 +118,6 @@
         ⚽ Lineup Pro
       </a>
       <div class="nav-links">
-        <a href="/">Dashboard</a>
-        <a href="/formations">Formations</a>
         <button class="btn-logout" on:click={handleLogout}>Log Out</button>
       </div>
     </nav>

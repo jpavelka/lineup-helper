@@ -11,8 +11,12 @@
   let name = '';
   let selectedFormationId = '';
   let formations = [];
+  let existingLineupNames = [];
+  let existingMaxSortOrder = -1;
   let loading = true;
   let saving = false;
+
+  $: duplicateName = name.trim() && existingLineupNames.some(n => n.toLowerCase() === name.trim().toLowerCase());
 
   onMount(async () => {
     if ($authStore.user) {
@@ -22,16 +26,18 @@
 
   async function loadFormations() {
     try {
-      const q = query(
-        collection(db, 'formations'), 
-        where('ownerId', '==', $authStore.user.uid)
-      );
-      const querySnapshot = await getDocs(q);
-      formations = querySnapshot.docs
+      const [formSnap, lineupSnap] = await Promise.all([
+        getDocs(query(collection(db, 'formations'), where('ownerId', '==', $authStore.user.uid))),
+        getDocs(query(collection(db, 'lineups'), where('teamId', '==', teamId)))
+      ]);
+      formations = formSnap.docs
         .map(doc => ({ id: doc.id, ...doc.data() }))
         .filter(f => f.name)
         .sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0) || a.name.localeCompare(b.name));
-      
+      const existingLineups = lineupSnap.docs.map(d => d.data());
+      existingLineupNames = existingLineups.map(d => d.name).filter(Boolean);
+      existingMaxSortOrder = existingLineups.reduce((max, l) => Math.max(max, l.sortOrder ?? 0), -1);
+
       if (formations.length > 0) {
         selectedFormationId = formations[0].id;
       }
@@ -43,7 +49,7 @@
   }
 
   async function createLineup() {
-    if (!name.trim() || !selectedFormationId) return;
+    if (!name.trim() || !selectedFormationId || duplicateName) return;
     
     saving = true;
     const formation = formations.find(f => f.id === selectedFormationId);
@@ -54,9 +60,10 @@
         teamId: teamId,
         formationId: selectedFormationId,
         formationName: formation.name,
-        players: {}, // Mapping of positionId -> playerId
+        players: {},
         ownerId: $authStore.user.uid,
-        createdAt: Date.now()
+        createdAt: Date.now(),
+        sortOrder: existingMaxSortOrder + 1
       });
       
       goto(`/teams/${teamId}/lineups/${docRef.id}`);
@@ -88,13 +95,17 @@
     <form on:submit|preventDefault={createLineup} class="create-form">
       <div class="form-group">
         <label for="lineup-name">Lineup Name</label>
-        <input 
+        <input
           id="lineup-name"
-          type="text" 
-          bind:value={name} 
-          placeholder="e.g. Starting XI - 4-4-2" 
-          required 
+          type="text"
+          bind:value={name}
+          placeholder="e.g. Starting XI - 4-4-2"
+          required
+          class:input-error={duplicateName}
         />
+        {#if duplicateName}
+          <span class="field-error">A lineup with this name already exists</span>
+        {/if}
       </div>
 
       <div class="form-group">
@@ -107,7 +118,7 @@
       </div>
 
       <div class="actions">
-        <button type="submit" class="btn-primary" disabled={saving}>
+        <button type="submit" class="btn-primary" disabled={saving || !!duplicateName}>
           {saving ? 'Creating...' : 'Continue to Assignment'}
         </button>
       </div>
@@ -174,6 +185,9 @@
     outline: none;
     border-color: #3b82f6;
   }
+
+  input.input-error { border-color: #ef4444; }
+  .field-error { font-size: 0.85rem; color: #ef4444; }
 
   .actions {
     margin-top: 1rem;
