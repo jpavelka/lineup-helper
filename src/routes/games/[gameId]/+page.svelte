@@ -7,6 +7,7 @@
   import MatchTimeline from '$lib/components/MatchTimeline.svelte';
   import PlayerStatsModal from '$lib/components/PlayerStatsModal.svelte';
   import { computePositionStats, computePlayerTimelines } from '$lib/utils.js';
+  import { getGroupColor } from '$lib/groupColors.js';
 
   const gameId = $page.params.gameId;
   
@@ -20,6 +21,10 @@
   let editingGame = null;
   let showPlayerStatsModal = false;
   let statsModalPlayer = null;
+  let statsBarMode = 'grouped'; // 'grouped' | 'timeline'
+  let planBarMode = 'grouped'; // 'grouped' | 'timeline'
+  let showPlanStatsModal = false;
+  let planStatsModalPlayer = null;
   let savedLineups = [];
 
   const HA_LABELS = { home: '🏠 Home', away: '✈️ Away', neutral: '⚖️ Neutral', 'n/a': 'N/A' };
@@ -148,6 +153,60 @@
   }
 
   $: totalPlanMins = (game?.gamePlan || []).reduce((sum, s) => sum + (Number(s.durationMins) || 0), 0);
+  $: isPreGame = game?.status !== 'live' && game?.status !== 'completed';
+
+  // Planned per-player stats derived from game plan steps
+  $: playerPlan = (() => {
+    if (!availableRoster.length) return [];
+    const posMap = {};
+    (gameFormation?.positions || []).forEach(p => { posMap[p.id] = p; });
+    const stats = {};
+    availableRoster.forEach(p => { stats[p.id] = { activeMs: 0, benchMs: 0, positionMs: {}, groupMs: {} }; });
+    for (const step of (game?.gamePlan || [])) {
+      const lu = savedLineups.find(l => l.id === step.lineupId);
+      if (!lu) continue;
+      const ms = (Number(step.durationMins) || 0) * 60 * 1000;
+      if (ms <= 0) continue;
+      availableRoster.forEach(player => {
+        const s = stats[player.id];
+        const posId = Object.keys(lu.players || {}).find(k => lu.players[k] === player.id);
+        if (posId) {
+          s.activeMs += ms;
+          s.positionMs[posId] = (s.positionMs[posId] || 0) + ms;
+          const group = posMap[posId]?.group;
+          if (group) s.groupMs[group] = (s.groupMs[group] || 0) + ms;
+        } else {
+          s.benchMs += ms;
+        }
+      });
+    }
+    return availableRoster.map(p => ({ ...p, ...stats[p.id] })).sort((a, b) => b.activeMs - a.activeMs);
+  })();
+
+  $: totalPlanMs = totalPlanMins * 60 * 1000;
+
+  $: playerPlanTimelines = (() => {
+    if (!availableRoster.length) return {};
+    const posMap = {};
+    (gameFormation?.positions || []).forEach(p => { posMap[p.id] = p; });
+    const timelines = {};
+    availableRoster.forEach(p => { timelines[p.id] = []; });
+    let curMs = 0;
+    for (const step of (game?.gamePlan || [])) {
+      const lu = savedLineups.find(l => l.id === step.lineupId);
+      if (!lu) continue;
+      const ms = (Number(step.durationMins) || 0) * 60 * 1000;
+      if (ms <= 0) continue;
+      const segEnd = curMs + ms;
+      availableRoster.forEach(player => {
+        const posId = Object.keys(lu.players || {}).find(k => lu.players[k] === player.id);
+        const group = posId ? (posMap[posId]?.group ?? null) : null;
+        timelines[player.id].push({ startMs: curMs, endMs: segEnd, group: posId ? group : null });
+      });
+      curMs = segEnd;
+    }
+    return timelines;
+  })();
 
   // --- Helpers ---
   function getPlayerName(playerId) {
@@ -351,84 +410,215 @@
     </div>
 
     <!-- Bottom Section: Stats & Timeline -->
-    <div class="stats-grid">
-      
-      <!-- Player Minutes Box Score -->
-      <div class="panel">
-        <div class="panel-title-row">
-          <h2>Player Stats</h2>
-          {#if game.status !== 'completed'}
-            <button class="btn-toggle" on:click={() => editingAvailability = !editingAvailability}>
-              {editingAvailability ? 'Done' : 'Edit Availability'}
-            </button>
-          {/if}
-        </div>
+    <div class="stats-grid" class:stats-grid-single={isPreGame}>
 
-        {#if editingAvailability}
-          <p class="small text-muted" style="margin: 0 0 0.75rem 0;">Check players available for this game.</p>
-          <div class="roster-checklist">
-            {#each (team?.roster || []).sort((a, b) => a.name.localeCompare(b.name)) as player}
-              <label class="check-item">
-                <input
-                  type="checkbox"
-                  checked={game.availablePlayers?.includes(player.id)}
-                  on:change={() => togglePlayerAvailability(player.id)}
-                />
-                <span class="check-name">{player.name}</span>
-                <span class="check-number">#{player.number}</span>
-              </label>
-            {/each}
-            {#if !team?.roster?.length}
-              <p class="text-muted small">No players in roster.</p>
-            {/if}
+      <!-- Pre-game: Player Plan | In/post-game: Player Stats -->
+      <div class="panel">
+        {#if isPreGame}
+          <!-- Player Plan -->
+          <div class="panel-title-row">
+            <h2>Player Plan</h2>
+            <div class="panel-title-right">
+              <div class="bar-mode-toggle">
+                <button class:active={planBarMode === 'grouped'} on:click={() => planBarMode = 'grouped'}>Grouped</button>
+                <button class:active={planBarMode === 'timeline'} on:click={() => planBarMode = 'timeline'}>Timeline</button>
+              </div>
+              {#if game.status !== 'completed'}
+                <button class="btn-toggle" on:click={() => editingAvailability = !editingAvailability}>
+                  {editingAvailability ? 'Done' : 'Edit Availability'}
+                </button>
+              {/if}
+            </div>
           </div>
-        {:else}
-          <div class="table-container stats-panel-scroll">
-            <table class="stats-table">
-              <thead>
-                <tr>
-                  <th>Player</th>
-                  <th class="text-right">Field Time</th>
-                  <th class="text-right">G</th>
-                  <th class="text-right">A</th>
-                </tr>
-              </thead>
-              <tbody>
-                {#each boxScore as p}
+
+          {#if editingAvailability}
+            <p class="small text-muted" style="margin: 0 0 0.75rem 0;">Check players available for this game.</p>
+            <div class="roster-checklist">
+              {#each (team?.roster || []).sort((a, b) => a.name.localeCompare(b.name)) as player}
+                <label class="check-item">
+                  <input
+                    type="checkbox"
+                    checked={game.availablePlayers?.includes(player.id)}
+                    on:change={() => togglePlayerAvailability(player.id)}
+                  />
+                  <span class="check-name">{player.name}</span>
+                  <span class="check-number">#{player.number}</span>
+                </label>
+              {/each}
+              {#if !team?.roster?.length}
+                <p class="text-muted small">No players in roster.</p>
+              {/if}
+            </div>
+          {:else if !game.gamePlan?.length}
+            <p class="text-muted small">Add steps to the Game Plan above to see planned minutes here.</p>
+          {:else}
+            <div class="table-container stats-panel-scroll">
+              <table class="stats-table">
+                <thead>
                   <tr>
-                    <td>
-                      <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
-                      <span class="btn-player-info" title="View position stats" on:click={() => { statsModalPlayer = p; showPlayerStatsModal = true; }}>i</span>
-                      <span class="muted small mr-1">#{p.number}</span>
-                      <strong>{p.name}</strong>
-                    </td>
-                    <td class="text-right text-green">{formatDuration(p.activeMs)}</td>
-                    <td class="text-right">{p.goals || '–'}</td>
-                    <td class="text-right text-muted">{p.assists || '–'}</td>
+                    <th>Player</th>
+                    <th class="text-right">Planned Time</th>
                   </tr>
-                {/each}
-                {#if boxScore.length === 0}
-                  <tr><td colspan="4" class="text-center text-muted">No players assigned to this game.</td></tr>
-                {/if}
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  {#each playerPlan as p}
+                    {@const barTotal = p.activeMs + p.benchMs}
+                    {@const groupEntries = Object.entries(p.groupMs || {}).sort((a, b) => b[1] - a[1])}
+                    {@const planSegs = playerPlanTimelines[p.id] ?? []}
+                    <tr>
+                      <td>
+                        <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+                        <span class="btn-player-info" title="View planned position time" on:click={() => { planStatsModalPlayer = p; showPlanStatsModal = true; }}>i</span>
+                        <span class="muted small mr-1">#{p.number}</span>
+                        <strong>{p.name}</strong>
+                      </td>
+                      <td class="text-right text-green">{formatDuration(p.activeMs)}</td>
+                    </tr>
+                    {#if barTotal > 0}
+                      <tr class="bar-row">
+                        <td colspan="2" class="bar-cell">
+                          <div class="player-color-bar">
+                            {#if planBarMode === 'timeline' && totalPlanMs > 0 && planSegs.length > 0}
+                              {#each planSegs as seg}
+                                {@const color = getGroupColor(seg.group)}
+                                <div class="bar-seg" style="width:{((seg.endMs - seg.startMs) / totalPlanMs * 100).toFixed(2)}%;background:{color.bg};" title="{seg.group ?? 'Bench'}: {formatDuration(seg.endMs - seg.startMs)}"></div>
+                              {/each}
+                            {:else}
+                              {#each groupEntries as [group, ms]}
+                                {@const color = getGroupColor(group)}
+                                <div class="bar-seg" style="width:{(ms / barTotal * 100).toFixed(2)}%;background:{color.bg};" title="{group}: {formatDuration(ms)}"></div>
+                              {/each}
+                              {#if p.benchMs > 0}
+                                {@const color = getGroupColor(null)}
+                                <div class="bar-seg" style="width:{(p.benchMs / barTotal * 100).toFixed(2)}%;background:{color.bg};" title="Bench: {formatDuration(p.benchMs)}"></div>
+                              {/if}
+                            {/if}
+                          </div>
+                        </td>
+                      </tr>
+                    {/if}
+                  {/each}
+                  {#if playerPlan.length === 0}
+                    <tr><td colspan="2" class="text-center text-muted">No players assigned to this game.</td></tr>
+                  {/if}
+                </tbody>
+              </table>
+            </div>
+          {/if}
+
+        {:else}
+          <!-- Player Stats (live / completed) -->
+          <div class="panel-title-row">
+            <h2>Player Stats</h2>
+            <div class="panel-title-right">
+              <div class="bar-mode-toggle">
+                <button class:active={statsBarMode === 'grouped'} on:click={() => statsBarMode = 'grouped'}>Grouped</button>
+                <button class:active={statsBarMode === 'timeline'} on:click={() => statsBarMode = 'timeline'}>Timeline</button>
+              </div>
+              {#if game.status !== 'completed'}
+                <button class="btn-toggle" on:click={() => editingAvailability = !editingAvailability}>
+                  {editingAvailability ? 'Done' : 'Edit Availability'}
+                </button>
+              {/if}
+            </div>
           </div>
+
+          {#if editingAvailability}
+            <p class="small text-muted" style="margin: 0 0 0.75rem 0;">Check players available for this game.</p>
+            <div class="roster-checklist">
+              {#each (team?.roster || []).sort((a, b) => a.name.localeCompare(b.name)) as player}
+                <label class="check-item">
+                  <input
+                    type="checkbox"
+                    checked={game.availablePlayers?.includes(player.id)}
+                    on:change={() => togglePlayerAvailability(player.id)}
+                  />
+                  <span class="check-name">{player.name}</span>
+                  <span class="check-number">#{player.number}</span>
+                </label>
+              {/each}
+              {#if !team?.roster?.length}
+                <p class="text-muted small">No players in roster.</p>
+              {/if}
+            </div>
+          {:else}
+            <div class="table-container stats-panel-scroll">
+              <table class="stats-table">
+                <thead>
+                  <tr>
+                    <th>Player</th>
+                    <th class="text-right">Field Time</th>
+                    <th class="text-right">G</th>
+                    <th class="text-right">A</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {#each boxScore as p}
+                    {@const pStats = positionStats[p.id] || { positionMs: {}, groupMs: {} }}
+                    {@const groupEntries = Object.entries(pStats.groupMs || {}).sort((a, b) => b[1] - a[1])}
+                    {@const barTotal = p.activeMs + p.benchMs}
+                    {@const totalGameMs = game?.gameTimeStats?.totalMs ?? 0}
+                    {@const timelineSegs = playerTimelines[p.id] ?? []}
+                    <tr>
+                      <td>
+                        <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+                        <span class="btn-player-info" title="View position stats" on:click={() => { statsModalPlayer = p; showPlayerStatsModal = true; }}>i</span>
+                        <span class="muted small mr-1">#{p.number}</span>
+                        <strong>{p.name}</strong>
+                      </td>
+                      <td class="text-right text-green">{formatDuration(p.activeMs)}</td>
+                      <td class="text-right">{p.goals || '–'}</td>
+                      <td class="text-right text-muted">{p.assists || '–'}</td>
+                    </tr>
+                    {#if barTotal > 0}
+                      <tr class="bar-row">
+                        <td colspan="4" class="bar-cell">
+                          <div class="player-color-bar">
+                            {#if statsBarMode === 'timeline' && totalGameMs > 0 && timelineSegs.length > 0}
+                              {#each timelineSegs as seg}
+                                {@const color = getGroupColor(seg.group)}
+                                <div class="bar-seg" style="width:{((seg.endMs - seg.startMs) / totalGameMs * 100).toFixed(2)}%;background:{color.bg};" title="{seg.group ?? 'Bench'}: {formatDuration(seg.endMs - seg.startMs)}"></div>
+                              {/each}
+                            {:else}
+                              {#each groupEntries as [group, ms]}
+                                {@const color = getGroupColor(group)}
+                                <div class="bar-seg" style="width:{(ms / barTotal * 100).toFixed(2)}%;background:{color.bg};" title="{group}: {formatDuration(ms)}"></div>
+                              {/each}
+                              {#if p.benchMs > 0}
+                                {@const color = getGroupColor(null)}
+                                <div class="bar-seg" style="width:{(p.benchMs / barTotal * 100).toFixed(2)}%;background:{color.bg};" title="Bench: {formatDuration(p.benchMs)}"></div>
+                              {/if}
+                            {/if}
+                          </div>
+                        </td>
+                      </tr>
+                    {/if}
+                  {/each}
+                  {#if boxScore.length === 0}
+                    <tr><td colspan="4" class="text-center text-muted">No players assigned to this game.</td></tr>
+                  {/if}
+                </tbody>
+              </table>
+            </div>
+          {/if}
         {/if}
       </div>
 
-      <!-- Match Timeline -->
-      <div class="panel">
-        <h2>Match Timeline</h2>
-        <div class="stats-panel-scroll">
-        <MatchTimeline
-          history={game.history}
-          roster={team?.roster || []}
-          {gameId}
-          allowEditing={true}
-          on:updated={(e) => { game.history = e.detail; }}
-        />
+      <!-- Match Timeline (hidden pre-game) -->
+      {#if !isPreGame}
+        <div class="panel">
+          <h2>Match Timeline</h2>
+          <div class="stats-panel-scroll">
+            <MatchTimeline
+              history={game.history}
+              roster={team?.roster || []}
+              {gameId}
+              allowEditing={true}
+              on:updated={(e) => { game.history = e.detail; }}
+            />
+          </div>
         </div>
-      </div>
+      {/if}
 
     </div>
   </div>
@@ -445,6 +635,21 @@
     totalGameMs={game?.gameTimeStats?.totalMs ?? 0}
     formation={gameFormation}
     on:close={() => showPlayerStatsModal = false}
+  />
+{/if}
+
+<!-- PLAYER PLAN STATS MODAL -->
+{#if showPlanStatsModal && planStatsModalPlayer}
+  {@const pp = playerPlan.find(p => p.id === planStatsModalPlayer.id) ?? planStatsModalPlayer}
+  <PlayerStatsModal
+    player={planStatsModalPlayer}
+    activeMs={pp.activeMs ?? 0}
+    benchMs={pp.benchMs ?? 0}
+    positionStats={{ positionMs: pp.positionMs ?? {}, groupMs: pp.groupMs ?? {} }}
+    timelineSegments={playerPlanTimelines[planStatsModalPlayer.id] ?? []}
+    totalGameMs={totalPlanMs}
+    formation={gameFormation}
+    on:close={() => showPlanStatsModal = false}
   />
 {/if}
 
@@ -506,6 +711,7 @@
 
   .grid-layout, .stats-grid { display: grid; grid-template-columns: 1fr; gap: 1.5rem; margin-bottom: 1.5rem;}
   @media (min-width: 800px) { .grid-layout, .stats-grid { grid-template-columns: 1fr 1fr; align-items: start;} }
+  @media (min-width: 800px) { .stats-grid-single { grid-template-columns: 1fr; } }
 
   @media (max-width: 799px) {
     .stats-panel-scroll { max-height: 340px; overflow-y: auto; }
@@ -546,10 +752,18 @@
   .stats-table th.text-right { text-align: right; }
   .stats-table td { padding: 0.75rem 0.5rem; border-bottom: 1px solid #1e293b; }
   .stats-table tr:last-child td { border-bottom: none; }
+  .bar-row td { padding: 0; border-bottom: 1px solid #1e293b; }
+  .bar-cell { padding: 0 0.5rem 0.35rem !important; }
+  .player-color-bar { display: flex; height: 5px; border-radius: 3px; overflow: hidden; background: #0f172a; }
+  .player-color-bar .bar-seg { flex-shrink: 0; height: 100%; }
 
   /* Player Minutes panel header row */
   .panel-title-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.75rem; }
   .panel-title-row h2 { margin: 0; border: none; padding: 0; }
+  .panel-title-right { display: flex; align-items: center; gap: 0.5rem; }
+  .bar-mode-toggle { display: flex; background: #0f172a; border-radius: 0.4rem; padding: 0.15rem; }
+  .bar-mode-toggle button { background: transparent; border: none; color: #64748b; padding: 0.2rem 0.5rem; border-radius: 0.3rem; cursor: pointer; font-size: 0.72rem; font-weight: 600; }
+  .bar-mode-toggle button.active { background: #334155; color: #f8fafc; }
 
   /* Home/Away badge in header */
   .ha-badge { font-size: 0.85rem; font-weight: 600; margin: 0 0.4rem; color: #94a3b8; }

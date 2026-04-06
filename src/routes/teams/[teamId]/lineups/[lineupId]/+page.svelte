@@ -301,7 +301,7 @@
           <h2>Lineup Comparison</h2>
           <p class="compare-subtitle">{totalLineupCount} lineup{totalLineupCount !== 1 ? 's' : ''} selected</p>
         </div>
-        <button class="btn-close" on:click={() => { showCompareModal = false; selectedComparePos = null; }}">✕</button>
+        <button class="btn-close" on:click={() => { showCompareModal = false; selectedComparePos = null; }}>✕</button>
       </div>
 
       {#if otherLineups.length > 0}
