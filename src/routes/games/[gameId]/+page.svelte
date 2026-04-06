@@ -63,10 +63,17 @@
       const formSnap = await getDocs(q);
       formations = formSnap.docs
         .map(d => ({ id: d.id, ...d.data() }))
-        .filter(f => f.name); // Only include formations that have a name
+        .filter(f => f.name)
+        .sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0) || a.name.localeCompare(b.name));
 
       const lineupsSnap = await getDocs(query(collection(db, 'lineups'), where('teamId', '==', game.teamId)));
       savedLineups = lineupsSnap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => a.name.localeCompare(b.name));
+
+      // Pre-populate formation from team default if not already set on this game
+      if (!game.formationId && team?.defaultFormationId) {
+        game.formationId = team.defaultFormationId;
+        await updateDoc(doc(db, 'games', gameId), { formationId: game.formationId });
+      }
 
     } catch (error) {
       console.error(error);
@@ -613,6 +620,7 @@
               history={game.history}
               roster={team?.roster || []}
               {gameId}
+              formation={gameFormation}
               allowEditing={true}
               on:updated={(e) => { game.history = e.detail; }}
             />

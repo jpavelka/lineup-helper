@@ -10,6 +10,8 @@
   /** @type {string|null} */
   export let gameId = null;
   export let allowEditing = false;
+  /** @type {{ positions: { id: string, name: string }[] } | null} */
+  export let formation = null;
 
   const dispatch = createEventDispatcher();
 
@@ -18,6 +20,18 @@
   let editAssist = '';
   let editPlayer = '';
   let editTimestampStr = '';
+  let editPauseReason = '';
+
+  const PAUSE_REASONS = ['Halftime', 'Injury', 'Water Break', 'End of Reg.', 'Other'];
+
+  function isPauseEvent(ev) {
+    return ev?.event?.startsWith('Game Paused');
+  }
+
+  function parsePauseReason(eventName) {
+    const match = eventName.match(/^Game Paused – (.+)$/);
+    return match ? match[1] : '';
+  }
   let expandedTimestamp = null;
 
   function toggleExpand(ev) {
@@ -46,8 +60,8 @@
           const prev = prevLineup[posId] ?? null;
           const curr = ev.lineupSnapshot[posId] ?? null;
           if (prev !== curr) {
-            if (curr) enters.push(curr);
-            if (prev) leaves.push(prev);
+            if (curr) enters.push({ playerId: curr, positionId: posId });
+            if (prev) leaves.push({ playerId: prev, positionId: posId });
           }
         });
         prevLineup = { ...ev.lineupSnapshot };
@@ -70,12 +84,27 @@
     return player ? player.name : 'Unknown';
   }
 
+  function getPositionName(positionId) {
+    if (!formation || !positionId) return null;
+    return formation.positions?.find(p => p.id === positionId)?.name ?? null;
+  }
+
+  let showClockTime = false;
+
   function formatDuration(ms) {
     if (!ms && ms !== 0) return '0:00';
     const totalSecs = Math.floor(ms / 1000);
     const mins = Math.floor(totalSecs / 60);
     const secs = totalSecs % 60;
     return `${mins}:${secs.toString().padStart(2, '0')}`;
+  }
+
+  function formatClockTime(ts) {
+    if (!ts) return '--:--';
+    const d = new Date(ts);
+    const hh = d.getHours().toString().padStart(2, '0');
+    const mm = d.getMinutes().toString().padStart(2, '0');
+    return `${hh}:${mm}`;
   }
 
   function isEditable(ev) {
@@ -140,6 +169,7 @@
     editAssist = ev.assistId || '';
     editPlayer = ev.playerId || '';
     editTimestampStr = timestampToTimeStr(ev.timestamp);
+    editPauseReason = isPauseEvent(ev) ? (parsePauseReason(ev.event) || 'Halftime') : '';
   }
 
   function hasPlayerFields(ev) {
@@ -159,6 +189,8 @@
       patch.assistId = editAssist || null;
     } else if (editingEvent.event === 'Yellow Card' || editingEvent.event === 'Red Card') {
       patch.playerId = editPlayer || null;
+    } else if (isPauseEvent(editingEvent)) {
+      patch.event = `Game Paused – ${editPauseReason}`;
     }
 
     updated[idx] = { ...updated[idx], ...patch };
@@ -174,6 +206,14 @@
   }
 </script>
 
+<div class="timeline-header">
+  <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+  <div class="time-mode-toggle">
+    <button class:active={!showClockTime} on:click={() => showClockTime = false}>Game</button>
+    <button class:active={showClockTime} on:click={() => showClockTime = true}>Clock</button>
+  </div>
+</div>
+
 <div class="timeline">
   {#each enrichedHistory as ev}
     <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
@@ -187,7 +227,7 @@
       class:expanded
       on:click={() => toggleExpand(ev)}
     >
-      <div class="time-marker">{formatDuration(ev.gameTimeMs)}</div>
+      <div class="time-marker">{showClockTime ? formatClockTime(ev.timestamp) : formatDuration(ev.gameTimeMs)}</div>
       <div class="event-content">
         <strong
           class="event-title"
@@ -207,11 +247,13 @@
 
           {#if ev.enters?.length || ev.leaves?.length}
             <div class="sub-details">
-              {#each ev.enters as pid}
-                <span class="sub-enter">↑ {getPlayerName(pid)}</span>
+              {#each ev.enters as sub}
+                {@const posName = getPositionName(sub.positionId)}
+                <span class="sub-enter">↑ {getPlayerName(sub.playerId)}{#if posName}&nbsp;<span class="sub-pos">({posName})</span>{/if}</span>
               {/each}
-              {#each ev.leaves as pid}
-                <span class="sub-leave">↓ {getPlayerName(pid)}</span>
+              {#each ev.leaves as sub}
+                {@const posName = getPositionName(sub.positionId)}
+                <span class="sub-leave">↓ {getPlayerName(sub.playerId)}{#if posName}&nbsp;<span class="sub-pos">({posName})</span>{/if}</span>
               {/each}
             </div>
           {/if}
@@ -245,6 +287,20 @@
           <button class="btn-adjust" on:click={() => adjustTimestamp(60)}>+1:00</button>
         </div>
       </div>
+      {#if isPauseEvent(editingEvent)}
+        <div class="form-group">
+          <label>Pause Reason</label>
+          <div class="pause-reason-list">
+            {#each PAUSE_REASONS as reason}
+              <button
+                class="pause-reason-btn"
+                class:selected={editPauseReason === reason}
+                on:click={() => editPauseReason = reason}
+              >{reason}</button>
+            {/each}
+          </div>
+        </div>
+      {/if}
       {#if hasPlayerFields(editingEvent)}
         {#if editingEvent.event === 'Goal (Us)'}
           <div class="form-group">
@@ -280,6 +336,10 @@
 {/if}
 
 <style>
+  .timeline-header { display: flex; justify-content: flex-end; margin-bottom: 0.5rem; }
+  .time-mode-toggle { display: flex; background: #1e293b; border-radius: 0.4rem; padding: 0.15rem; }
+  .time-mode-toggle button { background: transparent; border: none; color: #64748b; padding: 0.2rem 0.6rem; border-radius: 0.3rem; cursor: pointer; font-size: 0.75rem; font-weight: 600; }
+  .time-mode-toggle button.active { background: #334155; color: #f8fafc; }
   .timeline { display: flex; flex-direction: column; gap: 0.75rem; }
 
   .timeline-item {
@@ -311,6 +371,7 @@
   .sub-details { display: flex; flex-direction: column; gap: 0.15rem; margin-top: 0.1rem; }
   .sub-enter { color: #34d399; font-size: 0.85rem; font-weight: 500; }
   .sub-leave { color: #f87171; font-size: 0.85rem; font-weight: 500; }
+  .sub-pos { font-weight: 400; opacity: 0.75; }
 
   .score-inline { font-family: monospace; font-weight: 700; opacity: 0.85; }
   .edit-btn { display: inline-block; margin-top: 0.35rem; font-size: 0.72rem; font-weight: 600; color: #60a5fa; cursor: pointer; }
@@ -338,6 +399,10 @@
   .time-adjust-btns { display: flex; gap: 0.4rem; }
   .btn-adjust { background: #1e293b; border: 1px solid #334155; color: #cbd5e1; font-size: 0.8rem; padding: 0.3rem 0.6rem; border-radius: 0.4rem; cursor: pointer; font-family: monospace; flex: 1; }
   .btn-adjust:hover { background: #334155; }
+  .pause-reason-list { display: flex; flex-direction: column; gap: 0.4rem; }
+  .pause-reason-btn { background: #1e293b; border: 1px solid #334155; color: #cbd5e1; padding: 0.55rem 0.75rem; border-radius: 0.4rem; cursor: pointer; font-size: 0.9rem; text-align: left; font-weight: 400; }
+  .pause-reason-btn:hover { background: #334155; }
+  .pause-reason-btn.selected { border-color: #3b82f6; background: rgba(59,130,246,0.15); color: #f8fafc; }
   .modal-actions { display: flex; justify-content: flex-end; gap: 1rem; margin-top: 1rem; }
   button { border: none; padding: 0.6rem 1.2rem; border-radius: 0.5rem; cursor: pointer; font-weight: 600; color: white; }
   .btn-primary { background: #2563eb; }

@@ -35,10 +35,25 @@
   let appliedLineupId = null;  // which saved lineup is currently on the field
   let pendingLineupId = null;  // which saved lineup the pending local lineup came from
 
+  // --- Game plan navigation ---
+  let planStepIndex = null; // null = not following plan; number = current step index
+
   // --- Stint tracking (playerId -> gameTimeMs when they entered current status) ---
   let stintStartMs = {};
 
+  // --- Toast ---
+  let toastMessage = '';
+  let toastTimeout = null;
+
+  function showToast(msg) {
+    toastMessage = msg;
+    if (toastTimeout) clearTimeout(toastTimeout);
+    toastTimeout = setTimeout(() => { toastMessage = ''; }, 4000);
+  }
+
   // --- Modals ---
+  let showPauseModal = false;
+  let pauseReason = 'Halftime';
   let showEventModal = false;
   let showGoalsModal = false;
   let showPlayerStatsModal = false;
@@ -59,6 +74,7 @@
     if (!game.playerStats) game.playerStats = {};
     if (!game.gameTimeStats) game.gameTimeStats = { totalMs: 0, sessionStart: null };
     if (!game.score) game.score = { mine: 0, theirs: 0 };
+    if (!game.gamePlan) game.gamePlan = [];
 
     lineup = { ...game.lineup };
     gameLive = game.status === 'live';
@@ -84,7 +100,6 @@
 
     loading = false;
     timerInterval = setInterval(() => { now = Date.now(); }, 1000);
-    console.log(game)
   });
 
   onDestroy(() => { if (timerInterval) clearInterval(timerInterval); });
@@ -200,11 +215,9 @@
   // --- Match Lifecycle ---
   async function toggleLive() {
     if (gameLive) {
-      commitTime();
-      game.gameTimeStats.sessionStart = null;
-      game.status = 'paused';
-      gameLive = false;
-      game.history.push({ event: 'Game Paused', timestamp: Date.now(), gameTimeMs: game.gameTimeStats.totalMs });
+      pauseReason = 'Halftime';
+      showPauseModal = true;
+      return;
     } else {
       // Warn if not all positions are filled
       const emptyPositions = (formation?.positions || []).filter(p => !lineup[p.id]);
@@ -233,6 +246,16 @@
       gameLive = true;
       game.history.push({ event: isResume ? 'Game Resumed' : 'Game Started', timestamp: Date.now(), gameTimeMs: game.gameTimeStats.totalMs });
     }
+    await syncToDb();
+  }
+
+  async function confirmPause() {
+    showPauseModal = false;
+    commitTime();
+    game.gameTimeStats.sessionStart = null;
+    game.status = 'paused';
+    gameLive = false;
+    game.history.push({ event: `Game Paused – ${pauseReason}`, timestamp: Date.now(), gameTimeMs: game.gameTimeStats.totalMs });
     await syncToDb();
   }
 
@@ -272,11 +295,26 @@
     // Map saved positionId -> playerId, filtering to only available players
     const availableIds = new Set(availableRoster.map(p => p.id));
     const newLineup = {};
+    let missingCount = 0;
     for (const [posId, playerId] of Object.entries(saved.players || {})) {
-      newLineup[posId] = availableIds.has(playerId) ? playerId : null;
+      if (availableIds.has(playerId)) {
+        newLineup[posId] = playerId;
+      } else {
+        newLineup[posId] = null;
+        if (playerId) missingCount++;
+      }
     }
     lineup = newLineup;
     pendingLineupId = lineupId;
+    if (missingCount > 0) {
+      showToast(`${missingCount} player${missingCount > 1 ? 's' : ''} from "${saved.name}" ${missingCount > 1 ? 'are' : 'is'} not available — ${missingCount > 1 ? 'their positions were' : 'their position was'} left empty.`);
+    }
+  }
+
+  function loadPlanStep(i) {
+    if (i < 0 || i >= (game?.gamePlan?.length ?? 0)) return;
+    planStepIndex = i;
+    loadSavedLineup(game.gamePlan[i].lineupId);
   }
 
   // --- Sub / Swap Logic ---
@@ -312,7 +350,9 @@
   }
 
   async function applyLineup() {
-    commitTime();
+    const gameStarted = game.status !== 'scheduled';
+
+    if (gameStarted) commitTime();
 
     // Update stint starts for players who changed field/bench status
     const prevFieldIds = new Set(Object.values(game.lineup).filter(Boolean));
@@ -326,7 +366,9 @@
 
     game.lineup = { ...lineup };
     appliedLineupId = pendingLineupId;
-    game.history.push({ event: 'Substitution', timestamp: Date.now(), gameTimeMs: game.gameTimeStats.totalMs, lineupSnapshot: { ...lineup } });
+    if (gameStarted) {
+      game.history.push({ event: 'Substitution', timestamp: Date.now(), gameTimeMs: game.gameTimeStats.totalMs, lineupSnapshot: { ...lineup } });
+    }
     await syncToDb();
   }
 
@@ -458,7 +500,6 @@
           <button class="btn-live {gameLive ? 'stop' : 'start'}" on:click={toggleLive}>
             {gameLive ? 'Pause' : game.status === 'scheduled' ? 'Start' : 'Resume'}
           </button>
-          <button class="btn-primary" on:click={applyLineup} disabled={pendingSubs.length === 0}>Apply Subs</button>
         </div>
         <div class="actions-row">
           <button class="btn-secondary" on:click={() => showEventModal = true}>+ Event</button>
@@ -471,27 +512,30 @@
     </div>
   </header>
 
-  <!-- PENDING SUBS BANNER -->
-  {#if pendingSubs.length > 0}
-    <div class="pending-bar">
-      <span class="pending-label">Pending subs:</span>
-      {#each pendingSubs as sub, i}
-        {#if i > 0}<span class="pending-sep">·</span>{/if}
-        <span class="pending-sub">
-          {#if sub.playerInId && sub.playerOutId}
-            <span class="sub-in">{getPlayerName(sub.playerInId)}</span>
-            <span class="sub-arrow"> ↔ </span>
-            <span class="sub-out">{getPlayerName(sub.playerOutId)}</span>
-            <span class="sub-pos"> ({sub.posName})</span>
-          {:else if sub.playerInId}
-            <span class="sub-in">{getPlayerName(sub.playerInId)}</span>
-            <span class="sub-pos"> → {sub.posName}</span>
-          {:else}
-            <span class="sub-out">{getPlayerName(sub.playerOutId)}</span>
-            <span class="sub-pos"> off ({sub.posName})</span>
-          {/if}
-        </span>
-      {/each}
+  <!-- GAME PLAN NAVIGATOR -->
+  {#if game.gamePlan?.length > 0}
+    <div class="plan-nav">
+      <span class="plan-nav-label">Game Plan</span>
+      <div class="plan-steps">
+        {#each game.gamePlan as step, i}
+          {@const name = savedLineups.find(l => l.id === step.lineupId)?.name ?? '?'}
+          <button
+            class="plan-step-chip"
+            class:active={planStepIndex === i}
+            class:applied={planStepIndex === i && pendingLineupId === step.lineupId}
+            on:click={() => loadPlanStep(i)}
+            title="{name} · {step.durationMins} min"
+          >
+            <span class="chip-num">{i + 1}</span>
+            <span class="chip-name">{name}</span>
+            <span class="chip-dur">{step.durationMins}′</span>
+          </button>
+        {/each}
+      </div>
+      <div class="plan-nav-arrows">
+        <button class="plan-arrow" disabled={planStepIndex === null || planStepIndex <= 0} on:click={() => loadPlanStep((planStepIndex ?? 1) - 1)}>‹</button>
+        <button class="plan-arrow" disabled={planStepIndex !== null && planStepIndex >= game.gamePlan.length - 1} on:click={() => loadPlanStep(planStepIndex === null ? 0 : planStepIndex + 1)}>›</button>
+      </div>
     </div>
   {/if}
 
@@ -500,8 +544,18 @@
 
     <div class="panel pitch-panel">
       <div class="pitch-header">
-        <h2>On Field</h2>
+        <div class="pitch-header-title">
+          <h2>On Field</h2>
+          <div class="view-toggle">
+            <button class:active={!pitchView} on:click={() => pitchView = false}>List</button>
+            <button class:active={pitchView} on:click={() => pitchView = true}>Field</button>
+          </div>
+        </div>
         <div class="pitch-header-actions">
+          {#if !gameEnded}
+            <button class="btn-primary btn-sub-action" on:click={applyLineup} disabled={pendingSubs.length === 0 || game.status === 'scheduled'}>Apply Subs</button>
+            <button class="btn-secondary btn-sub-action" on:click={() => { lineup = { ...game.lineup }; pendingLineupId = appliedLineupId; selectedItem = null; }} disabled={pendingSubs.length === 0}>Clear</button>
+          {/if}
           {#if savedLineups.length > 0}
             <select class="lineup-select" on:change={(e) => { loadSavedLineup(e.target.value); e.target.value = ''; }}>
               <option value="">Load lineup…</option>
@@ -510,10 +564,6 @@
               {/each}
             </select>
           {/if}
-          <div class="view-toggle">
-            <button class:active={!pitchView} on:click={() => pitchView = false}>List</button>
-            <button class:active={pitchView} on:click={() => pitchView = true}>Field</button>
-          </div>
         </div>
       </div>
       {#if lineupLabel}
@@ -567,7 +617,12 @@
                     <span class="player-name sub-name-in">{getPlayerName(pendingSub.playerInId)}</span>
                   {/if}
                   {#if pendingSub.playerOutId}
-                    <span class="player-name sub-name-out">{getPlayerName(pendingSub.playerOutId)}</span>
+                    {@const movingToSub = pendingSubs.find(s => s.playerInId === pendingSub.playerOutId)}
+                    {#if movingToSub}
+                      <span class="player-name sub-name-move">({getPlayerName(pendingSub.playerOutId)} → {movingToSub.posName})</span>
+                    {:else}
+                      <span class="player-name sub-name-bench">{getPlayerName(pendingSub.playerOutId)}</span>
+                    {/if}
                   {/if}
                 {:else}
                   <span class="player-name">{getPlayerName(lineup[pos.id])}</span>
@@ -576,7 +631,9 @@
                   {/if}
                 {/if}
               </div>
-              {#if lineup[pos.id]}
+              {#if pendingSub}
+                <button class="btn-restore" title="Restore current player" on:click|stopPropagation={() => { lineup = { ...lineup, [pos.id]: game.lineup[pos.id] ?? null }; selectedItem = null; pendingLineupId = null; }}>↺</button>
+              {:else if lineup[pos.id]}
                 <button class="btn-remove" on:click|stopPropagation={() => executeSwap('slot', pos.id)}>×</button>
               {/if}
             </div>
@@ -620,6 +677,10 @@
                   {player.onField ? 'Field: ' + getPlayerLiveStats(player.id).active : 'Bench: ' + getPlayerLiveStats(player.id).bench}
                 </span>
               </div>
+              <div class="time-totals">
+                <span class="time-total active-color">F {getPlayerLiveStats(player.id).active}</span>
+                <span class="time-total bench-color">B {getPlayerLiveStats(player.id).bench}</span>
+              </div>
               {#if player.pendingIn}
                 <span class="sub-badge sub-badge-in">↑ IN</span>
               {:else if player.pendingOut}
@@ -657,9 +718,38 @@
       history={game.history}
       roster={availableRoster}
       {gameId}
+      {formation}
       allowEditing={true}
       on:updated={(e) => { game.history = e.detail; }}
     />
+  </div>
+{/if}
+
+<!-- TOAST -->
+{#if toastMessage}
+  <div class="toast">{toastMessage}</div>
+{/if}
+
+<!-- PAUSE MODAL -->
+{#if showPauseModal}
+  <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+  <div class="modal-backdrop" on:click={() => showPauseModal = false}>
+    <div class="modal-panel" on:click|stopPropagation>
+      <h2>Pause Game</h2>
+      <div class="pause-reasons">
+        {#each ['Halftime', 'Injury', 'Water Break', 'End of Reg.', 'Other'] as reason}
+          <button
+            class="pause-reason-btn"
+            class:selected={pauseReason === reason}
+            on:click={() => pauseReason = reason}
+          >{reason}</button>
+        {/each}
+      </div>
+      <div class="modal-actions">
+        <button class="btn-secondary" on:click={() => showPauseModal = false}>Cancel</button>
+        <button class="btn-primary" on:click={confirmPause}>Pause</button>
+      </div>
+    </div>
   </div>
 {/if}
 
@@ -826,20 +916,37 @@
   .btn-reset { background: transparent; border: 1px solid #334155; color: #64748b; font-size: 0.85rem; padding: 0.5rem 0.75rem; }
   .btn-reset:hover { background: #1e293b; color: #94a3b8; }
 
-  /* ─── Pending subs bar ─── */
-  .pending-bar {
-    background: #1e3a5f; border: 1px solid #2563eb; border-radius: 0.6rem;
-    padding: 0.5rem 1rem; margin-bottom: 0.75rem;
-    display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem;
-    font-size: 0.85rem;
+  /* ─── Game plan navigator ─── */
+  .plan-nav {
+    display: flex; align-items: center; gap: 0.5rem;
+    background: #0f172a; border: 1px solid #1e293b; border-radius: 0.6rem;
+    padding: 0.4rem 0.6rem; margin-bottom: 0.6rem; overflow: hidden;
   }
-  .pending-label { color: #93c5fd; font-weight: 700; flex-shrink: 0; }
-  .pending-sep { color: #3b82f6; }
-  .pending-sub { display: inline-flex; align-items: center; gap: 0.15rem; }
-  .sub-in { color: #34d399; font-weight: 600; }
-  .sub-out { color: #f87171; font-weight: 600; }
-  .sub-arrow { color: #94a3b8; }
-  .sub-pos { color: #64748b; font-size: 0.8rem; }
+  .plan-nav-label { font-size: 0.7rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; flex-shrink: 0; }
+  .plan-steps { display: flex; gap: 0.3rem; overflow-x: auto; flex: 1; padding-bottom: 1px; }
+  .plan-steps::-webkit-scrollbar { display: none; }
+  .plan-step-chip {
+    display: flex; align-items: center; gap: 0.3rem;
+    background: #1e293b; border: 1px solid #334155; color: #64748b;
+    padding: 0.2rem 0.5rem; border-radius: 0.4rem; cursor: pointer;
+    font-size: 0.75rem; white-space: nowrap; flex-shrink: 0; transition: all 0.15s;
+  }
+  .plan-step-chip:hover { background: #334155; color: #cbd5e1; }
+  .plan-step-chip.active { background: #1e3a5f; border-color: #3b82f6; color: #93c5fd; }
+  .chip-num { font-weight: 700; color: #475569; font-size: 0.65rem; }
+  .plan-step-chip.active .chip-num { color: #60a5fa; }
+  .chip-name { font-weight: 600; }
+  .chip-dur { color: #475569; font-size: 0.65rem; }
+  .plan-step-chip.active .chip-dur { color: #60a5fa; }
+  .plan-nav-arrows { display: flex; gap: 0.2rem; flex-shrink: 0; }
+  .plan-arrow {
+    background: #1e293b; border: 1px solid #334155; color: #94a3b8;
+    width: 1.6rem; height: 1.6rem; border-radius: 0.3rem; cursor: pointer;
+    font-size: 1rem; display: flex; align-items: center; justify-content: center; padding: 0;
+    transition: all 0.15s;
+  }
+  .plan-arrow:not(:disabled):hover { background: #334155; color: #f8fafc; }
+  .plan-arrow:disabled { opacity: 0.3; cursor: not-allowed; }
 
   /* ─── Layout ─── */
   .layout-grid {
@@ -858,10 +965,12 @@
   /* ─── Pitch panel ─── */
   .pitch-header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #334155; padding-bottom: 0.5rem; margin-bottom: 0.75rem; gap: 0.5rem; flex-wrap: wrap; }
   .lineup-label { font-size: 0.72rem; color: #64748b; margin-bottom: 0.5rem; font-style: italic; }
+  .pitch-header-title { display: flex; align-items: center; gap: 0.5rem; flex: 1; }
   .pitch-header h2 { margin: 0; border: none; padding: 0; }
-  .pitch-header-actions { display: flex; align-items: center; gap: 0.5rem; }
-  .lineup-select { background: #0f172a; border: 1px solid #334155; color: #cbd5e1; padding: 0.25rem 0.5rem; border-radius: 0.35rem; font-size: 0.78rem; cursor: pointer; outline: none; max-width: 130px; }
-  .view-toggle { display: flex; background: #0f172a; border-radius: 0.4rem; padding: 0.15rem; }
+  .pitch-header-actions { display: flex; align-items: center; gap: 0.5rem; margin-left: auto; }
+  .lineup-select { background: #0f172a; border: 1px solid #334155; color: #cbd5e1; padding: 0.5rem 0.5rem; border-radius: 0.35rem; font-size: 0.78rem; cursor: pointer; outline: none; max-width: 130px; }
+  .btn-sub-action { padding: 0.5rem 0.6rem; font-size: 0.78rem; border-radius: 0.35rem; }
+  .view-toggle { display: flex; background: #0f172a; border-radius: 0.4rem; padding: 0.15rem; margin-left: auto; }
   .view-toggle button { background: transparent; border: none; color: #64748b; padding: 0.25rem 0.6rem; border-radius: 0.3rem; cursor: pointer; font-size: 0.75rem; font-weight: 600; }
   .view-toggle button.active { background: #334155; color: #f8fafc; }
 
@@ -886,7 +995,8 @@
   .slot-card.selected, .bench-card.selected { border-color: #3b82f6; background: rgba(59,130,246,0.15); box-shadow: 0 0 10px rgba(59,130,246,0.3); }
   .slot-card.has-pending { border-color: #f59e0b; background: rgba(245,158,11,0.08); }
   .sub-name-in { color: #34d399; }
-  .sub-name-out { color: #f87171; text-decoration: line-through; opacity: 0.7; }
+  .sub-name-move { color: #fb923c; font-size: 0.8rem; }
+  .sub-name-bench { color: #f87171; font-size: 0.8rem; text-decoration: line-through; }
 
   .pos-badge { background: #334155; padding: 0.1rem 0.4rem; border-radius: 0.25rem; font-weight: bold; font-size: 0.75rem; min-width: 40px; text-align: center; color: #94a3b8; }
 
@@ -897,6 +1007,7 @@
   .bench-color { color: #94a3b8; }
 
   .btn-remove { background: #7f1d1d; color: white; width: 22px; height: 22px; border-radius: 50%; padding: 0; font-size: 0.8rem; flex-shrink: 0; }
+  .btn-restore { background: #92400e; color: #fcd34d; width: 22px; height: 22px; border-radius: 50%; padding: 0; font-size: 0.9rem; flex-shrink: 0; line-height: 1; }
 
   /* ─── Bench / Players panel ─── */
   .bench-header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #334155; padding-bottom: 0.5rem; margin-bottom: 0.75rem; gap: 0.5rem; flex-wrap: wrap; }
@@ -924,6 +1035,21 @@
     line-height: 1; transition: background 0.15s, color 0.15s;
   }
   .btn-player-info:hover { background: #60a5fa; color: #0f172a; }
+
+  .time-totals { display: flex; flex-direction: column; align-items: flex-end; gap: 0.1rem; flex-shrink: 0; margin-right: 0.25rem; }
+  .time-total { font-size: 0.68rem; font-weight: 600; font-variant-numeric: tabular-nums; }
+
+  /* ─── Toast ─── */
+  .toast {
+    position: fixed; bottom: 1.5rem; left: 50%; transform: translateX(-50%);
+    background: #1e3a5f; border: 1px solid #3b82f6; color: #bfdbfe;
+    padding: 0.75rem 1.25rem; border-radius: 0.6rem;
+    font-size: 0.88rem; font-weight: 500; z-index: 200;
+    max-width: 90vw; text-align: center;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.5);
+    animation: toast-in 0.2s ease;
+  }
+  @keyframes toast-in { from { opacity: 0; transform: translateX(-50%) translateY(8px); } to { opacity: 1; transform: translateX(-50%) translateY(0); } }
 
   /* ─── Field view ─── */
   .field-wrap { flex: 1; display: flex; justify-content: center; padding: 0.5rem 0; overflow: auto; max-height: 450px; }
@@ -966,6 +1092,10 @@
   }
 
   /* ─── Modals ─── */
+  .pause-reasons { display: flex; flex-direction: column; gap: 0.5rem; margin-bottom: 1.5rem; }
+  .pause-reason-btn { background: #1e293b; border: 1px solid #334155; color: #cbd5e1; padding: 0.65rem 1rem; border-radius: 0.5rem; cursor: pointer; font-size: 0.95rem; text-align: left; }
+  .pause-reason-btn:hover { background: #334155; }
+  .pause-reason-btn.selected { border-color: #3b82f6; background: rgba(59,130,246,0.15); color: #f8fafc; }
   .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.8); display: flex; justify-content: center; align-items: center; z-index: 100; }
   .modal-panel { background: #111827; padding: 2rem; border-radius: 1rem; border: 1px solid #334155; width: 100%; max-width: 400px; max-height: 90vh; overflow-y: auto; }
   .form-group { display: flex; flex-direction: column; gap: 0.5rem; margin-bottom: 1rem; }

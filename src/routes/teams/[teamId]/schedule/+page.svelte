@@ -129,6 +129,14 @@
     const d = new Date(dateString);
     return d.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
   }
+
+  $: record = games.reduce((acc, g) => {
+    if (g.status !== 'completed' || g.score == null) return acc;
+    if (g.score.mine > g.score.theirs) acc.w++;
+    else if (g.score.mine < g.score.theirs) acc.l++;
+    else acc.d++;
+    return acc;
+  }, { w: 0, l: 0, d: 0 });
 </script>
 
 <svelte:head>
@@ -143,7 +151,12 @@
     <header class="page-header">
       <div class="title-group">
         <a href="/teams/{teamId}" class="back-link">← Back to Team Hub</a>
-        <h1>{team?.name} Schedule</h1>
+        <div class="title-row">
+          <h1>{team?.name} Schedule</h1>
+          {#if record.w + record.l + record.d > 0}
+            <span class="record"><span class="record-w">{record.w}W</span> – <span class="record-l">{record.l}L</span> – <span class="record-d">{record.d}D</span></span>
+          {/if}
+        </div>
       </div>
       <div class="header-actions">
         <select class="filter-select" bind:value={filter}>
@@ -165,7 +178,7 @@
             </div>
             <div class="details">
               <a href="/games/{game.id}" class="game-link">
-                <h3>vs. {game.opponent || 'TBD'}</h3>
+                <h3>vs. {game.opponent || 'TBD'}{#if game.status === 'completed' && game.score != null} <span class="final-score" class:win={game.score.mine > game.score.theirs} class:loss={game.score.mine < game.score.theirs} class:draw={game.score.mine === game.score.theirs}>{game.score.mine}–{game.score.theirs}</span>{/if}</h3>
               </a>
               <p class="muted">
                 {#if game.homeAway && game.homeAway !== 'n/a'}<span class="ha-badge ha-{game.homeAway}">{HA_LABELS[game.homeAway] ?? game.homeAway}</span>{/if}
@@ -303,7 +316,12 @@
   }
   .back-link:hover { text-decoration: underline; }
 
+  .title-row { display: flex; align-items: baseline; gap: 0.75rem; flex-wrap: wrap; }
   h1 { margin: 0; font-size: 2rem; color: #f8fafc; }
+  .record { font-size: 1rem; font-weight: 600; color: #94a3b8; white-space: nowrap; }
+  .record-w { color: #34d399; }
+  .record-d { color: #fbbf24; }
+  .record-l { color: #f87171; }
 
   /* Games List */
   .games-list {
@@ -357,6 +375,10 @@
   .details h3 { margin: 0 0 0.25rem 0; font-size: 1.25rem; color: #e2e8f0; }
   .game-link { text-decoration: none; color: inherit; display: block; width: fit-content; }
   .game-link:hover h3 { color: #3b82f6; }
+  .final-score { font-size: 1rem; font-weight: 700; font-family: monospace; padding: 0.1rem 0.4rem; border-radius: 0.3rem; vertical-align: middle; margin-left: 0.5rem; }
+  .final-score.win { background: rgba(16,185,129,0.15); color: #34d399; }
+  .final-score.loss { background: rgba(239,68,68,0.15); color: #f87171; }
+  .final-score.draw { background: rgba(245,158,11,0.15); color: #fbbf24; }
   .details .muted { margin: 0; color: #94a3b8; font-size: 0.95rem; }
   .availability-status {
     margin: 0.5rem 0 0 0;

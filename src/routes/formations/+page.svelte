@@ -1,6 +1,6 @@
 <script>
   import { onMount } from 'svelte';
-  import { collection, query, where, getDocs, addDoc, doc, deleteDoc } from 'firebase/firestore';
+  import { collection, query, where, getDocs, addDoc, doc, deleteDoc, writeBatch } from 'firebase/firestore';
   import { db } from '$lib/firebase/config';
   import { authStore } from '$lib/stores/authStore';
   import { goto } from '$app/navigation';
@@ -22,7 +22,8 @@
       const querySnapshot = await getDocs(q);
       formations = querySnapshot.docs
         .map(doc => ({ id: doc.id, ...doc.data() }))
-        .filter(f => f.name); // Filter out any corrupt/unnamed formations
+        .filter(f => f.name)
+        .sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0) || a.name.localeCompare(b.name));
     } catch (e) {
       console.error("Error loading formations:", e);
     } finally {
@@ -57,6 +58,19 @@
     }
   }
 
+  async function moveFormation(index, dir) {
+    const newIndex = index + dir;
+    if (newIndex < 0 || newIndex >= formations.length) return;
+    const updated = [...formations];
+    [updated[index], updated[newIndex]] = [updated[newIndex], updated[index]];
+    formations = updated;
+    const batch = writeBatch(db);
+    formations.forEach((f, i) => {
+      batch.update(doc(db, 'formations', f.id), { sortOrder: i });
+    });
+    await batch.commit();
+  }
+
   async function deleteFormation(formId, formName) {
     if (!confirm(`Are you sure you want to delete the formation "${formName}"?`)) return;
     try {
@@ -82,9 +96,13 @@
     <p class="muted">Loading formations...</p>
   {:else}
     <div class="grid-layout">
-      {#each formations as form}
+      {#each formations as form, i}
         <div class="formation-card">
           <button class="btn-delete-card" on:click={() => deleteFormation(form.id, form.name)}>✕</button>
+          <div class="reorder-btns">
+            <button class="btn-reorder" disabled={i === 0} on:click={() => moveFormation(i, -1)} title="Move up">▲</button>
+            <button class="btn-reorder" disabled={i === formations.length - 1} on:click={() => moveFormation(i, 1)} title="Move down">▼</button>
+          </div>
           <a href="/formations/{form.id}" class="formation-link">
             <h3>{form.name}</h3>
           </a>
@@ -125,6 +143,18 @@
     color: #ef4444; font-size: 1.25rem; cursor: pointer; opacity: 0.5; transition: opacity 0.2s;
   }
   .btn-delete-card:hover { opacity: 1; }
+
+  .reorder-btns {
+    position: absolute; top: 0.5rem; left: 0.5rem;
+    display: flex; flex-direction: column; gap: 0.1rem;
+  }
+  .btn-reorder {
+    background: transparent; border: none; color: #64748b;
+    font-size: 0.6rem; padding: 0.1rem 0.3rem; cursor: pointer;
+    line-height: 1; border-radius: 0.2rem; transition: color 0.15s;
+  }
+  .btn-reorder:hover:not(:disabled) { color: #cbd5e1; }
+  .btn-reorder:disabled { opacity: 0.2; cursor: default; }
 
   .formation-link { text-decoration: none; color: inherit; display: block; width: fit-content; }
   .formation-link:hover h3 { color: #3b82f6; }

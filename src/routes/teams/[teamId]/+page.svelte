@@ -10,6 +10,7 @@
 
   let team = { name: '', roster: [] };
   let lineups = [];
+  let formations = [];
   let loading = true;
   let saveStatus = '';
 
@@ -28,7 +29,7 @@
 
   onMount(async () => {
     if ($authStore.user) {
-      await Promise.all([loadTeam(), loadLineups()]);
+      await Promise.all([loadTeam(), loadLineups(), loadFormations()]);
     }
   });
 
@@ -46,6 +47,16 @@
       console.error("Error loading team:", error);
     } finally {
       loading = false;
+    }
+  }
+
+  async function loadFormations() {
+    try {
+      const q = query(collection(db, 'formations'), where('ownerId', '==', $authStore.user.uid));
+      const snap = await getDocs(q);
+      formations = snap.docs.map(d => ({ id: d.id, ...d.data() })).filter(f => f.name).sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0) || a.name.localeCompare(b.name));
+    } catch (error) {
+      console.error("Error loading formations:", error);
     }
   }
 
@@ -150,6 +161,20 @@
       </div>
       <div class="header-actions">
         <span class="save-status">{saveStatus}</span>
+        <div class="default-formation-group">
+          <label class="default-formation-label" for="default-formation">Default Formation</label>
+          <select
+            id="default-formation"
+            class="default-formation-select"
+            value={team.defaultFormationId || ''}
+            on:change={(e) => { team.defaultFormationId = e.target.value || null; saveTeamToDb(team); }}
+          >
+            <option value="">-- None --</option>
+            {#each formations as form}
+              <option value={form.id}>{form.name}</option>
+            {/each}
+          </select>
+        </div>
         <a href="/teams/{teamId}/schedule" class="btn-primary">View Schedule</a>
       </div>
     </header>
@@ -321,7 +346,33 @@
     display: flex;
     align-items: center;
     gap: 1rem;
+    flex-wrap: wrap;
   }
+
+  .default-formation-group {
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+  }
+
+  .default-formation-label {
+    color: #94a3b8;
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+
+  .default-formation-select {
+    background: #1e293b;
+    border: 1px solid #334155;
+    color: #f8fafc;
+    padding: 0.5rem 0.75rem;
+    border-radius: 0.5rem;
+    font-size: 0.9rem;
+    cursor: pointer;
+    outline: none;
+  }
+  .default-formation-select:focus { border-color: #3b82f6; }
 
   .save-status {
     color: #10b981;

@@ -29,7 +29,8 @@
       const querySnapshot = await getDocs(q);
       formations = querySnapshot.docs
         .map(doc => ({ id: doc.id, ...doc.data() }))
-        .filter(f => f.name); // Ensure only formations with names are shown
+        .filter(f => f.name)
+        .sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0) || a.name.localeCompare(b.name));
       
       if (formations.length > 0) {
         selectedFormationId = formations[0].id;
