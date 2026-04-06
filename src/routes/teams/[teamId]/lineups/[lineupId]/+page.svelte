@@ -20,6 +20,7 @@
   let selectedItem = null; // { type: 'slot'|'bench', id: string }
   let pitchView = false;
   let showCompareModal = false;
+  let selectedComparePos = null; // posId being edited in compare modal
   let otherLineups = []; // all saved lineups for this team except the current one
   let selectedLineupIds = new Set();
 
@@ -156,6 +157,11 @@
     selectedLineupIds = selectedLineupIds; // trigger reactivity
   }
 
+  // All lineups in compare order: current first, then selected others
+  $: compareLineups = lineup
+    ? [{ id: lineupId, name: lineup.name, players: lineup.players }, ...selectedOtherLineups]
+    : [];
+
 </script>
 
 <svelte:head>
@@ -288,14 +294,14 @@
 <!-- COMPARE PLAYERS MODAL -->
 {#if showCompareModal}
   <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
-  <div class="modal-backdrop" on:click={() => showCompareModal = false}>
+  <div class="modal-backdrop" on:click={() => { showCompareModal = false; selectedComparePos = null; }}>
     <div class="compare-modal" on:click|stopPropagation>
       <div class="compare-modal-header">
         <div>
-          <h2>Player Lineup Appearances</h2>
-          <p class="compare-subtitle">Sorted by fewest appearances · {totalLineupCount} lineup{totalLineupCount !== 1 ? 's' : ''} selected</p>
+          <h2>Lineup Comparison</h2>
+          <p class="compare-subtitle">{totalLineupCount} lineup{totalLineupCount !== 1 ? 's' : ''} selected</p>
         </div>
-        <button class="btn-close" on:click={() => showCompareModal = false}>✕</button>
+        <button class="btn-close" on:click={() => { showCompareModal = false; selectedComparePos = null; }}">✕</button>
       </div>
 
       {#if otherLineups.length > 0}
@@ -320,42 +326,115 @@
         </div>
       {/if}
 
-      <div class="compare-list">
-        {#each playerAppearances as player}
-          <div class="compare-row" class:in-current={player.inCurrent}>
-            <div class="compare-player-info">
-              <span class="compare-num">#{player.number}</span>
-              <span class="compare-name">{player.name}</span>
-              {#if player.inCurrent}
-                <span class="current-tag">this lineup</span>
-              {/if}
-            </div>
-            <div class="compare-right">
-              <div class="compare-bar-wrap">
-                <div class="compare-bar-track">
-                  <div
-                    class="compare-bar-fill"
-                    class:full={player.count === totalLineupCount}
-                    style="width: {totalLineupCount > 0 ? (player.count / totalLineupCount) * 100 : 0}%"
-                  ></div>
-                </div>
-                <span class="compare-fraction">{player.count}/{totalLineupCount}</span>
-              </div>
-              {#if player.appearsIn.length > 0}
-                <div class="compare-lineup-names">
-                  {player.appearsIn.map(l => l.name).join(' · ')}
-                  {#if player.inCurrent} · {lineup.name}{/if}
-                </div>
-              {:else if player.inCurrent}
-                <div class="compare-lineup-names">{lineup.name}</div>
-              {/if}
-            </div>
-          </div>
-        {/each}
+      <div class="compare-body">
 
-        {#if playerAppearances.length === 0}
-          <p class="compare-empty">No players in roster.</p>
+        <!-- Position comparison table -->
+        {#if compareLineups.length > 1}
+          <div class="compare-section-heading">Position Comparison</div>
+          <div class="pos-table-wrap">
+            <table class="pos-table">
+              <thead>
+                <tr>
+                  <th class="pos-th">Position</th>
+                  {#each compareLineups as l}
+                    <th class="lineup-th" class:current-th={l.id === lineupId}>{l.name}</th>
+                  {/each}
+                </tr>
+              </thead>
+              <tbody>
+                {#each formation.positions as pos}
+                  {@const color = getGroupColor(pos.group)}
+                  {@const currentPlayerId = lineup.players?.[pos.id] ?? null}
+                  <tr>
+                    <td class="pos-name-cell">
+                      <span class="pos-badge-sm" style="background:{color.bg};color:{color.text};">{pos.name}</span>
+                    </td>
+                    {#each compareLineups as l}
+                      {@const pid = l.players?.[pos.id] ?? null}
+                      {@const name = getPlayerName(pid)}
+                      {#if l.id === lineupId}
+                        <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+                        <td
+                          class="player-cell current-col"
+                          class:pos-selected={selectedComparePos === pos.id}
+                          on:click={() => selectedComparePos = selectedComparePos === pos.id ? null : pos.id}
+                        >{name ?? '—'}</td>
+                      {:else}
+                        <td
+                          class="player-cell"
+                          class:cell-match={pid && pid === currentPlayerId}
+                          class:cell-empty={!pid}
+                        >{name ?? '—'}</td>
+                      {/if}
+                    {/each}
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
+          </div>
         {/if}
+
+        <!-- Player appearances -->
+        <div class="compare-section-heading">
+          {#if selectedComparePos}
+            {@const selPos = formation.positions.find(p => p.id === selectedComparePos)}
+            {@const color = getGroupColor(selPos?.group)}
+            <span>Assign to <span class="pos-badge-sm" style="background:{color.bg};color:{color.text};">{selPos?.name}</span> — pick a player below</span>
+            <button class="btn-cancel-assign" on:click={() => selectedComparePos = null}>cancel</button>
+          {:else}
+            Player Lineup Appearances <span class="heading-hint">(click a position above to reassign)</span>
+          {/if}
+        </div>
+        <div class="compare-list">
+          {#each playerAppearances as player}
+            <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+            <div
+              class="compare-row"
+              class:in-current={player.inCurrent}
+              class:assignable={selectedComparePos !== null}
+              on:click={() => {
+                if (selectedComparePos) {
+                  lineup.players = { ...lineup.players, [selectedComparePos]: player.id };
+                  markChanged();
+                  selectedComparePos = null;
+                }
+              }}
+            >
+              <div class="compare-player-info">
+                <span class="compare-num">#{player.number}</span>
+                <span class="compare-name">{player.name}</span>
+                {#if player.inCurrent}
+                  <span class="current-tag">this lineup</span>
+                {/if}
+              </div>
+              <div class="compare-right">
+                <div class="compare-bar-wrap">
+                  <div class="compare-bar-track">
+                    <div
+                      class="compare-bar-fill"
+                      class:full={player.count === totalLineupCount}
+                      style="width: {totalLineupCount > 0 ? (player.count / totalLineupCount) * 100 : 0}%"
+                    ></div>
+                  </div>
+                  <span class="compare-fraction">{player.count}/{totalLineupCount}</span>
+                </div>
+                {#if player.appearsIn.length > 0}
+                  <div class="compare-lineup-names">
+                    {player.appearsIn.map(l => l.name).join(' · ')}
+                    {#if player.inCurrent} · {lineup.name}{/if}
+                  </div>
+                {:else if player.inCurrent}
+                  <div class="compare-lineup-names">{lineup.name}</div>
+                {/if}
+              </div>
+            </div>
+          {/each}
+
+          {#if playerAppearances.length === 0}
+            <p class="compare-empty">No players in roster.</p>
+          {/if}
+        </div>
+
       </div>
     </div>
   </div>
@@ -541,9 +620,6 @@
   .btn-close { background: transparent; border: none; color: #64748b; font-size: 1.1rem; cursor: pointer; padding: 0.25rem; line-height: 1; flex-shrink: 0; }
   .btn-close:hover { color: #f8fafc; }
 
-  .compare-list { overflow-y: auto; padding: 0.75rem 1.5rem 1.5rem; display: flex; flex-direction: column; gap: 0.5rem; }
-  .compare-list::-webkit-scrollbar { width: 4px; }
-  .compare-list::-webkit-scrollbar-thumb { background: #334155; border-radius: 2px; }
 
   .compare-row { background: #0f172a; border: 1px solid #1e293b; border-radius: 0.6rem; padding: 0.65rem 0.85rem; display: flex; flex-direction: column; gap: 0.35rem; transition: border-color 0.15s; }
   .compare-row.in-current { border-color: #2563eb; background: rgba(37, 99, 235, 0.06); }
@@ -563,4 +639,34 @@
   .compare-lineup-names { font-size: 0.75rem; color: #475569; padding-left: 0.1rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
   .compare-empty { color: #475569; text-align: center; padding: 2rem; margin: 0; }
+
+  /* Compare body + section headings */
+  .compare-body { overflow-y: auto; flex: 1; }
+  .compare-body::-webkit-scrollbar { width: 4px; }
+  .compare-body::-webkit-scrollbar-thumb { background: #334155; border-radius: 2px; }
+  .compare-section-heading { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.08em; color: #475569; font-weight: 700; padding: 0.75rem 1.5rem 0.35rem; }
+
+  /* Position comparison table */
+  .pos-table-wrap { overflow-x: auto; padding: 0 1.5rem 1rem; }
+  .pos-table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+  .pos-th { text-align: left; padding: 0.35rem 0.5rem; color: #64748b; font-size: 0.7rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; white-space: nowrap; border-bottom: 1px solid #1e293b; }
+  .lineup-th { text-align: left; padding: 0.35rem 0.5rem; color: #94a3b8; font-size: 0.75rem; font-weight: 600; white-space: nowrap; border-bottom: 1px solid #1e293b; min-width: 90px; }
+  .current-th { color: #93c5fd; }
+  .pos-name-cell { padding: 0.3rem 0.5rem; white-space: nowrap; }
+  .pos-badge-sm { font-size: 0.72rem; font-weight: 700; padding: 0.12rem 0.45rem; border-radius: 0.3rem; }
+  .player-cell { padding: 0.3rem 0.5rem; color: #94a3b8; font-size: 0.82rem; white-space: nowrap; }
+  .player-cell.current-col { color: #f8fafc; font-weight: 600; cursor: pointer; }
+  .player-cell.current-col:hover { background: rgba(255,255,255,0.05); }
+  .player-cell.pos-selected { background: rgba(59,130,246,0.2) !important; color: #93c5fd !important; outline: 1px solid #3b82f6; }
+  .compare-row.assignable { cursor: pointer; }
+  .compare-row.assignable:hover { background: #1e293b; border-color: #3b82f6; }
+  .compare-section-heading { display: flex; align-items: center; gap: 0.5rem; }
+  .heading-hint { color: #334155; font-size: 0.65rem; font-weight: 400; text-transform: none; letter-spacing: 0; }
+  .btn-cancel-assign { background: transparent; border: 1px solid #475569; color: #94a3b8; font-size: 0.65rem; padding: 0.1rem 0.4rem; border-radius: 0.25rem; cursor: pointer; margin-left: auto; }
+  .player-cell.cell-match { background: rgba(16, 185, 129, 0.1); color: #34d399; font-weight: 600; }
+  .player-cell.cell-empty { color: #334155; }
+  .pos-table tbody tr:hover td { background: rgba(255,255,255,0.02); }
+
+  /* Adjust compare-list to not scroll independently (compare-body handles scrolling) */
+  .compare-list { padding: 0.5rem 1.5rem 1.5rem; display: flex; flex-direction: column; gap: 0.5rem; }
 </style>

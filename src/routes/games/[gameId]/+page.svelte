@@ -258,7 +258,7 @@
         <a href="/teams/{game.teamId}/schedule" class="back-link">← Back to Schedule</a>
         <h1>Game vs. {game.opponent || 'TBD'}</h1>
         <p class="muted">
-          {new Date(game.date).toLocaleString()} • {game.location || 'Location TBD'}
+          {new Date(game.date).toLocaleString(undefined, {dateStyle: 'long', timeStyle: 'short'})} • {game.location || 'Location TBD'}
           {#if game.homeAway && game.homeAway !== 'n/a'}
             <span class="ha-badge ha-{game.homeAway}">{HA_LABELS[game.homeAway]}</span>
           {/if}
