@@ -12,6 +12,7 @@
   let team = null;
   let games = [];
   let loading = true;
+  let filter = 'future'; // 'past', 'future', 'all'
 
   // Modal State
   let showModal = false;
@@ -114,6 +115,15 @@
 
   const HA_LABELS = { home: '🏠 Home', away: '✈️ Away', neutral: '⚖️ Neutral', 'n/a': 'N/A' };
 
+  $: filteredGames = games.filter(game => {
+    if (filter === 'all') return true;
+    const gameDate = new Date(game.date);
+    const now = new Date();
+    if (filter === 'past') return gameDate < now;
+    if (filter === 'future') return gameDate >= now;
+    return true;
+  });
+
   function formatDate(dateString) {
     if (!dateString) return 'TBD';
     const d = new Date(dateString);
@@ -135,11 +145,18 @@
         <a href="/teams/{teamId}" class="back-link">← Back to Team Hub</a>
         <h1>{team?.name} Schedule</h1>
       </div>
-      <button class="btn-primary" on:click={openCreateModal}>+ Add Game</button>
+      <div class="header-actions">
+        <select class="filter-select" bind:value={filter}>
+          <option value="future">Upcoming</option>
+          <option value="past">Past</option>
+          <option value="all">All Events</option>
+        </select>
+        <button class="btn-primary" on:click={openCreateModal}>+ Add Game</button>
+      </div>
     </header>
 
     <div class="games-list">
-      {#each games as game}
+      {#each filteredGames as game}
         <div class="game-card">
           <div class="game-info">
             <div class="date-badge">
@@ -169,9 +186,13 @@
         </div>
       {/each}
 
-      {#if games.length === 0}
+      {#if filteredGames.length === 0}
         <div class="empty-state">
-          No games scheduled yet. Click "+ Add Game" to start your season.
+          {#if games.length === 0}
+            No games scheduled yet. Click "+ Add Game" to start your season.
+          {:else}
+            No games found for the selected filter.
+          {/if}
         </div>
       {/if}
     </div>
@@ -254,6 +275,24 @@
     padding-bottom: 1rem;
     margin-bottom: 2rem;
   }
+
+  .header-actions {
+    display: flex;
+    gap: 0.75rem;
+    align-items: center;
+  }
+
+  .filter-select {
+    background: #0f172a;
+    border: 1px solid #334155;
+    color: #f8fafc;
+    padding: 0.75rem;
+    border-radius: 0.5rem;
+    font-weight: 600;
+    cursor: pointer;
+    outline: none;
+  }
+  .filter-select:focus { border-color: #3b82f6; }
 
   .back-link {
     color: #3b82f6;

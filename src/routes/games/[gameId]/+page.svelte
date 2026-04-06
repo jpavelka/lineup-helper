@@ -4,6 +4,9 @@
   import { doc, getDoc, updateDoc, collection, getDocs, query, where } from 'firebase/firestore';
   import { db } from '$lib/firebase/config';
   import { authStore } from '$lib/stores/authStore';
+  import MatchTimeline from '$lib/components/MatchTimeline.svelte';
+  import PlayerStatsModal from '$lib/components/PlayerStatsModal.svelte';
+  import { computePositionStats, computePlayerTimelines } from '$lib/utils.js';
 
   const gameId = $page.params.gameId;
   
@@ -15,6 +18,9 @@
   let editingAvailability = false;
   let showEditModal = false;
   let editingGame = null;
+  let showPlayerStatsModal = false;
+  let statsModalPlayer = null;
+  let savedLineups = [];
 
   const HA_LABELS = { home: '🏠 Home', away: '✈️ Away', neutral: '⚖️ Neutral', 'n/a': 'N/A' };
 
@@ -39,6 +45,7 @@
       if (!game.score) game.score = { mine: 0, theirs: 0 };
       if (!game.gameTimeStats) game.gameTimeStats = { totalMs: 0 };
       if (!game.availablePlayers) game.availablePlayers = [];
+      if (!game.gamePlan) game.gamePlan = [];
 
       const teamSnap = await getDoc(doc(db, 'teams', game.teamId));
       if (teamSnap.exists()) team = { id: teamSnap.id, ...teamSnap.data() };
@@ -52,6 +59,9 @@
       formations = formSnap.docs
         .map(d => ({ id: d.id, ...d.data() }))
         .filter(f => f.name); // Only include formations that have a name
+
+      const lineupsSnap = await getDocs(query(collection(db, 'lineups'), where('teamId', '==', game.teamId)));
+      savedLineups = lineupsSnap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => a.name.localeCompare(b.name));
 
     } catch (error) {
       console.error(error);
@@ -109,6 +119,36 @@
     }
   }
 
+  // --- Game Plan ---
+  async function saveGamePlan() {
+    try {
+      await updateDoc(doc(db, 'games', gameId), { gamePlan: game.gamePlan });
+    } catch (err) {
+      console.error('Error saving game plan:', err);
+    }
+  }
+
+  function addPlanStep() {
+    game.gamePlan = [...game.gamePlan, { lineupId: savedLineups[0]?.id ?? null, durationMins: 20 }];
+    saveGamePlan();
+  }
+
+  function removePlanStep(i) {
+    game.gamePlan = game.gamePlan.filter((_, idx) => idx !== i);
+    saveGamePlan();
+  }
+
+  function movePlanStep(i, dir) {
+    const arr = [...game.gamePlan];
+    const j = i + dir;
+    if (j < 0 || j >= arr.length) return;
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+    game.gamePlan = arr;
+    saveGamePlan();
+  }
+
+  $: totalPlanMins = (game?.gamePlan || []).reduce((sum, s) => sum + (Number(s.durationMins) || 0), 0);
+
   // --- Helpers ---
   function getPlayerName(playerId) {
     if (!playerId) return '';
@@ -124,19 +164,29 @@
     return `${mins}:${secs.toString().padStart(2, '0')}`;
   }
 
-  // Sort history chronologically
+  // Sort history chronologically (used by CSV export)
   $: sortedHistory = [...(game?.history || [])].sort((a, b) => a.timestamp - b.timestamp);
 
+  $: gameFormation = formations.find(f => f.id === game?.formationId) ?? null;
+  $: availableRoster = (team?.roster || []).filter(p => game?.availablePlayers?.includes(p.id));
+  $: positionStats = computePositionStats(game?.history || [], gameFormation);
+  $: playerTimelines = computePlayerTimelines(game?.history || [], gameFormation, availableRoster);
+
   // Generate Player Stats Array
+  $: goalScoredEvents = (game?.history || []).filter(e => e.event === 'Goal (Us)');
   $: boxScore = (team?.roster || [])
     .filter(p => game?.availablePlayers?.includes(p.id))
     .map(p => {
       const stats = game.playerStats[p.id] || { activeMs: 0, benchMs: 0 };
+      const goals = goalScoredEvents.filter(e => e.playerId === p.id).length;
+      const assists = goalScoredEvents.filter(e => e.assistId === p.id).length;
       return {
         ...p,
         activeMs: stats.activeMs,
         benchMs: stats.benchMs,
-        totalMs: stats.activeMs + stats.benchMs
+        totalMs: stats.activeMs + stats.benchMs,
+        goals,
+        assists
       };
     })
     .sort((a, b) => b.activeMs - a.activeMs); // Sort by most minutes played
@@ -221,8 +271,8 @@
       <div class="header-actions">
         <button class="btn-secondary" on:click={openEditModal}>✎ Edit Details</button>
         <button class="btn-secondary" on:click={exportCSV}>⬇ Export CSV</button>
-        <a href="/games/{gameId}/live" class="btn-live">
-          <span class="pulse-dot"></span> Live Match Tracker
+        <a href="/games/{gameId}/live" class="btn-live" class:btn-live-inactive={game.status !== 'live'}>
+          <span class="pulse-dot" class:no-pulse={game.status !== 'live'}></span> Live Match Tracker
         </a>
       </div>
     </header>
@@ -257,16 +307,61 @@
       </div>
     </div>
 
+    <!-- Game Plan -->
+    <div class="panel game-plan-panel">
+      <div class="panel-title-row">
+        <h2>Game Plan</h2>
+        {#if game.status !== 'completed' && savedLineups.length > 0}
+          <button class="btn-toggle" on:click={addPlanStep}>+ Add Step</button>
+        {/if}
+      </div>
+
+      {#if savedLineups.length === 0}
+        <p class="text-muted small">No saved lineups for this team yet.</p>
+      {:else if !game.gamePlan?.length}
+        <p class="text-muted small">No game plan yet. Add steps to schedule your lineup rotations.</p>
+      {:else}
+        <div class="plan-list">
+          {#each game.gamePlan as step, i}
+            {@const lineupName = savedLineups.find(l => l.id === step.lineupId)?.name ?? 'Unknown Lineup'}
+            <div class="plan-step">
+              <span class="step-num">{i + 1}</span>
+              {#if game.status !== 'completed'}
+                <select class="plan-select" bind:value={step.lineupId} on:change={saveGamePlan}>
+                  {#each savedLineups as l}
+                    <option value={l.id}>{l.name}</option>
+                  {/each}
+                </select>
+                <input class="plan-duration" type="number" min="1" max="120" bind:value={step.durationMins} on:blur={saveGamePlan} />
+                <span class="plan-mins-label">min</span>
+                <div class="plan-reorder">
+                  <button on:click={() => movePlanStep(i, -1)} disabled={i === 0}>↑</button>
+                  <button on:click={() => movePlanStep(i, 1)} disabled={i === game.gamePlan.length - 1}>↓</button>
+                </div>
+                <button class="plan-remove" on:click={() => removePlanStep(i)}>×</button>
+              {:else}
+                <span class="plan-name-readonly">{lineupName}</span>
+                <span class="plan-duration-readonly">{step.durationMins} min</span>
+              {/if}
+            </div>
+          {/each}
+        </div>
+        <div class="plan-total">Total: <strong>{totalPlanMins} min</strong></div>
+      {/if}
+    </div>
+
     <!-- Bottom Section: Stats & Timeline -->
     <div class="stats-grid">
       
       <!-- Player Minutes Box Score -->
       <div class="panel">
         <div class="panel-title-row">
-          <h2>Player Minutes</h2>
-          <button class="btn-toggle" on:click={() => editingAvailability = !editingAvailability}>
-            {editingAvailability ? 'Done' : 'Edit Availability'}
-          </button>
+          <h2>Player Stats</h2>
+          {#if game.status !== 'completed'}
+            <button class="btn-toggle" on:click={() => editingAvailability = !editingAvailability}>
+              {editingAvailability ? 'Done' : 'Edit Availability'}
+            </button>
+          {/if}
         </div>
 
         {#if editingAvailability}
@@ -288,28 +383,32 @@
             {/if}
           </div>
         {:else}
-          <div class="table-container">
+          <div class="table-container stats-panel-scroll">
             <table class="stats-table">
               <thead>
                 <tr>
                   <th>Player</th>
                   <th class="text-right">Field Time</th>
-                  <th class="text-right">Bench Time</th>
+                  <th class="text-right">G</th>
+                  <th class="text-right">A</th>
                 </tr>
               </thead>
               <tbody>
                 {#each boxScore as p}
                   <tr>
                     <td>
+                      <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+                      <span class="btn-player-info" title="View position stats" on:click={() => { statsModalPlayer = p; showPlayerStatsModal = true; }}>i</span>
                       <span class="muted small mr-1">#{p.number}</span>
                       <strong>{p.name}</strong>
                     </td>
                     <td class="text-right text-green">{formatDuration(p.activeMs)}</td>
-                    <td class="text-right text-muted">{formatDuration(p.benchMs)}</td>
+                    <td class="text-right">{p.goals || '–'}</td>
+                    <td class="text-right text-muted">{p.assists || '–'}</td>
                   </tr>
                 {/each}
                 {#if boxScore.length === 0}
-                  <tr><td colspan="3" class="text-center text-muted">No players assigned to this game.</td></tr>
+                  <tr><td colspan="4" class="text-center text-muted">No players assigned to this game.</td></tr>
                 {/if}
               </tbody>
             </table>
@@ -320,42 +419,33 @@
       <!-- Match Timeline -->
       <div class="panel">
         <h2>Match Timeline</h2>
-        <div class="timeline">
-          {#each sortedHistory as ev}
-            <div class="timeline-item">
-              <div class="time-marker">{formatDuration(ev.gameTimeMs)}</div>
-              <div class="event-content">
-                <strong class="event-title" 
-                  class:text-green={ev.event === 'Goal (Us)'}
-                  class:text-red={ev.event === 'Goal Conceded' || ev.event === 'Red Card'}
-                  class:text-yellow={ev.event === 'Yellow Card'}
-                >
-                  {ev.event}
-                </strong>
-                
-                {#if ev.playerId}
-                  <div class="event-player">{getPlayerName(ev.playerId)}</div>
-                {/if}
-                
-                {#if ev.assistId}
-                  <div class="event-details text-muted">Assist: {getPlayerName(ev.assistId)}</div>
-                {/if}
-                
-                {#if ev.event === 'Lineup Applied' || ev.event === 'Substitution'}
-                  <div class="event-details text-muted small">Tactical/Sub Change</div>
-                {/if}
-              </div>
-            </div>
-          {/each}
-          
-          {#if sortedHistory.length === 0}
-            <p class="text-muted text-center" style="padding: 2rem 0;">No events recorded yet. Start the Live Tracker to log events.</p>
-          {/if}
+        <div class="stats-panel-scroll">
+        <MatchTimeline
+          history={game.history}
+          roster={team?.roster || []}
+          {gameId}
+          allowEditing={true}
+          on:updated={(e) => { game.history = e.detail; }}
+        />
         </div>
       </div>
 
     </div>
   </div>
+{/if}
+
+<!-- PLAYER STATS MODAL -->
+{#if showPlayerStatsModal && statsModalPlayer}
+  <PlayerStatsModal
+    player={statsModalPlayer}
+    activeMs={statsModalPlayer.activeMs}
+    benchMs={statsModalPlayer.benchMs}
+    positionStats={positionStats[statsModalPlayer.id] || { positionMs: {}, groupMs: {} }}
+    timelineSegments={playerTimelines[statsModalPlayer.id] ?? []}
+    totalGameMs={game?.gameTimeStats?.totalMs ?? 0}
+    formation={gameFormation}
+    on:close={() => showPlayerStatsModal = false}
+  />
 {/if}
 
 <!-- EDIT GAME DETAILS MODAL -->
@@ -408,12 +498,18 @@
 
   .btn-live { background: #10b981; color: white; text-decoration: none; padding: 0.85rem 1.5rem; border-radius: 0.75rem; font-weight: bold; display: flex; align-items: center; gap: 0.75rem; transition: transform 0.2s; }
   .btn-live:hover { transform: translateY(-2px); }
-  
+  .btn-live-inactive { background: #d97706; }
+
   .pulse-dot { width: 10px; height: 10px; background: white; border-radius: 50%; animation: pulse 2s infinite; }
+  .pulse-dot.no-pulse { animation: none; }
   @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(255, 255, 255, 0.7); } 70% { box-shadow: 0 0 0 8px rgba(255, 255, 255, 0); } 100% { box-shadow: 0 0 0 0 rgba(255, 255, 255, 0); } }
 
   .grid-layout, .stats-grid { display: grid; grid-template-columns: 1fr; gap: 1.5rem; margin-bottom: 1.5rem;}
   @media (min-width: 800px) { .grid-layout, .stats-grid { grid-template-columns: 1fr 1fr; align-items: start;} }
+
+  @media (max-width: 799px) {
+    .stats-panel-scroll { max-height: 340px; overflow-y: auto; }
+  }
 
   .panel { background: #111827; border: 1px solid #334155; border-radius: 1rem; padding: 1.5rem; }
   h2 { margin-top: 0; color: #e2e8f0; border-bottom: 1px solid #1e293b; padding-bottom: 0.75rem; margin-bottom: 1rem;}
@@ -436,22 +532,20 @@
 
   /* Stats Table */
   .table-container { overflow-x: auto; }
+  .btn-player-info {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 1.15rem; height: 1.15rem; border-radius: 50%;
+    border: 1.5px solid #60a5fa; color: #60a5fa;
+    font-size: 0.65rem; font-weight: 700; font-style: italic;
+    cursor: pointer; margin-right: 0.4rem; vertical-align: middle;
+    transition: background 0.15s, color 0.15s; flex-shrink: 0;
+  }
+  .btn-player-info:hover { background: #60a5fa; color: #0f172a; }
   .stats-table { width: 100%; border-collapse: collapse; color: #e2e8f0; font-size: 0.95rem;}
   .stats-table th { color: #94a3b8; font-weight: 600; padding: 0.75rem 0.5rem; border-bottom: 2px solid #334155; text-align: left;}
   .stats-table th.text-right { text-align: right; }
   .stats-table td { padding: 0.75rem 0.5rem; border-bottom: 1px solid #1e293b; }
   .stats-table tr:last-child td { border-bottom: none; }
-
-  /* Timeline */
-  .timeline { display: flex; flex-direction: column; gap: 1rem; max-height: 400px; overflow-y: auto; padding-right: 0.5rem;}
-  .timeline::-webkit-scrollbar { width: 8px; }
-  .timeline::-webkit-scrollbar-thumb { background: #334155; border-radius: 4px; }
-
-  .timeline-item { display: flex; gap: 1rem; background: #0f172a; padding: 0.75rem; border-radius: 0.75rem; border-left: 4px solid #3b82f6;}
-  .time-marker { font-family: monospace; font-weight: bold; color: #cbd5e1; background: #1e293b; padding: 0.25rem 0.5rem; border-radius: 0.25rem; height: fit-content;}
-  .event-content { display: flex; flex-direction: column; gap: 0.1rem; }
-  .event-title { font-size: 1rem; }
-  .event-player { color: #f8fafc; font-weight: 500;}
 
   /* Player Minutes panel header row */
   .panel-title-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.75rem; }
@@ -489,6 +583,31 @@
     font-weight: 600;
   }
   .btn-toggle:hover { background: #334155; }
+
+  /* Game Plan */
+  .game-plan-panel { margin-bottom: 1.5rem; }
+  .plan-list { display: flex; flex-direction: column; gap: 0.5rem; margin-bottom: 0.75rem; }
+  .plan-step {
+    display: flex; align-items: center; gap: 0.5rem;
+    background: #0f172a; border: 1px solid #1e293b; border-radius: 0.5rem;
+    padding: 0.5rem 0.75rem; flex-wrap: wrap;
+  }
+  .step-num { color: #475569; font-size: 0.8rem; font-weight: 700; min-width: 1.2rem; }
+  .plan-select { flex: 1; min-width: 0; background: #1e293b; border: 1px solid #334155; color: #f8fafc; padding: 0.4rem 0.5rem; border-radius: 0.4rem; font-size: 0.9rem; outline: none; }
+  .plan-select:focus { border-color: #3b82f6; }
+  .plan-duration { width: 3.5rem; background: #1e293b; border: 1px solid #334155; color: #f8fafc; padding: 0.4rem 0.5rem; border-radius: 0.4rem; font-size: 0.9rem; text-align: right; outline: none; }
+  .plan-duration:focus { border-color: #3b82f6; }
+  .plan-mins-label { color: #64748b; font-size: 0.8rem; }
+  .plan-reorder { display: flex; gap: 0.2rem; }
+  .plan-reorder button { background: #1e293b; border: 1px solid #334155; color: #94a3b8; width: 1.6rem; height: 1.6rem; border-radius: 0.3rem; cursor: pointer; font-size: 0.75rem; padding: 0; display: flex; align-items: center; justify-content: center; }
+  .plan-reorder button:disabled { opacity: 0.3; cursor: not-allowed; }
+  .plan-reorder button:not(:disabled):hover { background: #334155; }
+  .plan-remove { background: transparent; border: none; color: #ef4444; font-size: 1.1rem; cursor: pointer; padding: 0 0.2rem; line-height: 1; opacity: 0.7; }
+  .plan-remove:hover { opacity: 1; }
+  .plan-name-readonly { flex: 1; color: #f8fafc; font-size: 0.9rem; font-weight: 500; }
+  .plan-duration-readonly { color: #94a3b8; font-size: 0.85rem; font-family: monospace; }
+  .plan-total { text-align: right; color: #94a3b8; font-size: 0.85rem; }
+  .plan-total strong { color: #f8fafc; }
 
   /* Roster checklist (availability editing) */
   .roster-checklist {

@@ -1,17 +1,21 @@
 <script>
   import { page } from '$app/stores';
   import { onMount, onDestroy } from 'svelte';
-  import { doc, getDoc, updateDoc } from 'firebase/firestore';
+  import { doc, getDoc, updateDoc, collection, query, where, getDocs } from 'firebase/firestore';
   import { db } from '$lib/firebase/config';
   import { getGroupColor } from '$lib/groupColors.js';
+  import { computePositionStats, computePlayerTimelines } from '$lib/utils.js';
+  import MatchTimeline from '$lib/components/MatchTimeline.svelte';
+  import PlayerStatsModal from '$lib/components/PlayerStatsModal.svelte';
 
   const gameId = $page.params.gameId;
 
   let game = null;
   let team = null;
   let formation = null;
-  let lineup = {}; 
-  
+  let lineup = {};
+  let savedLineups = [];
+
   // UI & Selection State
   let selectedItem = null;
   let pitchView = false;
@@ -21,33 +25,50 @@
   let now = Date.now();
   let timerInterval;
   let gameLive = false;
+  let gameEnded = false;
 
-  // --- Event Modal State ---
+  // --- Bench Sort & Bar Mode ---
+  let benchSort = 'status';
+  let colorBarMode = 'grouped'; // 'grouped' | 'timeline'
+
+  // --- Preset lineup tracking ---
+  let appliedLineupId = null;  // which saved lineup is currently on the field
+  let pendingLineupId = null;  // which saved lineup the pending local lineup came from
+
+  // --- Stint tracking (playerId -> gameTimeMs when they entered current status) ---
+  let stintStartMs = {};
+
+  // --- Modals ---
   let showEventModal = false;
-  let eventType = 'goal'; // 'goal' | 'card'
-  let eventTeam = 'mine'; // 'mine' | 'theirs'
+  let showGoalsModal = false;
+  let showPlayerStatsModal = false;
+  let statsModalPlayer = null;
+  let eventType = 'goal';
+  let eventTeam = 'mine';
   let eventScorer = '';
   let eventAssist = '';
   let eventCard = 'yellow';
   let eventPlayer = '';
 
   onMount(async () => {
-    // 1. Fetch Data
     const gameSnap = await getDoc(doc(db, 'games', gameId));
     game = { id: gameSnap.id, ...gameSnap.data() };
-    
-    // Ensure nested objects exist
+
     if (!game.lineup) game.lineup = {};
     if (!game.history) game.history = [];
     if (!game.playerStats) game.playerStats = {};
     if (!game.gameTimeStats) game.gameTimeStats = { totalMs: 0, sessionStart: null };
     if (!game.score) game.score = { mine: 0, theirs: 0 };
-    
+
     lineup = { ...game.lineup };
     gameLive = game.status === 'live';
+    gameEnded = game.status === 'completed';
 
     const teamSnap = await getDoc(doc(db, 'teams', game.teamId));
     team = teamSnap.data();
+
+    const lineupsSnap = await getDocs(query(collection(db, 'lineups'), where('teamId', '==', game.teamId)));
+    savedLineups = lineupsSnap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => a.name.localeCompare(b.name));
 
     if (game.formationId) {
       const formSnap = await getDoc(doc(db, 'formations', game.formationId));
@@ -56,42 +77,106 @@
       formation = { positions: [{id: 'p1', name: 'GK'}, {id: 'p2', name: 'DEF'}, {id: 'p3', name: 'FWD'}] };
     }
 
+    // Initialise stint tracking from the last sub event (or 0 if no subs yet)
+    const lastSub = [...game.history].filter(e => e.lineupSnapshot).sort((a, b) => b.gameTimeMs - a.gameTimeMs)[0];
+    const stintBase = lastSub ? lastSub.gameTimeMs : 0;
+    (team?.roster || []).forEach(p => { stintStartMs[p.id] = stintBase; });
+
     loading = false;
-
-    // Start local UI tick
     timerInterval = setInterval(() => { now = Date.now(); }, 1000);
+    console.log(game)
   });
 
-  onDestroy(() => {
-    if (timerInterval) clearInterval(timerInterval);
-  });
+  onDestroy(() => { if (timerInterval) clearInterval(timerInterval); });
 
-  // --- Derived State (Reactive) ---
-  $: availableRoster = team?.roster.filter(p => game?.availablePlayers.includes(p.id)) || [];
+  // --- Derived State ---
+  $: availableRoster = team?.roster.filter(p => game?.availablePlayers?.includes(p.id)) || [];
+  // Active players based on the *applied* lineup (game.lineup), not the pending local lineup
+  $: appliedPlayerIds = Object.values(game?.lineup || {}).filter(id => id !== null);
   $: activePlayerIds = Object.values(lineup).filter(id => id !== null);
-  $: benchPlayers = availableRoster.filter(p => !activePlayerIds.includes(p.id));
+  $: benchPlayers = availableRoster.filter(p => !appliedPlayerIds.includes(p.id));
 
-  // Calculate Live Game Time
-  $: liveGameTimeMs = game?.gameTimeStats.totalMs + (gameLive && game.gameTimeStats.sessionStart ? now - game.gameTimeStats.sessionStart : 0);
+  $: liveGameTimeMs = (game?.gameTimeStats.totalMs ?? 0) +
+    (gameLive && game?.gameTimeStats.sessionStart ? now - game.gameTimeStats.sessionStart : 0);
 
-  // Calculate Live Player Minutes
   $: livePlayerStats = availableRoster.map(player => {
     const base = game?.playerStats[player.id] || { activeMs: 0, benchMs: 0 };
     let currentActive = base.activeMs;
     let currentBench = base.benchMs;
-
-    // Add uncommitted time if game is live
     if (gameLive && game?.gameTimeStats.sessionStart) {
       const elapsed = Math.max(0, now - game.gameTimeStats.sessionStart);
-      if (activePlayerIds.includes(player.id)) currentActive += elapsed;
+      if (appliedPlayerIds.includes(player.id)) currentActive += elapsed;
       else currentBench += elapsed;
     }
-
     return { ...player, activeMs: currentActive, benchMs: currentBench };
   });
 
-  // --- Time Logic ---
-  
+  // Pending subs: diff local lineup vs last saved lineup
+  $: pendingSubs = (() => {
+    if (!game?.lineup || !formation) return [];
+    return formation.positions.reduce((acc, pos) => {
+      const prev = game.lineup[pos.id] ?? null;
+      const curr = lineup[pos.id] ?? null;
+      if (prev !== curr) acc.push({ posName: pos.name, posId: pos.id, playerInId: curr, playerOutId: prev });
+      return acc;
+    }, []);
+  })();
+
+  // Goal events for scoreboard modal
+  $: goalEvents = [...(game?.history || [])].filter(e => e.type === 'goal').sort((a, b) => a.gameTimeMs - b.gameTimeMs);
+
+  $: lineupLabel = (() => {
+    const appliedName = appliedLineupId ? savedLineups.find(l => l.id === appliedLineupId)?.name ?? null : null;
+    const pendingName = pendingLineupId ? savedLineups.find(l => l.id === pendingLineupId)?.name ?? null : null;
+    if (!appliedName && !pendingName) return null;
+    if (appliedLineupId === pendingLineupId) return appliedName ?? 'manual lineup';
+    return `${appliedName ?? 'manual lineup'} → ${pendingName ?? 'manual lineup'}`;
+  })();
+
+  // Combined + sorted player list for bench panel
+  $: sortedAvailablePlayers = (() => {
+    const players = availableRoster.map(p => {
+      const stats = livePlayerStats.find(s => s.id === p.id) || { activeMs: 0, benchMs: 0 };
+      const onField = appliedPlayerIds.includes(p.id);
+      const stintMs = liveGameTimeMs - (stintStartMs[p.id] ?? 0);
+      const pendingIn = pendingSubs.some(s => s.playerInId === p.id);
+      const pendingOut = pendingSubs.some(s => s.playerOutId === p.id);
+      return { ...p, ...stats, onField, stintMs, pendingIn, pendingOut };
+    });
+
+    switch (benchSort) {
+      case 'totalField':
+        return players.sort((a, b) => b.activeMs - a.activeMs || a.name.localeCompare(b.name));
+      case 'benchStint':
+        return players.sort((a, b) => {
+          if (!a.onField && !b.onField) return b.stintMs - a.stintMs || a.name.localeCompare(b.name);
+          if (!a.onField) return -1;
+          if (!b.onField) return 1;
+          return a.name.localeCompare(b.name);
+        });
+      case 'fieldStint':
+        return players.sort((a, b) => {
+          if (a.onField && b.onField) return b.stintMs - a.stintMs || a.name.localeCompare(b.name);
+          if (a.onField) return -1;
+          if (b.onField) return 1;
+          return a.name.localeCompare(b.name);
+        });
+      case 'status':
+        return players.sort((a, b) => {
+          const getGroup = (p) => {
+            if (!p.onField) return p.pendingOut ? 2 : 0;
+            return p.pendingIn ? 1 : 3;
+          };
+          const aGroup = getGroup(a);
+          const bGroup = getGroup(b);
+          return aGroup - bGroup || a.name.localeCompare(b.name);
+        });
+      default: // alpha
+        return players.sort((a, b) => a.name.localeCompare(b.name));
+    }
+  })();
+
+  // --- Time Helpers ---
   function formatDuration(ms) {
     if (!ms) return '0:00';
     const totalSecs = Math.floor(ms / 1000);
@@ -103,12 +188,8 @@
   function commitTime() {
     if (!gameLive || !game.gameTimeStats.sessionStart) return;
     const elapsed = Date.now() - game.gameTimeStats.sessionStart;
-    
-    // Update global game clock
     game.gameTimeStats.totalMs += elapsed;
-    game.gameTimeStats.sessionStart = Date.now(); // Reset for next tick
-
-    // Update player clocks based on CURRENT lineup (before any subs happen)
+    game.gameTimeStats.sessionStart = Date.now();
     availableRoster.forEach(p => {
       if (!game.playerStats[p.id]) game.playerStats[p.id] = { activeMs: 0, benchMs: 0 };
       if (activePlayerIds.includes(p.id)) game.playerStats[p.id].activeMs += elapsed;
@@ -116,6 +197,7 @@
     });
   }
 
+  // --- Match Lifecycle ---
   async function toggleLive() {
     if (gameLive) {
       commitTime();
@@ -124,16 +206,80 @@
       gameLive = false;
       game.history.push({ event: 'Game Paused', timestamp: Date.now(), gameTimeMs: game.gameTimeStats.totalMs });
     } else {
+      // Warn if not all positions are filled
+      const emptyPositions = (formation?.positions || []).filter(p => !lineup[p.id]);
+      if (emptyPositions.length > 0) {
+        const names = emptyPositions.map(p => p.name).join(', ');
+        if (!confirm(`${emptyPositions.length} position(s) are empty: ${names}.\n\nStart anyway?`)) return;
+      }
+      const isResume = game.status === 'paused';
+
+      // On first start, auto-apply any pending lineup changes
+      if (!isResume && pendingSubs.length > 0) {
+        const prevFieldIds = new Set(Object.values(game.lineup).filter(Boolean));
+        const newFieldIds = new Set(Object.values(lineup).filter(Boolean));
+        availableRoster.forEach(p => {
+          if (prevFieldIds.has(p.id) !== newFieldIds.has(p.id)) {
+            stintStartMs = { ...stintStartMs, [p.id]: 0 };
+          }
+        });
+        game.lineup = { ...lineup };
+        appliedLineupId = pendingLineupId;
+        game.history.push({ event: 'Lineup Set', timestamp: Date.now(), gameTimeMs: 0, lineupSnapshot: { ...lineup } });
+      }
+
       game.gameTimeStats.sessionStart = Date.now();
       game.status = 'live';
       gameLive = true;
-      game.history.push({ event: 'Game Started/Resumed', timestamp: Date.now(), gameTimeMs: game.gameTimeStats.totalMs });
+      game.history.push({ event: isResume ? 'Game Resumed' : 'Game Started', timestamp: Date.now(), gameTimeMs: game.gameTimeStats.totalMs });
     }
     await syncToDb();
   }
 
-  // --- Sub Logic ---
+  async function endMatch() {
+    if (!confirm('End the match? This will stop the clock and mark the game as completed.')) return;
+    commitTime();
+    game.gameTimeStats.sessionStart = null;
+    game.status = 'completed';
+    gameLive = false;
+    gameEnded = true;
+    game.history.push({ event: 'Match Ended', timestamp: Date.now(), gameTimeMs: game.gameTimeStats.totalMs });
+    await syncToDb();
+  }
 
+  async function resetGame() {
+    if (!confirm('Reset all game data? This clears the score, timeline, player stats, and lineup. This cannot be undone.')) return;
+    game.history = [];
+    game.playerStats = {};
+    game.gameTimeStats = { totalMs: 0, sessionStart: null };
+    game.score = { mine: 0, theirs: 0 };
+    game.status = 'scheduled';
+    game.lineup = {};
+    lineup = {};
+    gameLive = false;
+    gameEnded = false;
+    stintStartMs = {};
+    appliedLineupId = null;
+    pendingLineupId = null;
+    await syncToDb();
+  }
+
+  // --- Load Saved Lineup ---
+  function loadSavedLineup(lineupId) {
+    if (!lineupId) return;
+    const saved = savedLineups.find(l => l.id === lineupId);
+    if (!saved) return;
+    // Map saved positionId -> playerId, filtering to only available players
+    const availableIds = new Set(availableRoster.map(p => p.id));
+    const newLineup = {};
+    for (const [posId, playerId] of Object.entries(saved.players || {})) {
+      newLineup[posId] = availableIds.has(playerId) ? playerId : null;
+    }
+    lineup = newLineup;
+    pendingLineupId = lineupId;
+  }
+
+  // --- Sub / Swap Logic ---
   function handleSlotClick(posId) {
     if (selectedItem) executeSwap('slot', posId);
     else selectedItem = { type: 'slot', id: posId };
@@ -149,52 +295,45 @@
     let newLineup = { ...lineup };
 
     if (!payload) {
-      if (targetType === 'slot') {
-        newLineup[targetId] = null;
-      }
+      if (targetType === 'slot') newLineup[targetId] = null;
     } else if (payload.type === 'bench' && targetType === 'slot') {
-      // Direction: Player -> Position
       newLineup[targetId] = payload.id;
-    } 
-    else if (payload.type === 'slot' && targetType === 'bench') {
-      // Direction: Position -> Player
+    } else if (payload.type === 'slot' && targetType === 'bench') {
       newLineup[payload.id] = targetId;
-    }
-    else if (payload.type === 'slot' && targetType === 'slot') {
-      // Direction: Position -> Position (Swap)
+    } else if (payload.type === 'slot' && targetType === 'slot') {
       const temp = newLineup[payload.id];
       newLineup[payload.id] = newLineup[targetId];
       newLineup[targetId] = temp;
-    } 
+    }
 
     lineup = newLineup;
     selectedItem = null;
+    pendingLineupId = null;
   }
 
   async function applyLineup() {
-    commitTime(); // Credit players for time played BEFORE the sub
-    
-    game.lineup = lineup;
-    game.history.push({
-      event: 'Substitution',
-      timestamp: Date.now(),
-      gameTimeMs: game.gameTimeStats.totalMs,
-      lineupSnapshot: { ...lineup }
+    commitTime();
+
+    // Update stint starts for players who changed field/bench status
+    const prevFieldIds = new Set(Object.values(game.lineup).filter(Boolean));
+    const newFieldIds = new Set(Object.values(lineup).filter(Boolean));
+    const currentGameTime = game.gameTimeStats.totalMs;
+    availableRoster.forEach(p => {
+      if (prevFieldIds.has(p.id) !== newFieldIds.has(p.id)) {
+        stintStartMs = { ...stintStartMs, [p.id]: currentGameTime };
+      }
     });
 
+    game.lineup = { ...lineup };
+    appliedLineupId = pendingLineupId;
+    game.history.push({ event: 'Substitution', timestamp: Date.now(), gameTimeMs: game.gameTimeStats.totalMs, lineupSnapshot: { ...lineup } });
     await syncToDb();
   }
 
-  // --- Event Logic (Goals/Cards) ---
-
+  // --- Event Logic ---
   async function saveEvent() {
-    commitTime(); // Credit time up to the event
-
-    const eventObj = {
-      timestamp: Date.now(),
-      gameTimeMs: game.gameTimeStats.totalMs,
-      type: eventType
-    };
+    commitTime();
+    const eventObj = { timestamp: Date.now(), gameTimeMs: game.gameTimeStats.totalMs, type: eventType };
 
     if (eventType === 'goal') {
       if (eventTeam === 'mine') {
@@ -213,6 +352,7 @@
 
     game.history.push(eventObj);
     showEventModal = false;
+    eventScorer = ''; eventAssist = ''; eventPlayer = '';
     await syncToDb();
   }
 
@@ -231,7 +371,6 @@
     }
   }
 
-  // --- Helpers ---
   function getPlayerName(playerId) {
     if (!playerId) return 'Empty';
     const player = availableRoster.find(p => p.id === playerId);
@@ -242,46 +381,144 @@
     const p = livePlayerStats.find(p => p.id === playerId);
     return p ? { active: formatDuration(p.activeMs), bench: formatDuration(p.benchMs) } : { active: '0:00', bench: '0:00' };
   }
+
+  $: basePositionStats = computePositionStats(game?.history || [], formation);
+
+  // Add the currently-running session's elapsed time on top of the base
+  $: livePositionStats = (() => {
+    const result = {};
+    for (const [pid, s] of Object.entries(basePositionStats)) {
+      result[pid] = { positionMs: { ...s.positionMs }, groupMs: { ...s.groupMs } };
+    }
+    if (gameLive && game?.gameTimeStats.sessionStart) {
+      const elapsed = Math.max(0, now - game.gameTimeStats.sessionStart);
+      Object.entries(game.lineup || {}).forEach(([posId, playerId]) => {
+        if (!playerId) return;
+        if (!result[playerId]) result[playerId] = { positionMs: {}, groupMs: {} };
+        result[playerId].positionMs[posId] = (result[playerId].positionMs[posId] || 0) + elapsed;
+        const group = formation?.positions.find(p => p.id === posId)?.group;
+        if (group) result[playerId].groupMs[group] = (result[playerId].groupMs[group] || 0) + elapsed;
+      });
+    }
+    return result;
+  })();
+
+  $: basePlayerTimelines = computePlayerTimelines(game?.history || [], formation, availableRoster);
+
+  $: livePlayerTimelines = (() => {
+    const result = {};
+    for (const [pid, segs] of Object.entries(basePlayerTimelines)) result[pid] = [...segs];
+    if (gameLive && game?.gameTimeStats.sessionStart) {
+      const segStart = game.gameTimeStats.totalMs;
+      const segEnd = liveGameTimeMs;
+      if (segEnd > segStart) {
+        availableRoster.forEach(p => {
+          if (!result[p.id]) result[p.id] = [];
+          const posId = Object.keys(game.lineup || {}).find(k => game.lineup[k] === p.id);
+          const group = posId ? (formation?.positions.find(fp => fp.id === posId)?.group ?? null) : null;
+          result[p.id].push({ startMs: segStart, endMs: segEnd, group: appliedPlayerIds.includes(p.id) ? group : null });
+        });
+      }
+    }
+    return result;
+  })();
 </script>
 
 {#if loading}
   <div class="loading">Loading Live Editor...</div>
 {:else}
-  <!-- MATCH HEADER: SCORE & CLOCK -->
+  <!-- MATCH HEADER -->
   <header class="live-header">
     <div class="match-overview">
-      <a href="/games/{gameId}" class="back-link">← Dashboard</a>
-      <div class="scoreboard">
+      <div class="match-title-group">
+        <a href="/games/{gameId}" class="back-link">← Dashboard</a>
+        <span class="match-name">{game.homeAway === 'away' ? '@' : 'vs'} {game.opponent || 'TBD'}</span>
+      </div>
+
+      <!-- Scoreboard — click to see goals -->
+      <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+      <div class="scoreboard" class:clickable={goalEvents.length > 0} on:click={() => goalEvents.length > 0 && (showGoalsModal = true)} title={goalEvents.length > 0 ? 'View goals' : ''}>
         <span class="score">{game.score.mine}</span>
         <span class="divider">-</span>
         <span class="score">{game.score.theirs}</span>
+        {#if goalEvents.length > 0}<span class="goals-hint">⚽</span>{/if}
       </div>
+
       <div class="clock-display">
         <span class="time">{formatDuration(liveGameTimeMs)}</span>
-        <span class="status-badge" class:live={gameLive}>{gameLive ? 'LIVE' : 'PAUSED'}</span>
+        <span class="status-badge" class:live={gameLive} class:ended={gameEnded}>
+          {gameEnded ? 'ENDED' : gameLive ? 'LIVE' : game.status === 'scheduled' ? 'NOT STARTED' : 'PAUSED'}
+        </span>
       </div>
     </div>
-    
+
     <div class="match-actions">
-      <button class="btn-secondary" on:click={() => showEventModal = true}>+ Add Event</button>
-      <button class="btn-live {gameLive ? 'stop' : 'start'}" on:click={toggleLive}>
-        {gameLive ? 'Pause Match' : 'Start Match'}
-      </button>
-      <button class="btn-primary" on:click={applyLineup}>Apply Subs</button>
+      {#if !gameEnded}
+        <div class="actions-row">
+          <button class="btn-live {gameLive ? 'stop' : 'start'}" on:click={toggleLive}>
+            {gameLive ? 'Pause' : game.status === 'scheduled' ? 'Start' : 'Resume'}
+          </button>
+          <button class="btn-primary" on:click={applyLineup} disabled={pendingSubs.length === 0}>Apply Subs</button>
+        </div>
+        <div class="actions-row">
+          <button class="btn-secondary" on:click={() => showEventModal = true}>+ Event</button>
+          <button class="btn-end" on:click={endMatch}>End</button>
+          <button class="btn-reset" on:click={resetGame} title="Reset game">↺ Reset</button>
+        </div>
+      {:else}
+        <button class="btn-reset" on:click={resetGame} title="Reset game">↺ Reset</button>
+      {/if}
     </div>
   </header>
 
-  <!-- PITCH & BENCH LAYOUT -->
+  <!-- PENDING SUBS BANNER -->
+  {#if pendingSubs.length > 0}
+    <div class="pending-bar">
+      <span class="pending-label">Pending subs:</span>
+      {#each pendingSubs as sub, i}
+        {#if i > 0}<span class="pending-sep">·</span>{/if}
+        <span class="pending-sub">
+          {#if sub.playerInId && sub.playerOutId}
+            <span class="sub-in">{getPlayerName(sub.playerInId)}</span>
+            <span class="sub-arrow"> ↔ </span>
+            <span class="sub-out">{getPlayerName(sub.playerOutId)}</span>
+            <span class="sub-pos"> ({sub.posName})</span>
+          {:else if sub.playerInId}
+            <span class="sub-in">{getPlayerName(sub.playerInId)}</span>
+            <span class="sub-pos"> → {sub.posName}</span>
+          {:else}
+            <span class="sub-out">{getPlayerName(sub.playerOutId)}</span>
+            <span class="sub-pos"> off ({sub.posName})</span>
+          {/if}
+        </span>
+      {/each}
+    </div>
+  {/if}
+
+  <!-- PITCH & PLAYERS LAYOUT -->
   <div class="layout-grid">
-    
+
     <div class="panel pitch-panel">
       <div class="pitch-header">
         <h2>On Field</h2>
-        <div class="view-toggle">
-          <button class:active={!pitchView} on:click={() => pitchView = false}>List</button>
-          <button class:active={pitchView} on:click={() => pitchView = true}>Field</button>
+        <div class="pitch-header-actions">
+          {#if savedLineups.length > 0}
+            <select class="lineup-select" on:change={(e) => { loadSavedLineup(e.target.value); e.target.value = ''; }}>
+              <option value="">Load lineup…</option>
+              {#each savedLineups as sl}
+                <option value={sl.id}>{sl.name}</option>
+              {/each}
+            </select>
+          {/if}
+          <div class="view-toggle">
+            <button class:active={!pitchView} on:click={() => pitchView = false}>List</button>
+            <button class:active={pitchView} on:click={() => pitchView = true}>Field</button>
+          </div>
         </div>
       </div>
+      {#if lineupLabel}
+        <div class="lineup-label">{lineupLabel}</div>
+      {/if}
 
       {#if pitchView}
         <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
@@ -308,9 +545,6 @@
               >
                 <div class="field-node" style="background: {color.bg}; border-color: {color.bg};">{pos.name}</div>
                 <div class="field-node-label">{lineup[pos.id] ? getPlayerName(lineup[pos.id]) : '—'}</div>
-                {#if lineup[pos.id]}
-                  <div class="field-node-time">{getPlayerLiveStats(lineup[pos.id]).active}</div>
-                {/if}
               </div>
             {/each}
           </div>
@@ -319,21 +553,29 @@
         <div class="slots-container">
           {#each formation?.positions || [] as pos}
             {@const color = getGroupColor(pos.group)}
+            {@const pendingSub = pendingSubs.find(s => s.posId === pos.id)}
             <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
             <div class="slot-card"
                  class:selected={selectedItem?.type === 'slot' && selectedItem?.id === pos.id}
                  class:empty={!lineup[pos.id]}
+                 class:has-pending={!!pendingSub}
                  on:click={() => handleSlotClick(pos.id)}>
-
               <div class="pos-badge" style="background: {color.bg}; color: {color.text};">{pos.name}</div>
-
               <div class="player-info">
-                <span class="player-name">{getPlayerName(lineup[pos.id])}</span>
-                {#if lineup[pos.id]}
-                  <span class="player-time active-color">Field: {getPlayerLiveStats(lineup[pos.id]).active}</span>
+                {#if pendingSub}
+                  {#if pendingSub.playerInId}
+                    <span class="player-name sub-name-in">{getPlayerName(pendingSub.playerInId)}</span>
+                  {/if}
+                  {#if pendingSub.playerOutId}
+                    <span class="player-name sub-name-out">{getPlayerName(pendingSub.playerOutId)}</span>
+                  {/if}
+                {:else}
+                  <span class="player-name">{getPlayerName(lineup[pos.id])}</span>
+                  {#if lineup[pos.id]}
+                    <span class="player-time active-color">Field: {formatDuration(livePlayerStats.find(p => p.id === lineup[pos.id])?.activeMs ?? 0)}</span>
+                  {/if}
                 {/if}
               </div>
-
               {#if lineup[pos.id]}
                 <button class="btn-remove" on:click|stopPropagation={() => executeSwap('slot', pos.id)}>×</button>
               {/if}
@@ -344,21 +586,80 @@
     </div>
 
     <div class="panel bench-panel">
-      <h2>Bench</h2>
+      <div class="bench-header">
+        <h2>Players</h2>
+        <div class="bench-header-controls">
+          <div class="bar-mode-toggle">
+            <button class:active={colorBarMode === 'grouped'} on:click={() => colorBarMode = 'grouped'}>Grouped</button>
+            <button class:active={colorBarMode === 'timeline'} on:click={() => colorBarMode = 'timeline'}>Timeline</button>
+          </div>
+          <select class="sort-select" bind:value={benchSort}>
+            <option value="status">By Status</option>
+            <option value="alpha">A–Z</option>
+            <option value="totalField">Most Field Time</option>
+            <option value="benchStint">Longest on Bench</option>
+            <option value="fieldStint">Longest on Field</option>
+          </select>
+        </div>
+      </div>
       <div class="bench-container">
-        {#each benchPlayers as player}
+        {#each sortedAvailablePlayers as player}
           <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
           <div class="bench-card"
                class:selected={selectedItem?.type === 'bench' && selectedItem?.id === player.id}
-               on:click={() => handleBenchClick(player.id)}>
-            <div class="player-info">
-              <span class="player-name">#{player.number} {player.name}</span>
-              <span class="player-time bench-color">Bench: {getPlayerLiveStats(player.id).bench}</span>
+               class:on-field={player.onField}
+               class:pending-in={player.pendingIn}
+               class:pending-out={player.pendingOut}
+               on:click={() => !player.onField && handleBenchClick(player.id)}>
+            <div class="bench-card-row">
+              <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+              <span class="btn-player-info" title="View position stats" on:click|stopPropagation={() => { statsModalPlayer = player; showPlayerStatsModal = true; }}>i</span>
+              <div class="player-info">
+                <span class="player-name">#{player.number} {player.name}</span>
+                <span class="player-time {player.onField ? 'active-color' : 'bench-color'}">
+                  {player.onField ? 'Field: ' + getPlayerLiveStats(player.id).active : 'Bench: ' + getPlayerLiveStats(player.id).bench}
+                </span>
+              </div>
+              {#if player.pendingIn}
+                <span class="sub-badge sub-badge-in">↑ IN</span>
+              {:else if player.pendingOut}
+                <span class="sub-badge sub-badge-out">↓ OUT</span>
+              {:else if player.onField}
+                <span class="field-dot">▶</span>
+              {/if}
             </div>
+            {#if liveGameTimeMs > 0}
+              <div class="color-bar">
+                {#if colorBarMode === 'timeline'}
+                  {#each livePlayerTimelines[player.id] ?? [] as seg}
+                    <div class="bar-seg" style="width:{((seg.endMs - seg.startMs) / liveGameTimeMs * 100).toFixed(2)}%;background:{getGroupColor(seg.group).bg};"></div>
+                  {/each}
+                {:else}
+                  {@const ps = livePositionStats[player.id] || { groupMs: {} }}
+                  {@const benchMs = livePlayerStats.find(p => p.id === player.id)?.benchMs ?? 0}
+                  {@const groupSegs = [...Object.entries(ps.groupMs).sort((a,b) => b[1]-a[1]), [null, benchMs]].filter(([,ms]) => ms > 0)}
+                  {#each groupSegs as [group, ms]}
+                    <div class="bar-seg" style="width:{(ms / liveGameTimeMs * 100).toFixed(2)}%;background:{getGroupColor(group).bg};"></div>
+                  {/each}
+                {/if}
+              </div>
+            {/if}
           </div>
         {/each}
       </div>
     </div>
+  </div>
+
+  <!-- MATCH TIMELINE -->
+  <div class="panel timeline-panel">
+    <h2>Match Timeline</h2>
+    <MatchTimeline
+      history={game.history}
+      roster={availableRoster}
+      {gameId}
+      allowEditing={true}
+      on:updated={(e) => { game.history = e.detail; }}
+    />
   </div>
 {/if}
 
@@ -368,7 +669,6 @@
   <div class="modal-backdrop" on:click={() => showEventModal = false}>
     <div class="modal-panel" on:click|stopPropagation>
       <h2>Add Match Event</h2>
-
       <div class="form-group">
         <label>Event Type</label>
         <select bind:value={eventType}>
@@ -376,7 +676,6 @@
           <option value="card">Booking (Card)</option>
         </select>
       </div>
-
       {#if eventType === 'goal'}
         <div class="form-group">
           <label>Team</label>
@@ -417,7 +716,6 @@
           </select>
         </div>
       {/if}
-
       <div class="modal-actions">
         <button class="btn-secondary" on:click={() => showEventModal = false}>Cancel</button>
         <button class="btn-primary" on:click={saveEvent}>Save Event</button>
@@ -426,114 +724,209 @@
   </div>
 {/if}
 
+<!-- GOALS MODAL -->
+{#if showGoalsModal}
+  <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+  <div class="modal-backdrop" on:click={() => showGoalsModal = false}>
+    <div class="modal-panel" on:click|stopPropagation>
+      <div class="goals-modal-header">
+        <h2>Goals</h2>
+        <div class="score-display">{game.score.mine} – {game.score.theirs}</div>
+      </div>
+      {#if goalEvents.length === 0}
+        <p class="goals-empty">No goals recorded yet.</p>
+      {:else}
+        <div class="goals-list">
+          {#each goalEvents as ev}
+            <div class="goal-row" class:ours={ev.event === 'Goal (Us)'}>
+              <span class="goal-time">{formatDuration(ev.gameTimeMs)}</span>
+              <span class="goal-icon">{ev.event === 'Goal (Us)' ? '⚽' : '🚫'}</span>
+              <div class="goal-detail">
+                <span class="goal-type">{ev.event === 'Goal (Us)' ? 'Goal' : 'Goal Conceded'}</span>
+                {#if ev.playerId}
+                  <span class="goal-player">{getPlayerName(ev.playerId)}</span>
+                {/if}
+                {#if ev.assistId}
+                  <span class="goal-assist">Assist: {getPlayerName(ev.assistId)}</span>
+                {/if}
+              </div>
+            </div>
+          {/each}
+        </div>
+      {/if}
+      <div class="modal-actions">
+        <button class="btn-primary" on:click={() => showGoalsModal = false}>Close</button>
+      </div>
+    </div>
+  </div>
+{/if}
+
+<!-- PLAYER STATS MODAL -->
+{#if showPlayerStatsModal && statsModalPlayer}
+  <PlayerStatsModal
+    player={statsModalPlayer}
+    activeMs={livePlayerStats.find(p => p.id === statsModalPlayer.id)?.activeMs ?? 0}
+    benchMs={livePlayerStats.find(p => p.id === statsModalPlayer.id)?.benchMs ?? 0}
+    positionStats={livePositionStats[statsModalPlayer.id] || { positionMs: {}, groupMs: {} }}
+    timelineSegments={livePlayerTimelines[statsModalPlayer.id] ?? []}
+    totalGameMs={liveGameTimeMs}
+    {formation}
+    on:close={() => showPlayerStatsModal = false}
+  />
+{/if}
+
 <style>
+  .loading { padding: 3rem; text-align: center; color: #94a3b8; }
+
+  /* ─── Header ─── */
   .live-header {
     display: flex; justify-content: space-between; align-items: center;
-    background: #111827; padding: 1rem 1.5rem; border-radius: 1rem; border: 1px solid #334155; margin-bottom: 1.5rem; flex-wrap: wrap; gap: 1rem;
+    background: #111827; padding: 1rem 1.5rem; border-radius: 1rem;
+    border: 1px solid #334155; margin-bottom: 0.75rem; flex-wrap: wrap; gap: 1rem;
   }
-  
-  .match-overview { display: flex; align-items: center; gap: 1.5rem; }
+  .match-overview { display: flex; align-items: center; gap: 1.5rem; flex-wrap: wrap; }
+  .match-title-group { display: flex; flex-direction: column; gap: 0.15rem; }
   .back-link { color: #3b82f6; text-decoration: none; font-size: 0.9rem; font-weight: bold; }
   .back-link:hover { text-decoration: underline; }
-  .scoreboard { background: #000; padding: 0.5rem 1rem; border-radius: 0.5rem; display: flex; gap: 0.75rem; font-family: monospace; font-size: 1.75rem; font-weight: bold; }
+  .match-name { font-size: 1rem; font-weight: 700; color: #f8fafc; }
+
+  .scoreboard {
+    background: #000; padding: 0.5rem 1rem; border-radius: 0.5rem;
+    display: flex; gap: 0.75rem; align-items: center;
+    font-family: monospace; font-size: 1.75rem; font-weight: bold;
+  }
+  .scoreboard.clickable { cursor: pointer; transition: background 0.15s; }
+  .scoreboard.clickable:hover { background: #1a1a1a; }
   .divider { color: #475569; }
-  
+  .goals-hint { font-size: 0.9rem; margin-left: 0.25rem; opacity: 0.7; }
+
   .clock-display { display: flex; flex-direction: column; align-items: flex-start; gap: 0.25rem; }
   .time { font-size: 1.5rem; font-weight: bold; font-variant-numeric: tabular-nums; }
-  .status-badge { padding: 0.1rem 0.5rem; border-radius: 1rem; background: #475569; font-size: 0.75rem; font-weight: bold; letter-spacing: 1px;}
+  .status-badge { padding: 0.1rem 0.5rem; border-radius: 1rem; background: #475569; font-size: 0.75rem; font-weight: bold; letter-spacing: 1px; }
   .status-badge.live { background: #ef4444; color: white; animation: blink 2s infinite; }
-  
+  .status-badge.ended { background: #334155; color: #94a3b8; }
   @keyframes blink { 50% { opacity: 0.6; } }
 
-  .match-actions { display: flex; gap: 0.5rem; flex-wrap: wrap;}
-  button { border: none; padding: 0.75rem 1.25rem; border-radius: 0.5rem; font-weight: bold; cursor: pointer; color: white;}
+  .match-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center; }
+  .actions-row { display: flex; gap: 0.5rem; }
+  @media (max-width: 799px) {
+    .live-header { flex-direction: column; align-items: stretch; }
+    .match-actions { width: 100%; flex-direction: column; }
+    .actions-row { width: 100%; }
+    .actions-row > * { flex: 1; min-width: 0; }
+  }
+  button { border: none; padding: 0.75rem 1.25rem; border-radius: 0.5rem; font-weight: bold; cursor: pointer; color: white; }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
   .btn-live.start { background: #10b981; }
   .btn-live.stop { background: #f59e0b; }
   .btn-primary { background: #3b82f6; }
   .btn-secondary { background: #334155; }
+  .btn-end { background: #7f1d1d; color: #fca5a5; }
+  .btn-end:hover { background: #991b1b; }
+  .btn-reset { background: transparent; border: 1px solid #334155; color: #64748b; font-size: 0.85rem; padding: 0.5rem 0.75rem; }
+  .btn-reset:hover { background: #1e293b; color: #94a3b8; }
 
-  .layout-grid { 
-    display: flex;
-    flex-direction: column;
-    gap: 1rem;
-    height: calc(100vh - 200px); /* Account for match header */
+  /* ─── Pending subs bar ─── */
+  .pending-bar {
+    background: #1e3a5f; border: 1px solid #2563eb; border-radius: 0.6rem;
+    padding: 0.5rem 1rem; margin-bottom: 0.75rem;
+    display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem;
+    font-size: 0.85rem;
   }
+  .pending-label { color: #93c5fd; font-weight: 700; flex-shrink: 0; }
+  .pending-sep { color: #3b82f6; }
+  .pending-sub { display: inline-flex; align-items: center; gap: 0.15rem; }
+  .sub-in { color: #34d399; font-weight: 600; }
+  .sub-out { color: #f87171; font-weight: 600; }
+  .sub-arrow { color: #94a3b8; }
+  .sub-pos { color: #64748b; font-size: 0.8rem; }
 
-  .panel { 
-    background: #111827; 
-    border: 1px solid #334155; 
-    border-radius: 1rem; 
-    padding: 1rem; 
-    display: flex;
-    flex-direction: column;
-    overflow: hidden;
+  /* ─── Layout ─── */
+  .layout-grid {
+    display: flex; flex-direction: column; gap: 1rem;
+    height: calc(100vh - 100px);
   }
-
+  .panel {
+    background: #111827; border: 1px solid #334155; border-radius: 1rem;
+    padding: 1rem; display: flex; flex-direction: column; overflow: hidden;
+  }
   .pitch-panel { flex: 1.2; }
   .bench-panel { flex: 1; }
 
   h2 { margin-top: 0; font-size: 1rem; color: #cbd5e1; border-bottom: 1px solid #334155; padding-bottom: 0.5rem; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.75rem; }
 
-  .slots-container, .bench-container { 
-    overflow-y: auto; 
-    flex: 1;
-    padding-right: 0.25rem;
-    display: flex;
-    flex-direction: column;
-    gap: 0.5rem;
-  }
-
-  /* Custom Scrollbars */
-  .slots-container::-webkit-scrollbar, .bench-container::-webkit-scrollbar { width: 4px; }
-  .slots-container::-webkit-scrollbar-track, .bench-container::-webkit-scrollbar-track { background: #0f172a; }
-  .slots-container::-webkit-scrollbar-thumb, .bench-container::-webkit-scrollbar-thumb { background: #334155; border-radius: 2px; }
-
-  /* Compact grid for slots on mobile */
-  .slots-container {
-    display: grid;
-  }
-
-  .slot-card, .bench-card {
-    display: flex; align-items: center; gap: 0.5rem;
-    background: #1e293b; border: 2px solid transparent; border-radius: 0.5rem; padding: 0.5rem 0.75rem;
-    cursor: pointer; transition: all 0.1s;
-    min-height: 50px;
-  }
-  .slot-card.empty { border: 1px dashed #475569; background: #0f172a; }
-  .slot-card.selected, .bench-card.selected { border-color: #3b82f6; background: rgba(59, 130, 246, 0.15); box-shadow: 0 0 10px rgba(59, 130, 246, 0.3);}
-  
-  .pos-badge { background: #334155; padding: 0.1rem 0.4rem; border-radius: 0.25rem; font-weight: bold; font-size: 0.75rem; min-width: 40px; text-align: center; color: #94a3b8; }
-  
-  .player-info { display: flex; flex-direction: column; flex: 1; overflow: hidden; }
-  .player-name { font-size: 0.9rem; font-weight: 600; color: #f8fafc; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .player-time { font-size: 0.7rem; font-weight: 500; margin-top: 0.05rem;}
-  .active-color { color: #34d399; }
-  .bench-color { color: #94a3b8; }
-
-  .btn-remove { background: #7f1d1d; color: white; width: 22px; height: 22px; border-radius: 50%; padding: 0; font-size: 0.8rem; }
-
-  @media (min-width: 800px) { 
-    .layout-grid { display: grid; grid-template-columns: 1.5fr 1fr; height: auto; } 
-    .pitch-panel, .bench-panel { flex: none; height: auto; }
-    .slots-container, .bench-container { overflow-y: visible; height: auto; display: flex; flex-direction: column; }
-    .slots-container { display: flex; }
-    .panel { padding: 1.5rem; overflow: visible; }
-    h2 { font-size: 1.2rem; }
-    .player-name { font-size: 1.1rem; }
-    .player-time { font-size: 0.8rem; }
-    .pos-badge { font-size: 0.9rem; padding: 0.25rem 0.5rem; }
-    .btn-remove { width: 28px; height: 28px; font-size: 1rem; }
-  }
-
-  /* Pitch header with toggle */
-  .pitch-header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #334155; padding-bottom: 0.5rem; margin-bottom: 0.75rem; }
+  /* ─── Pitch panel ─── */
+  .pitch-header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #334155; padding-bottom: 0.5rem; margin-bottom: 0.75rem; gap: 0.5rem; flex-wrap: wrap; }
+  .lineup-label { font-size: 0.72rem; color: #64748b; margin-bottom: 0.5rem; font-style: italic; }
   .pitch-header h2 { margin: 0; border: none; padding: 0; }
+  .pitch-header-actions { display: flex; align-items: center; gap: 0.5rem; }
+  .lineup-select { background: #0f172a; border: 1px solid #334155; color: #cbd5e1; padding: 0.25rem 0.5rem; border-radius: 0.35rem; font-size: 0.78rem; cursor: pointer; outline: none; max-width: 130px; }
   .view-toggle { display: flex; background: #0f172a; border-radius: 0.4rem; padding: 0.15rem; }
   .view-toggle button { background: transparent; border: none; color: #64748b; padding: 0.25rem 0.6rem; border-radius: 0.3rem; cursor: pointer; font-size: 0.75rem; font-weight: 600; }
   .view-toggle button.active { background: #334155; color: #f8fafc; }
 
-  /* Field View */
-  .field-wrap { flex: 1; display: flex; justify-content: center; padding: 0.5rem 0; overflow: auto; }
+  .slots-container, .bench-container {
+    overflow-y: auto; flex: 1; padding-right: 0.25rem;
+    display: flex; flex-direction: column; gap: 0.5rem;
+  }
+  .slots-container::-webkit-scrollbar, .bench-container::-webkit-scrollbar { width: 4px; }
+  .slots-container::-webkit-scrollbar-thumb, .bench-container::-webkit-scrollbar-thumb { background: #334155; border-radius: 2px; }
+  .slots-container { display: grid; }
+
+  .slot-card, .bench-card {
+    display: flex; align-items: center; gap: 0.5rem;
+    background: #1e293b; border: 2px solid transparent; border-radius: 0.5rem;
+    padding: 0.5rem 0.75rem; cursor: pointer; transition: all 0.1s; min-height: 50px;
+  }
+  .bench-card { flex-direction: column; align-items: stretch; gap: 0.35rem; padding-bottom: 0.4rem; flex-shrink: 0; }
+  .bench-card-row { display: flex; align-items: center; gap: 0.5rem; }
+  .color-bar { display: flex; height: 5px; border-radius: 3px; overflow: hidden; background: #0f172a; }
+  .bar-seg { flex-shrink: 0; height: 100%; }
+  .slot-card.empty { border: 1px dashed #475569; background: #0f172a; }
+  .slot-card.selected, .bench-card.selected { border-color: #3b82f6; background: rgba(59,130,246,0.15); box-shadow: 0 0 10px rgba(59,130,246,0.3); }
+  .slot-card.has-pending { border-color: #f59e0b; background: rgba(245,158,11,0.08); }
+  .sub-name-in { color: #34d399; }
+  .sub-name-out { color: #f87171; text-decoration: line-through; opacity: 0.7; }
+
+  .pos-badge { background: #334155; padding: 0.1rem 0.4rem; border-radius: 0.25rem; font-weight: bold; font-size: 0.75rem; min-width: 40px; text-align: center; color: #94a3b8; }
+
+  .player-info { display: flex; flex-direction: column; flex: 1; overflow: hidden; }
+  .player-name { font-size: 0.9rem; font-weight: 600; color: #f8fafc; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .player-time { font-size: 0.7rem; font-weight: 500; margin-top: 0.05rem; }
+  .active-color { color: #34d399; }
+  .bench-color { color: #94a3b8; }
+
+  .btn-remove { background: #7f1d1d; color: white; width: 22px; height: 22px; border-radius: 50%; padding: 0; font-size: 0.8rem; flex-shrink: 0; }
+
+  /* ─── Bench / Players panel ─── */
+  .bench-header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #334155; padding-bottom: 0.5rem; margin-bottom: 0.75rem; gap: 0.5rem; flex-wrap: wrap; }
+  .bench-header h2 { margin: 0; border: none; padding: 0; }
+  .bench-header-controls { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+  .sort-select { background: #0f172a; border: 1px solid #334155; color: #cbd5e1; padding: 0.25rem 0.5rem; border-radius: 0.35rem; font-size: 0.78rem; cursor: pointer; outline: none; }
+  .bar-mode-toggle { display: flex; background: #0f172a; border-radius: 0.4rem; padding: 0.15rem; }
+  .bar-mode-toggle button { background: transparent; border: none; color: #64748b; padding: 0.2rem 0.5rem; border-radius: 0.3rem; cursor: pointer; font-size: 0.72rem; font-weight: 600; }
+  .bar-mode-toggle button.active { background: #334155; color: #f8fafc; }
+
+  .bench-card.on-field { background: #0f1f0f; border-color: #166534; cursor: default; opacity: 0.75; }
+  .bench-card.pending-in { border-color: #10b981; background: rgba(16,185,129,0.1); }
+  .bench-card.pending-out { border-color: #f87171; background: rgba(248,113,113,0.08); }
+
+  .sub-badge { font-size: 0.68rem; font-weight: 800; padding: 0.15rem 0.4rem; border-radius: 0.25rem; flex-shrink: 0; }
+  .sub-badge-in { background: #064e3b; color: #34d399; }
+  .sub-badge-out { background: #7f1d1d; color: #fca5a5; }
+  .field-dot { color: #166534; font-size: 0.7rem; flex-shrink: 0; }
+  .btn-player-info {
+    flex-shrink: 0; cursor: pointer;
+    width: 1.25rem; height: 1.25rem; border-radius: 50%;
+    border: 1.5px solid #60a5fa; color: #60a5fa;
+    font-size: 0.7rem; font-weight: 700; font-style: italic;
+    display: flex; align-items: center; justify-content: center;
+    line-height: 1; transition: background 0.15s, color 0.15s;
+  }
+  .btn-player-info:hover { background: #60a5fa; color: #0f172a; }
+
+  /* ─── Field view ─── */
+  .field-wrap { flex: 1; display: flex; justify-content: center; padding: 0.5rem 0; overflow: auto; max-height: 450px; }
   .field-container { position: relative; width: 100%; max-width: 280px; aspect-ratio: 2 / 3; background: #14532d; border: 2px solid rgba(255,255,255,0.4); border-radius: 6px; flex-shrink: 0; }
   .field-lines { position: absolute; inset: 0; pointer-events: none; }
   .field-lines::before { content: ''; position: absolute; top: 50%; left: 0; right: 0; height: 1px; background: rgba(255,255,255,0.4); }
@@ -552,21 +945,52 @@
   .field-node { width: 2.1rem; height: 2.1rem; border-radius: 50%; border: 2px solid rgba(255,255,255,0.3); display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 0.6rem; color: white; box-shadow: 0 2px 6px rgba(0,0,0,0.5); transition: all 0.15s; }
   .field-pos.selected .field-node { border-color: white; box-shadow: 0 0 0 3px rgba(59,130,246,0.8), 0 2px 6px rgba(0,0,0,0.5); transform: scale(1.15); }
   .field-pos.empty .field-node { background: #1e293b !important; border: 2px dashed #475569 !important; }
-  .field-node-label { font-size: 0.58rem; color: #f1f5f9; text-shadow: 0 1px 3px rgba(0,0,0,0.9); margin-top: 0.1rem; max-width: 3.5rem; text-align: center; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; line-height: 1.2; }
-  .field-node-time { font-size: 0.52rem; color: #34d399; font-weight: 700; line-height: 1.2; }
+  .field-node-label { font-size: 0.58rem; color: #f1f5f9; text-shadow: 0 1px 3px rgba(0,0,0,0.9); margin-top: 0.1rem; max-width: 3.5rem; text-align: center; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
 
+
+  /* ─── Wider screens ─── */
   @media (min-width: 800px) {
+    .layout-grid { display: grid; grid-template-columns: 1.5fr 1fr; height: auto; }
+    .pitch-panel, .bench-panel { flex: none; height: auto; }
+    .slots-container, .bench-container { overflow-y: visible; height: auto; display: flex; flex-direction: column; }
+    .slots-container { display: flex; }
+    .panel { padding: 1.5rem; overflow: visible; }
+    h2 { font-size: 1.2rem; }
+    .player-name { font-size: 1.1rem; }
+    .player-time { font-size: 0.8rem; }
+    .pos-badge { font-size: 0.9rem; padding: 0.25rem 0.5rem; }
+    .btn-remove { width: 28px; height: 28px; font-size: 1rem; }
     .field-container { max-width: 320px; }
     .field-node { width: 2.6rem; height: 2.6rem; font-size: 0.7rem; }
     .field-node-label { font-size: 0.65rem; max-width: 4.5rem; }
-    .field-node-time { font-size: 0.6rem; }
   }
 
-  /* Modal */
-  .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.8); display: flex; justify-content: center; align-items: center; z-index: 100;}
-  .modal-panel { background: #111827; padding: 2rem; border-radius: 1rem; border: 1px solid #334155; width: 100%; max-width: 400px; }
+  /* ─── Modals ─── */
+  .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.8); display: flex; justify-content: center; align-items: center; z-index: 100; }
+  .modal-panel { background: #111827; padding: 2rem; border-radius: 1rem; border: 1px solid #334155; width: 100%; max-width: 400px; max-height: 90vh; overflow-y: auto; }
   .form-group { display: flex; flex-direction: column; gap: 0.5rem; margin-bottom: 1rem; }
   .form-group label { color: #cbd5e1; font-size: 0.9rem; }
   .form-group select { background: #0f172a; border: 1px solid #334155; color: white; padding: 0.75rem; border-radius: 0.5rem; font-size: 1rem; outline: none; }
   .modal-actions { display: flex; justify-content: flex-end; gap: 1rem; margin-top: 1.5rem; }
+
+  /* Goals modal */
+  .goals-modal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.25rem; }
+  .goals-modal-header h2 { margin: 0; }
+  .score-display { font-family: monospace; font-size: 1.5rem; font-weight: bold; background: #000; padding: 0.25rem 0.75rem; border-radius: 0.4rem; }
+  .goals-list { display: flex; flex-direction: column; gap: 0.5rem; margin-bottom: 1rem; }
+  .goal-row { display: flex; align-items: center; gap: 0.75rem; background: #0f172a; padding: 0.6rem 0.85rem; border-radius: 0.5rem; border-left: 3px solid #334155; }
+  .goal-row.ours { border-left-color: #10b981; }
+  .goal-time { font-family: monospace; font-size: 0.85rem; color: #94a3b8; width: 2.5rem; flex-shrink: 0; }
+  .goal-icon { font-size: 1rem; flex-shrink: 0; }
+  .goal-detail { display: flex; flex-direction: column; gap: 0.1rem; }
+  .goal-type { font-weight: 600; color: #f8fafc; font-size: 0.9rem; }
+  .goal-player { color: #34d399; font-size: 0.85rem; }
+  .goal-assist { color: #64748b; font-size: 0.8rem; }
+  .goals-empty { color: #475569; text-align: center; padding: 1.5rem 0; margin: 0; }
+
+  /* ─── Player stats modal ─── */
+
+  /* ─── Timeline panel ─── */
+  .timeline-panel { margin-top: 1rem; }
+  .timeline-panel h2 { font-size: 1rem; color: #cbd5e1; border-bottom: 1px solid #334155; padding-bottom: 0.5rem; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.75rem; }
 </style>

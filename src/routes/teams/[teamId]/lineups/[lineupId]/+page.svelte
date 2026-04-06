@@ -2,7 +2,7 @@
   import { page } from '$app/stores';
   import { onMount } from 'svelte';
   import { beforeNavigate } from '$app/navigation';
-  import { doc, getDoc, updateDoc } from 'firebase/firestore';
+  import { doc, getDoc, updateDoc, collection, query, where, getDocs } from 'firebase/firestore';
   import { db } from '$lib/firebase/config';
   import { authStore } from '$lib/stores/authStore';
   import { getGroupColor } from '$lib/groupColors.js';
@@ -19,6 +19,9 @@
 
   let selectedItem = null; // { type: 'slot'|'bench', id: string }
   let pitchView = false;
+  let showCompareModal = false;
+  let otherLineups = []; // all saved lineups for this team except the current one
+  let selectedLineupIds = new Set();
 
   onMount(async () => {
     if ($authStore.user) {
@@ -54,6 +57,13 @@
 
       const formSnap = await getDoc(doc(db, 'formations', lineup.formationId));
       formation = formSnap.data();
+
+      const q = query(collection(db, 'lineups'), where('teamId', '==', teamId));
+      const lineupSnaps = await getDocs(q);
+      otherLineups = lineupSnaps.docs
+        .map(d => ({ id: d.id, ...d.data() }))
+        .filter(l => l.id !== lineupId);
+      selectedLineupIds = new Set(otherLineups.map(l => l.id));
     } catch (e) {
       console.error("Error loading data:", e);
     } finally {
@@ -130,6 +140,22 @@
   $: activePlayerIds = Object.values(lineup?.players || {}).filter(id => id !== null);
   $: benchPlayers = team?.roster.filter(p => !activePlayerIds.includes(p.id)) || [];
 
+  // Comparison: per-player appearance counts across selected lineups + current
+  $: selectedOtherLineups = otherLineups.filter(l => selectedLineupIds.has(l.id));
+  $: totalLineupCount = selectedOtherLineups.length + 1; // selected others + this one
+  $: playerAppearances = (team?.roster || []).map(player => {
+    const appearsIn = selectedOtherLineups.filter(l => Object.values(l.players || {}).includes(player.id));
+    const inCurrent = activePlayerIds.includes(player.id);
+    const count = appearsIn.length + (inCurrent ? 1 : 0);
+    return { ...player, count, appearsIn, inCurrent };
+  }).sort((a, b) => a.count - b.count || a.name.localeCompare(b.name));
+
+  function toggleLineup(id) {
+    if (selectedLineupIds.has(id)) selectedLineupIds.delete(id);
+    else selectedLineupIds.add(id);
+    selectedLineupIds = selectedLineupIds; // trigger reactivity
+  }
+
 </script>
 
 <svelte:head>
@@ -150,6 +176,7 @@
       </div>
       <div class="header-actions">
         <span class="save-status" class:unsaved={hasUnsavedChanges}>{saveStatus}</span>
+        <button class="btn-compare" on:click={() => showCompareModal = true}>Compare Lineups</button>
         <button class="btn-save" class:active={hasUnsavedChanges} on:click={saveLineup}>Save Changes</button>
       </div>
     </header>
@@ -258,6 +285,82 @@
   </div>
 {/if}
 
+<!-- COMPARE PLAYERS MODAL -->
+{#if showCompareModal}
+  <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+  <div class="modal-backdrop" on:click={() => showCompareModal = false}>
+    <div class="compare-modal" on:click|stopPropagation>
+      <div class="compare-modal-header">
+        <div>
+          <h2>Player Lineup Appearances</h2>
+          <p class="compare-subtitle">Sorted by fewest appearances · {totalLineupCount} lineup{totalLineupCount !== 1 ? 's' : ''} selected</p>
+        </div>
+        <button class="btn-close" on:click={() => showCompareModal = false}>✕</button>
+      </div>
+
+      {#if otherLineups.length > 0}
+        <div class="lineup-selector">
+          <div class="selector-row">
+            <span class="selector-label">Include lineups:</span>
+            <div class="selector-quick">
+              <button on:click={() => { selectedLineupIds = new Set(otherLineups.map(l => l.id)); }}>All</button>
+              <button on:click={() => { selectedLineupIds = new Set(); }}>None</button>
+            </div>
+          </div>
+          <div class="lineup-chips">
+            <span class="lineup-chip current-chip">{lineup.name}</span>
+            {#each otherLineups as l}
+              <button
+                class="lineup-chip"
+                class:selected={selectedLineupIds.has(l.id)}
+                on:click={() => toggleLineup(l.id)}
+              >{l.name}</button>
+            {/each}
+          </div>
+        </div>
+      {/if}
+
+      <div class="compare-list">
+        {#each playerAppearances as player}
+          <div class="compare-row" class:in-current={player.inCurrent}>
+            <div class="compare-player-info">
+              <span class="compare-num">#{player.number}</span>
+              <span class="compare-name">{player.name}</span>
+              {#if player.inCurrent}
+                <span class="current-tag">this lineup</span>
+              {/if}
+            </div>
+            <div class="compare-right">
+              <div class="compare-bar-wrap">
+                <div class="compare-bar-track">
+                  <div
+                    class="compare-bar-fill"
+                    class:full={player.count === totalLineupCount}
+                    style="width: {totalLineupCount > 0 ? (player.count / totalLineupCount) * 100 : 0}%"
+                  ></div>
+                </div>
+                <span class="compare-fraction">{player.count}/{totalLineupCount}</span>
+              </div>
+              {#if player.appearsIn.length > 0}
+                <div class="compare-lineup-names">
+                  {player.appearsIn.map(l => l.name).join(' · ')}
+                  {#if player.inCurrent} · {lineup.name}{/if}
+                </div>
+              {:else if player.inCurrent}
+                <div class="compare-lineup-names">{lineup.name}</div>
+              {/if}
+            </div>
+          </div>
+        {/each}
+
+        {#if playerAppearances.length === 0}
+          <p class="compare-empty">No players in roster.</p>
+        {/if}
+      </div>
+    </div>
+  </div>
+{/if}
+
 <style>
   .loading { padding: 3rem; text-align: center; color: #94a3b8; }
 
@@ -280,6 +383,10 @@
   .formation-name { font-size: 1rem; font-weight: 500; }
   
   .header-actions { display: flex; align-items: center; gap: 1rem; }
+  @media (max-width: 899px) {
+    .editor-header { flex-direction: column; align-items: stretch; }
+    .header-actions { width: 100%; justify-content: flex-end; }
+  }
   .save-status { color: #10b981; font-size: 0.85rem; font-style: italic; }
   .save-status.unsaved { color: #fbbf24; }
 
@@ -406,4 +513,54 @@
     .field-node { width: 2.6rem; height: 2.6rem; font-size: 0.7rem; }
     .field-node-label { font-size: 0.65rem; max-width: 4.5rem; }
   }
+
+  /* Compare button */
+  .btn-compare { background: #1e293b; border: 1px solid #334155; color: #cbd5e1; padding: 0.6rem 1rem; border-radius: 0.5rem; cursor: pointer; font-weight: 600; font-size: 0.9rem; transition: all 0.2s; }
+  .btn-compare:hover { background: #334155; }
+
+  /* Compare modal */
+  .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.75); display: flex; justify-content: center; align-items: center; z-index: 50; padding: 1rem; }
+  .compare-modal { background: #111827; border: 1px solid #334155; border-radius: 1rem; width: 100%; max-width: 560px; max-height: 85vh; display: flex; flex-direction: column; overflow: hidden; }
+
+  .compare-modal-header { display: flex; justify-content: space-between; align-items: flex-start; padding: 1.5rem 1.5rem 1rem; border-bottom: 1px solid #1e293b; flex-shrink: 0; }
+
+  /* Lineup selector */
+  .lineup-selector { padding: 0.85rem 1.5rem; border-bottom: 1px solid #1e293b; flex-shrink: 0; display: flex; flex-direction: column; gap: 0.5rem; }
+  .selector-row { display: flex; align-items: center; justify-content: space-between; }
+  .selector-label { font-size: 0.8rem; color: #64748b; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+  .selector-quick { display: flex; gap: 0.35rem; }
+  .selector-quick button { background: transparent; border: 1px solid #334155; color: #94a3b8; padding: 0.15rem 0.55rem; border-radius: 0.3rem; cursor: pointer; font-size: 0.75rem; font-weight: 600; }
+  .selector-quick button:hover { background: #1e293b; color: #f8fafc; }
+  .lineup-chips { display: flex; flex-wrap: wrap; gap: 0.4rem; }
+  .lineup-chip { background: #1e293b; border: 1px solid #334155; color: #64748b; padding: 0.25rem 0.65rem; border-radius: 1rem; font-size: 0.8rem; font-weight: 600; cursor: pointer; transition: all 0.15s; }
+  .lineup-chip.selected { background: #1e3a5f; border-color: #3b82f6; color: #93c5fd; }
+  .lineup-chip.current-chip { border-color: #1d4ed8; color: #93c5fd; background: #1e3a5f; cursor: default; }
+  .lineup-chip:not(.current-chip):hover { border-color: #475569; color: #cbd5e1; }
+  .compare-modal-header h2 { margin: 0 0 0.25rem 0; font-size: 1.15rem; color: #f8fafc; }
+  .compare-subtitle { margin: 0; font-size: 0.82rem; color: #64748b; }
+  .btn-close { background: transparent; border: none; color: #64748b; font-size: 1.1rem; cursor: pointer; padding: 0.25rem; line-height: 1; flex-shrink: 0; }
+  .btn-close:hover { color: #f8fafc; }
+
+  .compare-list { overflow-y: auto; padding: 0.75rem 1.5rem 1.5rem; display: flex; flex-direction: column; gap: 0.5rem; }
+  .compare-list::-webkit-scrollbar { width: 4px; }
+  .compare-list::-webkit-scrollbar-thumb { background: #334155; border-radius: 2px; }
+
+  .compare-row { background: #0f172a; border: 1px solid #1e293b; border-radius: 0.6rem; padding: 0.65rem 0.85rem; display: flex; flex-direction: column; gap: 0.35rem; transition: border-color 0.15s; }
+  .compare-row.in-current { border-color: #2563eb; background: rgba(37, 99, 235, 0.06); }
+
+  .compare-player-info { display: flex; align-items: center; gap: 0.5rem; }
+  .compare-num { color: #64748b; font-size: 0.8rem; font-weight: 700; width: 2rem; flex-shrink: 0; }
+  .compare-name { color: #f8fafc; font-weight: 600; font-size: 0.95rem; flex: 1; }
+  .current-tag { background: #1d4ed8; color: #bfdbfe; font-size: 0.7rem; font-weight: 700; padding: 0.1rem 0.45rem; border-radius: 1rem; text-transform: uppercase; letter-spacing: 0.04em; flex-shrink: 0; }
+
+  .compare-right { display: flex; flex-direction: column; gap: 0.2rem; }
+  .compare-bar-wrap { display: flex; align-items: center; gap: 0.6rem; }
+  .compare-bar-track { flex: 1; height: 6px; background: #1e293b; border-radius: 3px; overflow: hidden; }
+  .compare-bar-fill { height: 100%; background: #3b82f6; border-radius: 3px; transition: width 0.3s; min-width: 0; }
+  .compare-bar-fill.full { background: #10b981; }
+  .compare-fraction { font-size: 0.78rem; font-weight: 700; color: #94a3b8; width: 2.5rem; text-align: right; flex-shrink: 0; }
+
+  .compare-lineup-names { font-size: 0.75rem; color: #475569; padding-left: 0.1rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  .compare-empty { color: #475569; text-align: center; padding: 2rem; margin: 0; }
 </style>

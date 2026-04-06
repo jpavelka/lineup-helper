@@ -171,7 +171,9 @@
             {#each lineups as lineup}
               <div class="lineup-item">
                 <div class="lineup-info">
-                  <span class="lineup-name">{lineup.name}</span>
+                  <a href="/teams/{teamId}/lineups/{lineup.id}"  class="lineup-link">
+                    <span class="lineup-name">{lineup.name}</span>
+                  </a>
                   <span class="muted small">{lineup.formationName || 'Custom Formation'}</span>
                 </div>
                 <div class="lineup-actions">
@@ -409,7 +411,6 @@
 
   .lineup-name {
     font-weight: 600;
-    color: #f8fafc;
   }
 
   .lineup-actions {
@@ -646,4 +647,6 @@
     color: #64748b;
     text-align: center;
   }
+  .lineup-link { text-decoration: none; color: inherit; display: block; width: fit-content; }
+  .lineup-link:hover { color: #3b82f6; }
 </style>
