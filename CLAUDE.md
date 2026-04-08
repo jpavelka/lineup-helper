@@ -39,6 +39,9 @@ There are no tests configured in this project.
 
 **Firebase config** is in `src/lib/firebase/config.js` and exports `app`, `auth`, and `db`. The API key in that file is a Firebase client key (safe to be public per Firebase design).
 
-**Utilities:** `src/lib/utils.js` exports `generateUUID()` which wraps `crypto.randomUUID()` with a fallback.
+**Utilities:** `src/lib/utils.js` exports:
+- `generateUUID()` — wraps `crypto.randomUUID()` with a fallback
+- `computePositionStats(history, formation)` — computes per-player position and group time (in ms) from game history
+- `computePlayerTimelines(history, formation, roster)` — computes ordered timeline segments per player from game history
 
 **Styling:** No CSS framework — all styles are scoped per-component using Svelte's `<style>` blocks, with a dark theme (`#0f172a` background). Global styles are defined in `+layout.svelte`.

@@ -132,6 +132,11 @@
 
   function addPlayer() {
     if (!newPlayerName.trim()) return;
+    const trimmed = newPlayerName.trim().toLowerCase();
+    if ((team.roster || []).some(p => p.name.toLowerCase() === trimmed)) {
+      alert(`A player named "${newPlayerName.trim()}" is already on the roster.`);
+      return;
+    }
     const newPlayer = {
       id: generateUUID(),
       name: newPlayerName.trim(),
@@ -162,6 +167,11 @@
 
   function saveEdit(playerId) {
     if (!editName.trim()) return;
+    const trimmed = editName.trim().toLowerCase();
+    if (team.roster.some(p => p.id !== playerId && p.name.toLowerCase() === trimmed)) {
+      alert(`A player named "${editName.trim()}" is already on the roster.`);
+      return;
+    }
     team.roster = team.roster.map(p =>
       p.id === playerId ? { ...p, name: editName.trim(), number: editNumber.trim() || '-' } : p
     );
