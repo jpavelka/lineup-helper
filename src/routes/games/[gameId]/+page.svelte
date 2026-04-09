@@ -1,7 +1,8 @@
 <script>
   import { page } from '$app/stores';
   import { onMount } from 'svelte';
-  import { doc, getDoc, updateDoc, collection, getDocs, query, where } from 'firebase/firestore';
+  import { beforeNavigate } from '$app/navigation';
+  import { doc, getDoc, updateDoc, addDoc, collection, getDocs, query, where } from 'firebase/firestore';
   import { db } from '$lib/firebase/config';
   import { authStore } from '$lib/stores/authStore';
   import MatchTimeline from '$lib/components/MatchTimeline.svelte';
@@ -52,6 +53,7 @@
       if (!game.gameTimeStats) game.gameTimeStats = { totalMs: 0 };
       if (!game.availablePlayers) game.availablePlayers = [];
       if (!game.gamePlan) game.gamePlan = [];
+      if (!game.gamePlanFormationId) game.gamePlanFormationId = '';
 
       const teamSnap = await getDoc(doc(db, 'teams', game.teamId));
       if (teamSnap.exists()) team = { id: teamSnap.id, ...teamSnap.data() };
@@ -70,11 +72,26 @@
       const lineupsSnap = await getDocs(query(collection(db, 'lineups'), where('teamId', '==', game.teamId)));
       savedLineups = lineupsSnap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0) || a.name.localeCompare(b.name));
 
+      // Migrate old gamePlan format: { lineupId, durationMins } → { durationMins, players, formationId }
+      game.gamePlan = (game.gamePlan || []).map(step => {
+        if (step.lineupId !== undefined && !step.players) {
+          const lu = savedLineups.find(l => l.id === step.lineupId);
+          return { durationMins: step.durationMins, players: { ...(lu?.players ?? {}) }, formationId: step.formationId ?? game.gamePlanFormationId ?? null };
+        }
+        if (!step.players) step.players = {};
+        if (step.formationId === undefined) step.formationId = game.gamePlanFormationId ?? null;
+        return step;
+      });
+
       // Pre-populate formation from team default if not already set on this game
       if (!game.formationId && team?.defaultFormationId) {
         game.formationId = team.defaultFormationId;
         await updateDoc(doc(db, 'games', gameId), { formationId: game.formationId });
       }
+
+      // Snapshot the loaded game plan so we can revert to it
+      savedGamePlanSnapshot = JSON.parse(JSON.stringify(game.gamePlan));
+      savedGamePlanFormationSnapshot = game.gamePlanFormationId;
 
     } catch (error) {
       console.error(error);
@@ -82,6 +99,12 @@
       loading = false;
     }
   }
+
+  beforeNavigate(({ cancel }) => {
+    if (gamePlanDirty && !confirm('You have unsaved changes to the Game Plan. Leave without saving?')) {
+      cancel();
+    }
+  });
 
   function openEditModal() {
     editingGame = {
@@ -133,22 +156,172 @@
   }
 
   // --- Game Plan ---
+  let gamePlanDirty = false;
+  let savedGamePlanSnapshot = null;      // deep copy of last-saved gamePlan
+  let savedGamePlanFormationSnapshot = null;
+
+  function markGamePlanDirty() { gamePlanDirty = true; }
+
   async function saveGamePlan() {
     try {
-      await updateDoc(doc(db, 'games', gameId), { gamePlan: game.gamePlan });
+      await updateDoc(doc(db, 'games', gameId), {
+        gamePlan: game.gamePlan,
+        gamePlanFormationId: game.gamePlanFormationId || null
+      });
+      savedGamePlanSnapshot = JSON.parse(JSON.stringify(game.gamePlan));
+      savedGamePlanFormationSnapshot = game.gamePlanFormationId;
+      gamePlanDirty = false;
     } catch (err) {
       console.error('Error saving game plan:', err);
     }
   }
 
+  function revertGamePlan() {
+    game.gamePlan = JSON.parse(JSON.stringify(savedGamePlanSnapshot));
+    game.gamePlanFormationId = savedGamePlanFormationSnapshot;
+    gamePlanDirty = false;
+  }
+
   function addPlanStep() {
-    game.gamePlan = [...game.gamePlan, { lineupId: savedLineups[0]?.id ?? null, durationMins: 20 }];
-    saveGamePlan();
+    const lastStep = game.gamePlan[game.gamePlan.length - 1];
+    const formationId = lastStep?.formationId ?? game.gamePlanFormationId ?? null;
+    game.gamePlan = [...game.gamePlan, { durationMins: 20, players: {}, formationId }];
+    markGamePlanDirty();
+  }
+
+  // --- Save step as lineup modal ---
+  let showSaveLineupModal = false;
+  let saveLineupStepIdx = null;
+  let saveLineupName = '';
+  let saveLineupConflict = null;
+
+  function openSaveLineupModal(stepIdx) {
+    saveLineupStepIdx = stepIdx;
+    saveLineupName = game.gamePlan[stepIdx].name || '';
+    saveLineupConflict = null;
+    showSaveLineupModal = true;
+  }
+
+  async function confirmSaveLineup(overwrite = false) {
+    const name = saveLineupName.trim();
+    if (!name) return;
+    const existing = savedLineups.find(l => l.name === name);
+    if (existing && !overwrite) { saveLineupConflict = existing; return; }
+    const step = game.gamePlan[saveLineupStepIdx];
+    const players = { ...(step.players ?? {}) };
+    try {
+      if (existing && overwrite) {
+        await updateDoc(doc(db, 'lineups', existing.id), { name, players });
+        savedLineups = savedLineups.map(l => l.id === existing.id ? { ...l, name, players } : l);
+      } else {
+        const nextSortOrder = savedLineups.reduce((max, l) => Math.max(max, l.sortOrder ?? 0), -1) + 1;
+        const ref = await addDoc(collection(db, 'lineups'), {
+          name, teamId: game.teamId,
+          formationId: game.gamePlanFormationId,
+          formationName: planFormation?.name ?? '',
+          players, ownerId: $authStore.user.uid,
+          sortOrder: nextSortOrder
+        });
+        savedLineups = [...savedLineups, { id: ref.id, name, teamId: game.teamId, formationId: game.gamePlanFormationId, players, sortOrder: nextSortOrder }];
+      }
+      showSaveLineupModal = false;
+      saveLineupConflict = null;
+    } catch (err) {
+      console.error('Error saving lineup:', err);
+    }
+  }
+
+  function importLineupToStep(stepIdx, lineupId) {
+    if (!lineupId) return;
+    const lu = savedLineups.find(l => l.id === lineupId);
+    if (!lu) return;
+    game.gamePlan[stepIdx].players = { ...lu.players };
+    game.gamePlan = [...game.gamePlan];
+    markGamePlanDirty();
+  }
+
+  // --- Cell autocomplete ---
+  let activeCell = null; // { stepIdx, posId }
+  let cellInputVal = '';
+  let cellHighlightIdx = 0;
+  let dropdownPos = { top: 0, left: 0, width: 0 };
+
+  $: cellFilteredPlayers = (() => {
+    if (!activeCell) return [];
+    const { stepIdx, posId } = activeCell;
+    const step = game.gamePlan[stepIdx];
+    const usedIds = new Set(
+      Object.entries(step?.players ?? {})
+        .filter(([pid]) => pid !== posId)
+        .map(([, playerId]) => playerId)
+    );
+    const q = cellInputVal.trim().toLowerCase();
+    return availableRoster.filter(p =>
+      !usedIds.has(p.id) && (!q || p.name.toLowerCase().includes(q))
+    );
+  })();
+
+  function autoFocus(node) {
+    setTimeout(() => { node.focus(); node.select(); }, 0);
+    return {};
+  }
+
+  function openCell(stepIdx, posId, e) {
+    if (game.status === 'completed') return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    dropdownPos = { top: rect.bottom, left: rect.left, width: Math.max(rect.width, 140) };
+    const currentPlayerId = game.gamePlan[stepIdx]?.players?.[posId];
+    activeCell = { stepIdx, posId };
+    cellInputVal = currentPlayerId ? getPlayerName(currentPlayerId) : '';
+    cellHighlightIdx = 0;
+  }
+
+  function closeCell() {
+    activeCell = null;
+    cellInputVal = '';
+    cellHighlightIdx = 0;
+  }
+
+  function selectCellPlayer(playerId) {
+    if (!activeCell) return;
+    const { stepIdx, posId } = activeCell;
+    const step = game.gamePlan[stepIdx];
+    if (!step.players) step.players = {};
+    if (playerId) step.players[posId] = playerId;
+    else delete step.players[posId];
+    game.gamePlan = [...game.gamePlan];
+    markGamePlanDirty();
+    closeCell();
+  }
+
+  function onCellKeydown(e) {
+    const len = cellFilteredPlayers.length;
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      cellHighlightIdx = Math.min(cellHighlightIdx + 1, len - 1);
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      cellHighlightIdx = Math.max(cellHighlightIdx - 1, 0);
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      if (len > 0) selectCellPlayer(cellFilteredPlayers[cellHighlightIdx]?.id ?? cellFilteredPlayers[0].id);
+      else if (!cellInputVal.trim()) selectCellPlayer(null);
+      else closeCell();
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      closeCell();
+    } else if (e.key === 'Tab') {
+      closeCell();
+    }
+  }
+
+  function onCellBlur() {
+    setTimeout(closeCell, 120);
   }
 
   function removePlanStep(i) {
     game.gamePlan = game.gamePlan.filter((_, idx) => idx !== i);
-    saveGamePlan();
+    markGamePlanDirty();
   }
 
   function movePlanStep(i, dir) {
@@ -157,27 +330,28 @@
     if (j < 0 || j >= arr.length) return;
     [arr[i], arr[j]] = [arr[j], arr[i]];
     game.gamePlan = arr;
-    saveGamePlan();
+    markGamePlanDirty();
   }
 
-  $: totalPlanMins = (game?.gamePlan || []).reduce((sum, s) => sum + (Number(s.durationMins) || 0), 0);
+  $: totalPlanMins = (game?.gamePlan || []).reduce((sum, s) => s.included !== false ? sum + (Number(s.durationMins) || 0) : sum, 0);
   $: isPreGame = game?.status !== 'live' && game?.status !== 'completed';
 
   // Planned per-player stats derived from game plan steps
   $: playerPlan = (() => {
     if (!availableRoster.length) return [];
-    const posMap = {};
-    (gameFormation?.positions || []).forEach(p => { posMap[p.id] = p; });
     const stats = {};
     availableRoster.forEach(p => { stats[p.id] = { activeMs: 0, benchMs: 0, positionMs: {}, groupMs: {} }; });
     for (const step of (game?.gamePlan || [])) {
-      const lu = savedLineups.find(l => l.id === step.lineupId);
-      if (!lu) continue;
+      if (step.included === false) continue;
       const ms = (Number(step.durationMins) || 0) * 60 * 1000;
       if (ms <= 0) continue;
+      const stepFormation = formations.find(f => f.id === (step.formationId ?? null)) ?? null;
+      const posMap = {};
+      (stepFormation?.positions || []).forEach(p => { posMap[p.id] = p; });
+      const players = step.players || {};
       availableRoster.forEach(player => {
         const s = stats[player.id];
-        const posId = Object.keys(lu.players || {}).find(k => lu.players[k] === player.id);
+        const posId = Object.keys(players).find(k => players[k] === player.id);
         if (posId) {
           s.activeMs += ms;
           s.positionMs[posId] = (s.positionMs[posId] || 0) + ms;
@@ -195,19 +369,20 @@
 
   $: playerPlanTimelines = (() => {
     if (!availableRoster.length) return {};
-    const posMap = {};
-    (gameFormation?.positions || []).forEach(p => { posMap[p.id] = p; });
     const timelines = {};
     availableRoster.forEach(p => { timelines[p.id] = []; });
     let curMs = 0;
     for (const step of (game?.gamePlan || [])) {
-      const lu = savedLineups.find(l => l.id === step.lineupId);
-      if (!lu) continue;
+      if (step.included === false) continue;
       const ms = (Number(step.durationMins) || 0) * 60 * 1000;
       if (ms <= 0) continue;
+      const stepFormation = formations.find(f => f.id === (step.formationId ?? null)) ?? null;
+      const posMap = {};
+      (stepFormation?.positions || []).forEach(p => { posMap[p.id] = p; });
+      const players = step.players || {};
       const segEnd = curMs + ms;
       availableRoster.forEach(player => {
-        const posId = Object.keys(lu.players || {}).find(k => lu.players[k] === player.id);
+        const posId = Object.keys(players).find(k => players[k] === player.id);
         const group = posId ? (posMap[posId]?.group ?? null) : null;
         timelines[player.id].push({ startMs: curMs, endMs: segEnd, group: posId ? group : null });
       });
@@ -235,6 +410,30 @@
   $: sortedHistory = [...(game?.history || [])].sort((a, b) => a.timestamp - b.timestamp);
 
   $: gameFormation = formations.find(f => f.id === game?.formationId) ?? null;
+
+  // Build a flat column sequence: insert a 'pos' column before step 0 and before any step
+  // whose formation differs from the previous step's formation.
+  // Each step col carries a reference to its owning posCol for efficient block lookup.
+  $: planColumns = (() => {
+    const cols = [];
+    let lastFormId = '__none__';
+    let currentPosCol = null;
+    for (let i = 0; i < (game?.gamePlan?.length ?? 0); i++) {
+      const step = game.gamePlan[i];
+      const fid = step.formationId ?? null;
+      if (fid !== lastFormId) {
+        currentPosCol = { type: 'pos', formation: formations.find(f => f.id === fid) ?? null };
+        cols.push(currentPosCol);
+        lastFormId = fid;
+      }
+      cols.push({ type: 'step', step, idx: i, posCol: currentPosCol });
+    }
+    return cols;
+  })();
+
+  // For the player plan stats modal: use the formation of the first step
+  $: planFormation = formations.find(f => f.id === (game?.gamePlan?.[0]?.formationId ?? null)) ?? null;
+  $: maxPlanRows = planColumns.filter(c => c.type === 'pos').reduce((max, c) => Math.max(max, c.formation?.positions?.length ?? 0), 0);
   $: availableRoster = (team?.roster || []).filter(p => game?.availablePlayers?.includes(p.id));
   $: positionStats = computePositionStats(game?.history || [], gameFormation);
   $: playerTimelines = computePlayerTimelines(game?.history || [], gameFormation, availableRoster);
@@ -380,63 +579,174 @@
     <div class="panel game-plan-panel">
       <div class="panel-title-row">
         <h2>Game Plan</h2>
-        {#if game.status !== 'completed' && savedLineups.length > 0}
-          <button class="btn-toggle" on:click={addPlanStep}>+ Add Step</button>
-        {/if}
+        <div class="plan-header-controls">
+          {#if game.status !== 'completed'}
+            <button class="btn-toggle" on:click={addPlanStep}>+ Add Step</button>
+          {/if}
+          {#if gamePlanDirty}
+            <div class="plan-dirty-actions">
+              <button class="btn-toggle" on:click={revertGamePlan}>Revert</button>
+              <button class="btn-primary plan-save-action" on:click={saveGamePlan}>Save</button>
+            </div>
+          {/if}
+        </div>
       </div>
 
-      {#if savedLineups.length === 0}
-        <p class="text-muted small">No saved lineups for this team yet.</p>
-      {:else if !game.gamePlan?.length}
-        <p class="text-muted small">No game plan yet. Add steps to schedule your lineup rotations.</p>
+      {#if !game.gamePlan?.length}
+        <p class="text-muted small">No steps yet. Add a step to start planning your rotations.</p>
       {:else}
-        <div class="plan-list">
-          {#each game.gamePlan as step, i}
-            {@const lineupName = savedLineups.find(l => l.id === step.lineupId)?.name ?? 'Unknown Lineup'}
-            <div class="plan-step">
-              <span class="step-num">{i + 1}</span>
-              {#if game.status !== 'completed'}
-                <select class="plan-select" bind:value={step.lineupId} on:change={saveGamePlan}>
-                  {#each savedLineups as l}
-                    <option value={l.id}>{l.name}</option>
+        {@const stepCols = planColumns.filter(c => c.type === 'step')}
+        <div class="plan-grid-wrap">
+          <table class="plan-grid">
+            <!-- HEADER ROW -->
+            <thead>
+              <tr>
+                {#each planColumns as col, i}
+                  {#if col.type === 'pos'}
+                    <th class="plan-pos-th" class:plan-pos-th-sep={i === 0}>
+                      <span class="plan-seg-form-ro">{col.formation?.name ?? '?'}</span>
+                    </th>
+                  {:else}
+                    {@const { step, idx } = col}
+                    <th class="plan-step-th">
+                      <div class="plan-step-hdr">
+                        {#if game.status !== 'completed'}
+                          <input class="plan-step-name-input" type="text" value={step.name ?? ''}
+                            on:input={(e) => { game.gamePlan[idx].name = e.target.value; markGamePlanDirty(); }}
+                            placeholder="Lineup {idx + 1}" />
+                          <div class="plan-dur-row">
+                            <input class="plan-dur-input" type="number" min="1" max="120"
+                              value={step.durationMins}
+                              on:input={(e) => { game.gamePlan[idx].durationMins = Number(e.target.value); markGamePlanDirty(); }} />
+                            <span class="plan-dur-label">min</span>
+                          </div>
+                          <!-- svelte-ignore a11y-no-onchange -->
+                          <select class="load-lineup-sel"
+                            value={step.formationId ?? ''}
+                            on:change={(e) => {
+                              game.gamePlan[idx].formationId = e.target.value || null;
+                              game.gamePlan = [...game.gamePlan];
+                              markGamePlanDirty();
+                            }}>
+                            <option value="">-- Formation --</option>
+                            {#each formations as f}
+                              <option value={f.id}>{f.name}</option>
+                            {/each}
+                          </select>
+                          {#if savedLineups.length > 0}
+                            <!-- svelte-ignore a11y-no-onchange -->
+                            <select class="load-lineup-sel"
+                              on:change={(e) => { if (e.target.value) { importLineupToStep(idx, e.target.value); e.target.value = ''; } }}>
+                              <option value="">Load lineup...</option>
+                              {#each savedLineups as l}
+                                <option value={l.id}>{l.name}</option>
+                              {/each}
+                            </select>
+                          {/if}
+                          <div class="plan-step-actions">
+                            <button class="plan-mv-btn" on:click={() => movePlanStep(idx, -1)} disabled={idx === 0}>←</button>
+                            <button class="plan-mv-btn" on:click={() => movePlanStep(idx, 1)} disabled={idx === game.gamePlan.length - 1}>→</button>
+                            <button class="plan-mv-btn" title="Save as lineup" on:click={() => openSaveLineupModal(idx)}>
+                              <svg width="11" height="11" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M2 1a1 1 0 0 0-1 1v12a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V4.414L11.586 1H2zm9 1.5V5H5V2.5h6zM5 9h6v4H5V9zm1 1v2h1v-2H6zm3 0v2h1v-2H9z"/></svg>
+                            </button>
+                            <button class="plan-remove" on:click={() => removePlanStep(idx)}>×</button>
+                          </div>
+                        {:else}
+                          <span class="plan-step-name-ro">{step.name || `Lineup ${idx + 1}`}</span>
+                          <span class="plan-dur-ro">{step.durationMins} min</span>
+                        {/if}
+                      </div>
+                    </th>
+                  {/if}
+                {/each}
+              </tr>
+            </thead>
+
+            <!-- BODY: single tbody, one row per position slot index across all formations -->
+            <tbody>
+              {#each {length: maxPlanRows} as _, rowIdx}
+                <tr>
+                  {#each planColumns as col}
+                    {#if col.type === 'pos'}
+                      {@const pos = col.formation?.positions?.[rowIdx]}
+                      {#if pos}
+                        {@const posColor = getGroupColor(pos.group)}
+                        <td class="plan-pos-td" style="border-left: 3px solid {posColor.bg};">{pos.name}</td>
+                      {:else}
+                        <td class="plan-pos-td plan-pos-empty-cell"></td>
+                      {/if}
+                    {:else}
+                      {@const { step, idx } = col}
+                      {@const pos = col.posCol?.formation?.positions?.[rowIdx]}
+                      {#if pos}
+                        {@const thisPlayer = step.players?.[pos.id] ?? ''}
+                        {@const prevStepPlayers = idx > 0 ? (game.gamePlan[idx - 1].players ?? {}) : null}
+                        {@const prevPlayer = prevStepPlayers ? (prevStepPlayers[pos.id] ?? '') : null}
+                        {@const playerChanged = prevStepPlayers !== null && thisPlayer !== prevPlayer}
+                        {@const playerSubOn = playerChanged && !!thisPlayer && !Object.values(prevStepPlayers).includes(thisPlayer)}
+                        {@const playerSwitched = playerChanged && !!thisPlayer && Object.values(prevStepPlayers).includes(thisPlayer)}
+                        <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-noninteractive-element-interactions -->
+                        <td class="plan-cell" class:plan-cell-subon={playerSubOn} class:plan-cell-switched={playerSwitched}
+                          on:click={(e) => openCell(idx, pos.id, e)}>
+                          {#if activeCell?.stepIdx === idx && activeCell?.posId === pos.id}
+                            <input class="plan-cell-input" use:autoFocus
+                              bind:value={cellInputVal}
+                              on:input={() => cellHighlightIdx = 0}
+                              on:keydown={onCellKeydown}
+                              on:blur={onCellBlur} />
+                          {:else if game.status !== 'completed'}
+                            <span class="plan-cell-val" class:plan-player-subon={playerSubOn} class:plan-player-switched={playerSwitched}>
+                              {thisPlayer ? getPlayerName(thisPlayer) : ''}
+                            </span>
+                          {:else}
+                            <span class="plan-player-ro" class:plan-player-subon={playerSubOn} class:plan-player-switched={playerSwitched}>
+                              {thisPlayer ? getPlayerName(thisPlayer) : '--'}
+                            </span>
+                          {/if}
+                        </td>
+                      {:else}
+                        <td class="plan-cell plan-cell-oos"></td>
+                      {/if}
+                    {/if}
                   {/each}
-                </select>
-                <input class="plan-duration" type="number" min="1" max="120" bind:value={step.durationMins} on:blur={saveGamePlan} />
-                <span class="plan-mins-label">min</span>
-                <div class="plan-reorder">
-                  <button on:click={() => movePlanStep(i, -1)} disabled={i === 0}>↑</button>
-                  <button on:click={() => movePlanStep(i, 1)} disabled={i === game.gamePlan.length - 1}>↓</button>
-                </div>
-                <button class="plan-remove" on:click={() => removePlanStep(i)}>×</button>
-              {:else}
-                <span class="plan-name-readonly">{lineupName}</span>
-                <span class="plan-duration-readonly">{step.durationMins} min</span>
-              {/if}
-            </div>
-          {/each}
+                </tr>
+              {/each}
+            </tbody>
+
+            <!-- FOOTER: include toggles -->
+            <tfoot>
+              <tr>
+                {#each planColumns as col}
+                  {#if col.type === 'pos'}
+                    <td class="plan-pos-td"></td>
+                  {:else}
+                    {@const { step, idx } = col}
+                    <td class="plan-cell">
+                      <button
+                        class="plan-include-btn"
+                        class:plan-include-off={step.included === false}
+                        title={step.included === false ? 'Excluded from time calculations' : 'Included in time calculations'}
+                        on:click={() => {
+                          game.gamePlan[idx].included = game.gamePlan[idx].included === false ? true : false;
+                          game.gamePlan = [...game.gamePlan];
+                          markGamePlanDirty();
+                        }}>
+                        {step.included === false ? 'excluded' : 'included'}
+                      </button>
+                    </td>
+                  {/if}
+                {/each}
+              </tr>
+            </tfoot>
+          </table>
         </div>
-        <div class="plan-total">Total: <strong>{totalPlanMins} min</strong></div>
+        <div class="plan-grand-total">Grand total: <strong>{totalPlanMins} min</strong></div>
       {/if}
-    </div>
 
-    <!-- Bottom Section: Stats & Timeline -->
-    <div class="stats-grid" class:stats-grid-single={isPreGame}>
-
-      <!-- Pre-game: Player Plan | In/post-game: Player Stats -->
-      <div class="panel">
-        {#if isPreGame}
-          <!-- Player Plan -->
-          <div class="panel-title-row">
-            <h2>Player Plan</h2>
-            <div class="panel-title-right">
-              {#if game.status !== 'completed'}
-                <button class="btn-toggle" on:click={() => editingAvailability = !editingAvailability}>
-                  {editingAvailability ? 'Done' : 'Edit Availability'}
-                </button>
-              {/if}
-            </div>
-          </div>
-          <div class="plan-controls">
+      {#if isPreGame}
+        <!-- Player Plan (folded into Game Plan panel) -->
+        <div class="player-plan-section">
+          <div class="plan-controls" style="margin-top: 1.25rem;">
             <div class="bar-mode-toggle">
               <button class:active={planSort === 'name'} on:click={() => planSort = 'name'}>A–Z</button>
               <button class:active={planSort === 'time'} on:click={() => planSort = 'time'}>Time</button>
@@ -444,6 +754,13 @@
             <div class="bar-mode-toggle">
               <button class:active={planBarMode === 'grouped'} on:click={() => planBarMode = 'grouped'}>Grouped</button>
               <button class:active={planBarMode === 'timeline'} on:click={() => planBarMode = 'timeline'}>Timeline</button>
+            </div>
+            <div style="margin-left: auto;">
+              {#if game.status !== 'completed'}
+                <button class="btn-toggle" on:click={() => editingAvailability = !editingAvailability}>
+                  {editingAvailability ? 'Done' : 'Edit Availability'}
+                </button>
+              {/if}
             </div>
           </div>
 
@@ -468,7 +785,7 @@
           {:else if !game.gamePlan?.length}
             <p class="text-muted small">Add steps to the Game Plan above to see planned minutes here.</p>
           {:else}
-            <div class="table-container stats-panel-scroll">
+            <div class="table-container">
               <table class="stats-table">
                 <thead>
                   <tr>
@@ -521,8 +838,14 @@
               </table>
             </div>
           {/if}
+        </div>
+      {/if}
+    </div>
 
-        {:else}
+    <!-- Bottom Section: Stats & Timeline (live/completed only) -->
+    {#if !isPreGame}
+    <div class="stats-grid">
+      <div class="panel">
           <!-- Player Stats (live / completed) -->
           <div class="panel-title-row">
             <h2>Player Stats</h2>
@@ -617,27 +940,45 @@
               </table>
             </div>
           {/if}
-        {/if}
       </div>
 
-      <!-- Match Timeline (hidden pre-game) -->
-      {#if !isPreGame}
-        <div class="panel">
-          <h2>Match Timeline</h2>
-          <div class="stats-panel-scroll">
-            <MatchTimeline
-              history={game.history}
-              roster={team?.roster || []}
-              {gameId}
-              formation={gameFormation}
-              allowEditing={true}
-              on:updated={(e) => { game.history = e.detail; }}
-            />
-          </div>
+      <!-- Match Timeline -->
+      <div class="panel">
+        <h2>Match Timeline</h2>
+        <div class="stats-panel-scroll">
+          <MatchTimeline
+            history={game.history}
+            roster={team?.roster || []}
+            {gameId}
+            formation={gameFormation}
+            allowEditing={true}
+            on:updated={(e) => { game.history = e.detail; }}
+          />
         </div>
-      {/if}
+      </div>
 
     </div>
+    {/if}
+  </div>
+{/if}
+
+<!-- CELL AUTOCOMPLETE DROPDOWN -->
+{#if activeCell}
+  <div class="plan-dropdown" style="top:{dropdownPos.top}px;left:{dropdownPos.left}px;width:{dropdownPos.width}px;">
+    {#if !cellInputVal.trim() && game.gamePlan[activeCell.stepIdx]?.players?.[activeCell.posId]}
+      <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+      <div class="plan-drop-item plan-drop-clear" on:mousedown|preventDefault={() => selectCellPlayer(null)}>— clear —</div>
+    {/if}
+    {#each cellFilteredPlayers as player, j}
+      <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+      <div class="plan-drop-item" class:plan-drop-hi={j === cellHighlightIdx}
+        on:mousedown|preventDefault={() => selectCellPlayer(player.id)}>
+        {player.name}
+      </div>
+    {/each}
+    {#if cellFilteredPlayers.length === 0 && cellInputVal.trim()}
+      <div class="plan-drop-empty">No match</div>
+    {/if}
   </div>
 {/if}
 
@@ -665,9 +1006,38 @@
     positionStats={{ positionMs: pp.positionMs ?? {}, groupMs: pp.groupMs ?? {} }}
     timelineSegments={playerPlanTimelines[planStatsModalPlayer.id] ?? []}
     totalGameMs={totalPlanMs}
-    formation={gameFormation}
+    formation={planFormation}
     on:close={() => showPlanStatsModal = false}
   />
+{/if}
+
+<!-- SAVE LINEUP MODAL -->
+{#if showSaveLineupModal}
+  <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+  <div class="modal-backdrop" on:click={() => { showSaveLineupModal = false; saveLineupConflict = null; }}>
+    <div class="modal-panel" on:click|stopPropagation>
+      <h2>Save as Lineup</h2>
+      {#if saveLineupConflict}
+        <p class="text-muted small" style="margin-bottom:1rem;">
+          A lineup named <strong style="color:#f8fafc;">"{saveLineupConflict.name}"</strong> already exists.
+          Overwrite it, or go back and choose a different name.
+        </p>
+        <div class="modal-actions">
+          <button class="btn-secondary" on:click={() => saveLineupConflict = null}>Choose Different Name</button>
+          <button class="btn-primary" on:click={() => confirmSaveLineup(true)}>Overwrite</button>
+        </div>
+      {:else}
+        <div class="form-group">
+          <label for="save-lineup-name">Lineup Name</label>
+          <input id="save-lineup-name" type="text" bind:value={saveLineupName} placeholder="e.g. First Half" />
+        </div>
+        <div class="modal-actions">
+          <button class="btn-secondary" on:click={() => showSaveLineupModal = false}>Cancel</button>
+          <button class="btn-primary" disabled={!saveLineupName.trim()} on:click={() => confirmSaveLineup(false)}>Save</button>
+        </div>
+      {/if}
+    </div>
+  </div>
 {/if}
 
 <!-- EDIT GAME DETAILS MODAL -->
@@ -728,11 +1098,12 @@
 
   .grid-layout, .stats-grid { display: grid; grid-template-columns: 1fr; gap: 1.5rem; margin-bottom: 1.5rem;}
   @media (min-width: 800px) { .grid-layout, .stats-grid { grid-template-columns: 1fr 1fr; align-items: start;} }
-  @media (min-width: 800px) { .stats-grid-single { grid-template-columns: 1fr; } }
 
   @media (max-width: 799px) {
     .stats-panel-scroll { max-height: 340px; overflow-y: auto; }
   }
+
+  .player-plan-section { border-top: 1px solid #1e293b; padding-top: 0.25rem; }
 
   .panel { background: #111827; border: 1px solid #334155; border-radius: 1rem; padding: 1.5rem; }
   h2 { margin-top: 0; color: #e2e8f0; border-bottom: 1px solid #1e293b; padding-bottom: 0.75rem; margin-bottom: 1rem;}
@@ -767,7 +1138,7 @@
   .stats-table { width: 100%; border-collapse: collapse; color: #e2e8f0; font-size: 0.95rem;}
   .stats-table th { color: #94a3b8; font-weight: 600; padding: 0.75rem 0.5rem; border-bottom: 2px solid #334155; text-align: left;}
   .stats-table th.text-right { text-align: right; }
-  .stats-table td { padding: 0.75rem 0.5rem; border-bottom: 1px solid #1e293b; }
+  .stats-table td { padding: 0.15rem 0.5rem; border-bottom: 1px solid #1e293b; }
   .stats-table tr:last-child td { border-bottom: none; }
   .bar-row td { padding: 0; border-bottom: 1px solid #1e293b; }
   .bar-cell { padding: 0 0.5rem 0.35rem !important; }
@@ -818,28 +1189,103 @@
 
   /* Game Plan */
   .game-plan-panel { margin-bottom: 1.5rem; }
-  .plan-list { display: flex; flex-direction: column; gap: 0.5rem; margin-bottom: 0.75rem; }
-  .plan-step {
-    display: flex; align-items: center; gap: 0.5rem;
-    background: #0f172a; border: 1px solid #1e293b; border-radius: 0.5rem;
-    padding: 0.5rem 0.75rem; flex-wrap: wrap;
+  .plan-header-controls { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; }
+  .plan-dirty-actions { display: flex; gap: 0.4rem; align-items: center; }
+  .plan-save-action { padding: 0.35rem 0.85rem; font-size: 0.85rem; border-radius: 0.5rem; }
+
+  .plan-grid-wrap { overflow-x: auto; margin-bottom: 0.75rem; }
+  .plan-grid { border-collapse: collapse; font-size: 0.88rem; color: #e2e8f0; width: max-content; min-width: 100%; }
+
+  .plan-pos-th-sep { border-left: 2px solid #334155; }
+  .plan-pos-empty { border-left: 2px solid #334155; background: transparent; padding: 0; }
+  .plan-cell-oos { background: #0a0f1a; cursor: default; border-left: 2px solid #334155; }
+  .plan-cell-oos:hover { background: #0a0f1a; }
+
+  .plan-pos-th {
+    text-align: left; color: #94a3b8; font-weight: 600;
+    padding: 0.5rem 0.5rem; border-bottom: 2px solid #334155;
+    min-width: 6rem; vertical-align: bottom;
   }
-  .step-num { color: #475569; font-size: 0.8rem; font-weight: 700; min-width: 1.2rem; }
-  .plan-select { flex: 1; min-width: 0; background: #1e293b; border: 1px solid #334155; color: #f8fafc; padding: 0.4rem 0.5rem; border-radius: 0.4rem; font-size: 0.9rem; outline: none; }
-  .plan-select:focus { border-color: #3b82f6; }
-  .plan-duration { width: 3.5rem; background: #1e293b; border: 1px solid #334155; color: #f8fafc; padding: 0.4rem 0.5rem; border-radius: 0.4rem; font-size: 0.9rem; text-align: right; outline: none; }
-  .plan-duration:focus { border-color: #3b82f6; }
-  .plan-mins-label { color: #64748b; font-size: 0.8rem; }
-  .plan-reorder { display: flex; gap: 0.2rem; }
-  .plan-reorder button { background: #1e293b; border: 1px solid #334155; color: #94a3b8; width: 1.6rem; height: 1.6rem; border-radius: 0.3rem; cursor: pointer; font-size: 0.75rem; padding: 0; display: flex; align-items: center; justify-content: center; }
-  .plan-reorder button:disabled { opacity: 0.3; cursor: not-allowed; }
-  .plan-reorder button:not(:disabled):hover { background: #334155; }
-  .plan-remove { background: transparent; border: none; color: #ef4444; font-size: 1.1rem; cursor: pointer; padding: 0 0.2rem; line-height: 1; opacity: 0.7; }
+  .plan-seg-form-sel { background: #0f172a; border: 1px solid #334155; color: #f8fafc; padding: 0.25rem 0.4rem; border-radius: 0.35rem; font-size: 0.78rem; outline: none; width: 100%; }
+  .plan-seg-form-sel:focus { border-color: #3b82f6; }
+  .plan-seg-form-ro { color: #94a3b8; font-size: 0.82rem; font-weight: 600; }
+  .plan-no-form { color: #475569; font-size: 0.8rem; font-style: italic; text-align: center; padding: 0.5rem; }
+  .plan-step-th {
+    border-bottom: 2px solid #334155;
+    padding: 0.4rem 0.35rem;
+    min-width: 6.5rem;
+    vertical-align: top;
+  }
+  .plan-step-hdr { display: flex; flex-direction: column; gap: 0.3rem; align-items: flex-start; }
+  .plan-step-name-input {
+    width: 100%; background: transparent; border: none; border-bottom: 1px solid #334155;
+    color: #f8fafc; font-size: 0.82rem; font-weight: 600; font-family: inherit;
+    padding: 0.1rem 0; outline: none;
+  }
+  .plan-step-name-input:focus { border-bottom-color: #3b82f6; }
+  .plan-step-name-input::placeholder { color: #475569; font-weight: 400; }
+  .plan-step-name-ro { color: #f8fafc; font-size: 0.82rem; font-weight: 600; display: block; }
+  .plan-dur-row { display: flex; align-items: center; gap: 0.3rem; }
+  .plan-dur-input { width: 3.2rem; background: #0f172a; border: 1px solid #334155; color: #f8fafc; padding: 0.25rem 0.4rem; border-radius: 0.35rem; font-size: 0.85rem; text-align: right; outline: none; }
+  .plan-dur-input:focus { border-color: #3b82f6; }
+  .plan-dur-label { color: #64748b; font-size: 0.8rem; }
+  .plan-dur-ro { color: #94a3b8; font-size: 0.82rem; }
+  .load-lineup-sel { background: #0f172a; border: 1px solid #334155; color: #94a3b8; padding: 0.2rem 0.4rem; border-radius: 0.35rem; font-size: 0.78rem; outline: none; width: 100%; }
+  .load-lineup-sel:focus { border-color: #3b82f6; }
+  .plan-step-actions { display: flex; gap: 0.2rem; align-items: center; }
+  .plan-mv-btn { background: #1e293b; border: 1px solid #334155; color: #94a3b8; width: 1.5rem; height: 1.5rem; border-radius: 0.3rem; cursor: pointer; font-size: 0.75rem; padding: 0; display: flex; align-items: center; justify-content: center; }
+  .plan-mv-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+  .plan-mv-btn:not(:disabled):hover { background: #334155; }
+  .plan-remove { background: transparent; border: none; color: #ef4444; font-size: 1.1rem; cursor: pointer; padding: 0 0.15rem; line-height: 1; opacity: 0.7; }
   .plan-remove:hover { opacity: 1; }
-  .plan-name-readonly { flex: 1; color: #f8fafc; font-size: 0.9rem; font-weight: 500; }
-  .plan-duration-readonly { color: #94a3b8; font-size: 0.85rem; font-family: monospace; }
-  .plan-total { text-align: right; color: #94a3b8; font-size: 0.85rem; }
-  .plan-total strong { color: #f8fafc; }
+
+  .plan-pos-td {
+    color: #cbd5e1; font-size: 0.88rem; padding: 0.45rem 0.75rem;
+    border-bottom: 1px solid #1e293b; white-space: nowrap;
+    position: sticky; left: 0; background: #111827; z-index: 1;
+  }
+  .plan-cell { padding: 0.2rem 0.4rem; border-bottom: 1px solid #1e293b; cursor: pointer; }
+  .plan-cell:hover { background: #1e293b; }
+  .plan-cell-subon { background: rgba(52, 211, 153, 0.08); }
+  .plan-cell-subon:hover { background: rgba(52, 211, 153, 0.14); }
+  .plan-cell-switched { background: rgba(245, 158, 11, 0.08); }
+  .plan-cell-switched:hover { background: rgba(245, 158, 11, 0.14); }
+  .plan-cell-val { display: block; font-size: 0.85rem; color: #e2e8f0; padding: 0.2rem 0.15rem; min-height: 1.4rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .plan-player-subon { color: #34d399; }
+  .plan-player-switched { color: #f59e0b; }
+  .plan-player-ro { color: #94a3b8; font-size: 0.85rem; }
+  .plan-cell-input {
+    width: 100%; background: transparent; border: none; outline: none;
+    color: #f8fafc; font-size: 0.85rem; font-family: inherit;
+    padding: 0.2rem 0.15rem; min-height: 1.4rem;
+  }
+
+  .plan-dropdown {
+    position: fixed; z-index: 1000;
+    background: #111827; border: 1px solid #334155; border-radius: 0.4rem;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+    max-height: 220px; overflow-y: auto;
+    margin-top: 2px;
+  }
+  .plan-drop-item {
+    padding: 0.4rem 0.75rem; font-size: 0.88rem; color: #e2e8f0;
+    cursor: pointer; white-space: nowrap;
+  }
+  .plan-drop-item:hover, .plan-drop-hi { background: #1e293b; }
+  .plan-drop-clear { color: #475569; font-style: italic; }
+  .plan-drop-empty { padding: 0.4rem 0.75rem; font-size: 0.85rem; color: #475569; }
+
+  .plan-include-btn {
+    width: 100%; background: #0f172a; border: 1px solid #334155;
+    color: #34d399; font-size: 0.7rem; font-weight: 600;
+    padding: 0.15rem 0.3rem; border-radius: 0.3rem; cursor: pointer;
+    text-align: center; transition: background 0.15s, color 0.15s;
+  }
+  .plan-include-btn:hover { background: #1e293b; }
+  .plan-include-btn.plan-include-off { color: #475569; border-color: #1e293b; }
+
+  .plan-grand-total { text-align: right; color: #94a3b8; font-size: 0.85rem; }
+  .plan-grand-total strong { color: #f8fafc; }
 
   /* Roster checklist (availability editing) */
   .roster-checklist {

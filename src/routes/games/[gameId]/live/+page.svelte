@@ -34,6 +34,7 @@
   // --- Preset lineup tracking ---
   let appliedLineupId = null;  // which saved lineup is currently on the field
   let pendingLineupId = null;  // which saved lineup the pending local lineup came from
+  let pendingPlanStepName = null; // name of plan step loaded into pending lineup
 
   // --- Game plan navigation ---
   let planStepIndex = null; // null = not following plan; number = current step index
@@ -142,9 +143,9 @@
 
   $: lineupLabel = (() => {
     const appliedName = appliedLineupId ? savedLineups.find(l => l.id === appliedLineupId)?.name ?? null : null;
-    const pendingName = pendingLineupId ? savedLineups.find(l => l.id === pendingLineupId)?.name ?? null : null;
+    const pendingName = pendingPlanStepName ?? (pendingLineupId ? savedLineups.find(l => l.id === pendingLineupId)?.name ?? null : null);
     if (!appliedName && !pendingName) return null;
-    if (appliedLineupId === pendingLineupId) return appliedName ?? 'manual lineup';
+    if (appliedName === pendingName) return appliedName ?? 'manual lineup';
     return `${appliedName ?? 'manual lineup'} → ${pendingName ?? 'manual lineup'}`;
   })();
 
@@ -306,6 +307,7 @@
     }
     lineup = newLineup;
     pendingLineupId = lineupId;
+    pendingPlanStepName = null;
     if (missingCount > 0) {
       showToast(`${missingCount} player${missingCount > 1 ? 's' : ''} from "${saved.name}" ${missingCount > 1 ? 'are' : 'is'} not available — ${missingCount > 1 ? 'their positions were' : 'their position was'} left empty.`);
     }
@@ -314,7 +316,25 @@
   function loadPlanStep(i) {
     if (i < 0 || i >= (game?.gamePlan?.length ?? 0)) return;
     planStepIndex = i;
-    loadSavedLineup(game.gamePlan[i].lineupId);
+    const step = game.gamePlan[i];
+    const stepName = step.name || `Lineup ${i + 1}`;
+    const availableIds = new Set(availableRoster.map(p => p.id));
+    const newLineup = {};
+    let missingCount = 0;
+    for (const [posId, playerId] of Object.entries(step.players || {})) {
+      if (availableIds.has(playerId)) {
+        newLineup[posId] = playerId;
+      } else {
+        newLineup[posId] = null;
+        if (playerId) missingCount++;
+      }
+    }
+    lineup = newLineup;
+    pendingLineupId = null;
+    pendingPlanStepName = stepName;
+    if (missingCount > 0) {
+      showToast(`${missingCount} player${missingCount > 1 ? 's' : ''} from "${stepName}" ${missingCount > 1 ? 'are' : 'is'} not available — ${missingCount > 1 ? 'their positions were' : 'their position was'} left empty.`);
+    }
   }
 
   // --- Sub / Swap Logic ---
@@ -518,15 +538,13 @@
       <span class="plan-nav-label">Game Plan</span>
       <div class="plan-steps">
         {#each game.gamePlan as step, i}
-          {@const name = savedLineups.find(l => l.id === step.lineupId)?.name ?? '?'}
+          {@const name = step.name || `Lineup ${i + 1}`}
           <button
             class="plan-step-chip"
             class:active={planStepIndex === i}
-            class:applied={planStepIndex === i && pendingLineupId === step.lineupId}
             on:click={() => loadPlanStep(i)}
             title="{name} · {step.durationMins} min"
           >
-            <span class="chip-num">{i + 1}</span>
             <span class="chip-name">{name}</span>
             <span class="chip-dur">{step.durationMins}′</span>
           </button>
