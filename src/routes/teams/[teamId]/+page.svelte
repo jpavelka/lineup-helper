@@ -239,6 +239,8 @@
           </select>
         </div>
         <a href="/teams/{teamId}/schedule" class="btn-primary">View Schedule</a>
+        <a href="/teams/{teamId}/stats" class="btn-primary">Season Stats</a>
+        <a href="/teams/{teamId}/playingTime" class="btn-primary">Playing Time</a>
       </div>
     </header>
 
