@@ -7,7 +7,7 @@
   import { authStore } from '$lib/stores/authStore';
   import MatchTimeline from '$lib/components/MatchTimeline.svelte';
   import PlayerStatsModal from '$lib/components/PlayerStatsModal.svelte';
-  import { computePositionStats, computePlayerTimelines } from '$lib/utils.js';
+  import { computePositionStats, computePlayerTimelines, generateUUID } from '$lib/utils.js';
   import { getGroupColor } from '$lib/groupColors.js';
 
   const gameId = $page.params.gameId;
@@ -22,12 +22,18 @@
   let editingGame = null;
   let showPlayerStatsModal = false;
   let statsModalPlayer = null;
-  let statsBarMode = 'grouped'; // 'grouped' | 'timeline'
-  let planBarMode = 'grouped'; // 'grouped' | 'timeline'
+  let statsBarMode = 'timeline'; // 'grouped' | 'timeline'
+  let planBarMode = 'timeline'; // 'grouped' | 'timeline'
   let planSort = 'name'; // 'name' | 'time'
   let showPlanStatsModal = false;
   let planStatsModalPlayer = null;
   let savedLineups = [];
+
+  // --- Player picker modal (mobile long-press / desktop right-click) ---
+  let showPickerModal = false;
+  let pickerCell = null; // { stepIdx, posId, posName }
+  let longPressTimer = null;
+  let longPressTriggered = false;
 
   const HA_LABELS = { home: '🏠 Home', away: '✈️ Away', neutral: '⚖️ Neutral', 'n/a': 'N/A' };
 
@@ -54,9 +60,13 @@
       if (!game.availablePlayers) game.availablePlayers = [];
       if (!game.gamePlan) game.gamePlan = [];
       if (!game.gamePlanFormationId) game.gamePlanFormationId = '';
-
       const teamSnap = await getDoc(doc(db, 'teams', game.teamId));
       if (teamSnap.exists()) team = { id: teamSnap.id, ...teamSnap.data() };
+
+      if (game.playersOnField == null && team?.defaultPlayersOnField != null) {
+        game.playersOnField = team.defaultPlayersOnField;
+        await updateDoc(doc(db, 'games', gameId), { playersOnField: game.playersOnField });
+      }
 
       // Filter by ownerId and ensure name exists
       const q = query(
@@ -72,16 +82,32 @@
       const lineupsSnap = await getDocs(query(collection(db, 'lineups'), where('teamId', '==', game.teamId)));
       savedLineups = lineupsSnap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0) || a.name.localeCompare(b.name));
 
-      // Migrate old gamePlan format: { lineupId, durationMins } → { durationMins, players, formationId }
-      game.gamePlan = (game.gamePlan || []).map(step => {
-        if (step.lineupId !== undefined && !step.players) {
-          const lu = savedLineups.find(l => l.id === step.lineupId);
-          return { durationMins: step.durationMins, players: { ...(lu?.players ?? {}) }, formationId: step.formationId ?? game.gamePlanFormationId ?? null };
-        }
-        if (!step.players) step.players = {};
-        if (step.formationId === undefined) step.formationId = game.gamePlanFormationId ?? null;
-        return step;
-      });
+      // Migrate old gamePlan step format: { lineupId, durationMins } → { durationMins, players, formationId }
+      function migrateSteps(steps) {
+        return (steps || []).map(step => {
+          if (step.lineupId !== undefined && !step.players) {
+            const lu = savedLineups.find(l => l.id === step.lineupId);
+            return { durationMins: step.durationMins, players: { ...(lu?.players ?? {}) }, formationId: step.formationId ?? game.gamePlanFormationId ?? null };
+          }
+          if (!step.players) step.players = {};
+          if (step.formationId === undefined) step.formationId = game.gamePlanFormationId ?? null;
+          return step;
+        });
+      }
+
+      // Multi-plan migration: promote legacy single gamePlan into gamePlans array
+      if (game.gamePlans?.length) {
+        planMeta = game.gamePlans.map(({ id, name }) => ({ id, name }));
+        allPlanSteps = Object.fromEntries(game.gamePlans.map(p => [p.id, migrateSteps(p.steps)]));
+        activePlanId = game.activePlanId ?? planMeta[0]?.id ?? null;
+      } else {
+        const id = generateUUID();
+        planMeta = [{ id, name: 'Plan A' }];
+        allPlanSteps = { [id]: migrateSteps(game.gamePlan) };
+        activePlanId = id;
+      }
+      selectedPlanId = activePlanId;
+      game.gamePlan = JSON.parse(JSON.stringify(allPlanSteps[selectedPlanId] ?? []));
 
       // Pre-populate formation from team default if not already set on this game
       if (!game.formationId && team?.defaultFormationId) {
@@ -89,9 +115,10 @@
         await updateDoc(doc(db, 'games', gameId), { formationId: game.formationId });
       }
 
-      // Snapshot the loaded game plan so we can revert to it
-      savedGamePlanSnapshot = JSON.parse(JSON.stringify(game.gamePlan));
-      savedGamePlanFormationSnapshot = game.gamePlanFormationId;
+      // Snapshots for revert
+      savedPlanMetaSnapshot = JSON.parse(JSON.stringify(planMeta));
+      savedPlanStepsSnapshot = JSON.parse(JSON.stringify(allPlanSteps));
+      savedActivePlanIdSnapshot = activePlanId;
 
     } catch (error) {
       console.error(error);
@@ -146,7 +173,7 @@
       await updateDoc(doc(db, 'games', gameId), {
         preNotes: game.preNotes,
         postNotes: game.postNotes,
-        formationId: game.formationId || null
+        playersOnField: game.playersOnField ?? null
       });
       saveStatus = 'Saved.';
       setTimeout(() => saveStatus = '', 2000);
@@ -155,21 +182,33 @@
     }
   }
 
-  // --- Game Plan ---
+  // --- Game Plan (multi-plan) ---
   let gamePlanDirty = false;
-  let savedGamePlanSnapshot = null;      // deep copy of last-saved gamePlan
-  let savedGamePlanFormationSnapshot = null;
+  let planMeta = [];            // [{ id, name }] — ordered list of plans
+  let allPlanSteps = {};        // { planId: steps[] } — in-memory steps for every plan
+  let selectedPlanId = null;    // which plan tab is currently open
+  let activePlanId = null;      // which plan feeds the live tracker
+  let savedPlanMetaSnapshot = [];
+  let savedPlanStepsSnapshot = {};
+  let savedActivePlanIdSnapshot = null;
 
   function markGamePlanDirty() { gamePlanDirty = true; }
 
   async function saveGamePlan() {
+    // Stash current view before saving
+    allPlanSteps[selectedPlanId] = JSON.parse(JSON.stringify(game.gamePlan));
+    const gamePlans = planMeta.map(m => ({ id: m.id, name: m.name, steps: allPlanSteps[m.id] ?? [] }));
+    const activeSteps = allPlanSteps[activePlanId] ?? [];
     try {
       await updateDoc(doc(db, 'games', gameId), {
-        gamePlan: game.gamePlan,
+        gamePlans,
+        activePlanId,
+        gamePlan: activeSteps,          // kept in sync for the live tracker
         gamePlanFormationId: game.gamePlanFormationId || null
       });
-      savedGamePlanSnapshot = JSON.parse(JSON.stringify(game.gamePlan));
-      savedGamePlanFormationSnapshot = game.gamePlanFormationId;
+      savedPlanMetaSnapshot = JSON.parse(JSON.stringify(planMeta));
+      savedPlanStepsSnapshot = JSON.parse(JSON.stringify(allPlanSteps));
+      savedActivePlanIdSnapshot = activePlanId;
       gamePlanDirty = false;
     } catch (err) {
       console.error('Error saving game plan:', err);
@@ -177,9 +216,96 @@
   }
 
   function revertGamePlan() {
-    game.gamePlan = JSON.parse(JSON.stringify(savedGamePlanSnapshot));
-    game.gamePlanFormationId = savedGamePlanFormationSnapshot;
+    planMeta = JSON.parse(JSON.stringify(savedPlanMetaSnapshot));
+    allPlanSteps = JSON.parse(JSON.stringify(savedPlanStepsSnapshot));
+    activePlanId = savedActivePlanIdSnapshot;
+    // If the selected plan was added after last save, fall back to active
+    if (!allPlanSteps[selectedPlanId]) selectedPlanId = activePlanId;
+    game.gamePlan = JSON.parse(JSON.stringify(allPlanSteps[selectedPlanId] ?? []));
     gamePlanDirty = false;
+  }
+
+  function switchToPlan(planId) {
+    if (planId === selectedPlanId) return;
+    allPlanSteps[selectedPlanId] = JSON.parse(JSON.stringify(game.gamePlan));
+    selectedPlanId = planId;
+    game.gamePlan = JSON.parse(JSON.stringify(allPlanSteps[planId] ?? []));
+  }
+
+  let showAddPlanModal = false;
+
+  function addGamePlan() {
+    showAddPlanModal = true;
+  }
+
+  function confirmAddGamePlan(copyFromId = null) {
+    showAddPlanModal = false;
+    const letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+    const name = `Plan ${letters[planMeta.length] ?? planMeta.length + 1}`;
+    const id = generateUUID();
+    // Stash current view so the copy source is up-to-date
+    allPlanSteps[selectedPlanId] = JSON.parse(JSON.stringify(game.gamePlan));
+    allPlanSteps[id] = copyFromId ? JSON.parse(JSON.stringify(allPlanSteps[copyFromId] ?? [])) : [];
+    planMeta = [...planMeta, { id, name }];
+    switchToPlan(id);
+    markGamePlanDirty();
+  }
+
+  function deleteCurrentPlan() {
+    if (planMeta.length <= 1) return;
+    const deletingId = selectedPlanId;
+    const newMeta = planMeta.filter(p => p.id !== deletingId);
+    delete allPlanSteps[deletingId];
+    planMeta = newMeta;
+    if (activePlanId === deletingId) activePlanId = newMeta[0].id;
+    selectedPlanId = activePlanId;
+    game.gamePlan = JSON.parse(JSON.stringify(allPlanSteps[selectedPlanId] ?? []));
+    markGamePlanDirty();
+  }
+
+  function setActivePlan(planId) {
+    activePlanId = planId;
+    markGamePlanDirty();
+  }
+
+  function renamePlan(planId, newName) {
+    planMeta = planMeta.map(p => p.id === planId ? { ...p, name: newName } : p);
+    markGamePlanDirty();
+  }
+
+  function remapStepPlayers(idx, newFormationId) {
+    const step = game.gamePlan[idx];
+    const oldFormation = formations.find(f => f.id === (step.formationId ?? null)) ?? null;
+    const newFormation = formations.find(f => f.id === (newFormationId ?? null)) ?? null;
+
+    const oldPosNameMap = {};
+    (oldFormation?.positions || []).forEach(p => { oldPosNameMap[p.id] = p.name; });
+
+    const playerOldPosName = {};
+    for (const [posId, playerId] of Object.entries(step.players || {})) {
+      if (playerId) playerOldPosName[playerId] = oldPosNameMap[posId];
+    }
+
+    const onFieldPlayers = Object.values(step.players || {}).filter(id => id);
+    const newPositions = newFormation?.positions || [];
+    const newPlayers = {};
+    const usedPlayers = new Set();
+    const filledPositions = new Set();
+
+    for (const newPos of newPositions) {
+      const match = onFieldPlayers.find(pid => !usedPlayers.has(pid) && playerOldPosName[pid] === newPos.name);
+      if (match) {
+        newPlayers[newPos.id] = match;
+        usedPlayers.add(match);
+        filledPositions.add(newPos.id);
+      }
+    }
+
+    const unmatched = onFieldPlayers.filter(pid => !usedPlayers.has(pid));
+    const emptySlots = newPositions.filter(p => !filledPositions.has(p.id));
+    unmatched.forEach((pid, i) => { if (i < emptySlots.length) newPlayers[emptySlots[i].id] = pid; });
+
+    game.gamePlan[idx].players = newPlayers;
   }
 
   function addPlanStep() {
@@ -240,8 +366,9 @@
     markGamePlanDirty();
   }
 
-  // --- Cell autocomplete ---
-  let activeCell = null; // { stepIdx, posId }
+  // --- Cell nav + edit modes ---
+  let navCell = null;    // { stepIdx, posId } — keyboard-navigable highlight
+  let activeCell = null; // { stepIdx, posId } — edit mode (input + dropdown)
   let cellInputVal = '';
   let cellHighlightIdx = 0;
   let dropdownPos = { top: 0, left: 0, width: 0 };
@@ -250,33 +377,113 @@
     if (!activeCell) return [];
     const { stepIdx, posId } = activeCell;
     const step = game.gamePlan[stepIdx];
-    const usedIds = new Set(
-      Object.entries(step?.players ?? {})
-        .filter(([pid]) => pid !== posId)
-        .map(([, playerId]) => playerId)
-    );
+    const stepFormation = formations.find(f => f.id === (step?.formationId ?? null)) ?? null;
+    const posNameMap = {};
+    (stepFormation?.positions || []).forEach(p => { posNameMap[p.id] = p.name; });
+    // Map playerId → position name for players already assigned elsewhere in this step
+    const playerCurrentPos = {};
+    Object.entries(step?.players ?? {}).forEach(([pid, playerId]) => {
+      if (pid !== posId && playerId) playerCurrentPos[playerId] = posNameMap[pid] ?? null;
+    });
     const q = cellInputVal.trim().toLowerCase();
-    return availableRoster.filter(p =>
-      !usedIds.has(p.id) && (!q || p.name.toLowerCase().includes(q))
-    );
+    return availableRoster
+      .filter(p => !q || p.name.toLowerCase().includes(q))
+      .map(p => ({ ...p, currentPosName: playerCurrentPos[p.id] ?? null }));
   })();
 
+  $: pickerPlayers = (() => {
+    if (!pickerCell) return [];
+    const { stepIdx, posId } = pickerCell;
+    const step = game?.gamePlan?.[stepIdx];
+    const stepFormation = formations.find(f => f.id === (step?.formationId ?? null)) ?? null;
+    const posNameMap = {};
+    const posGroupMap = {};
+    (stepFormation?.positions || []).forEach(p => { posNameMap[p.id] = p.name; posGroupMap[p.id] = p.group ?? null; });
+    const playerCurrentPos = {};
+    const playerCurrentGroup = {};
+    Object.entries(step?.players ?? {}).forEach(([pid, playerId]) => {
+      if (pid !== posId && playerId) {
+        playerCurrentPos[playerId] = posNameMap[pid] ?? null;
+        playerCurrentGroup[playerId] = posGroupMap[pid] ?? null;
+      }
+    });
+    return availableRoster.map(p => ({ ...p, currentPosName: playerCurrentPos[p.id] ?? null, currentPosGroup: playerCurrentGroup[p.id] ?? null }));
+  })();
+
+  function openPickerModal(stepIdx, posId, posName) {
+    if (game.status === 'completed') return;
+    pickerCell = { stepIdx, posId, posName };
+    showPickerModal = true;
+  }
+
+  function closePickerModal() {
+    showPickerModal = false;
+    pickerCell = null;
+  }
+
+  function pickerSelectPlayer(playerId) {
+    if (!pickerCell) return;
+    const { stepIdx, posId } = pickerCell;
+    activeCell = { stepIdx, posId };
+    selectCellPlayer(playerId);
+    closePickerModal();
+  }
+
+  function onCellTouchStart(stepIdx, posId, posName) {
+    longPressTriggered = false;
+    longPressTimer = setTimeout(() => {
+      longPressTriggered = true;
+      openPickerModal(stepIdx, posId, posName);
+    }, 500);
+  }
+
+  function onCellTouchEnd() {
+    clearTimeout(longPressTimer);
+    longPressTimer = null;
+  }
+
   function autoFocus(node) {
-    setTimeout(() => { node.focus(); node.select(); }, 0);
+    setTimeout(() => {
+      node.focus();
+      if (!cellInputVal) {
+        node.select();
+      } else {
+        const len = node.value.length;
+        node.setSelectionRange(len, len);
+      }
+    }, 0);
     return {};
   }
 
-  function openCell(stepIdx, posId, e) {
+  // Click a cell: first click → nav mode; click already-nav cell → edit mode
+  function clickCell(stepIdx, posId, e) {
+    if (longPressTriggered) { longPressTriggered = false; return; }
     if (game.status === 'completed') return;
-    const rect = e.currentTarget.getBoundingClientRect();
+    if (navCell?.stepIdx === stepIdx && navCell?.posId === posId && !activeCell) {
+      openEditCell(stepIdx, posId, e.currentTarget, true);
+    } else {
+      navCell = { stepIdx, posId };
+      closeEditMode();
+    }
+  }
+
+  function openEditCell(stepIdx, posId, element, clearInput = false) {
+    const rect = element.getBoundingClientRect();
     dropdownPos = { top: rect.bottom, left: rect.left, width: Math.max(rect.width, 140) };
     const currentPlayerId = game.gamePlan[stepIdx]?.players?.[posId];
     activeCell = { stepIdx, posId };
-    cellInputVal = currentPlayerId ? getPlayerName(currentPlayerId) : '';
+    cellInputVal = clearInput ? '' : (currentPlayerId ? getPlayerName(currentPlayerId) : '');
     cellHighlightIdx = 0;
   }
 
-  function closeCell() {
+  function closeEditMode() {
+    activeCell = null;
+    cellInputVal = '';
+    cellHighlightIdx = 0;
+  }
+
+  function closeAllModes() {
+    navCell = null;
     activeCell = null;
     cellInputVal = '';
     cellHighlightIdx = 0;
@@ -287,36 +494,166 @@
     const { stepIdx, posId } = activeCell;
     const step = game.gamePlan[stepIdx];
     if (!step.players) step.players = {};
-    if (playerId) step.players[posId] = playerId;
-    else delete step.players[posId];
+    if (playerId) {
+      // Remove the player from any other position they currently occupy in this step
+      for (const [pid, pid2] of Object.entries(step.players)) {
+        if (pid !== posId && pid2 === playerId) delete step.players[pid];
+      }
+      step.players[posId] = playerId;
+    } else {
+      delete step.players[posId];
+    }
     game.gamePlan = [...game.gamePlan];
     markGamePlanDirty();
-    closeCell();
+    // Return to nav mode on the same cell after selecting
+    navCell = { stepIdx, posId };
+    closeEditMode();
   }
+
+  function scrollDropdownToHighlight() {
+    setTimeout(() => {
+      const dropdown = document.querySelector('.plan-dropdown');
+      if (!dropdown) return;
+      const item = dropdown.querySelector('.plan-drop-hi');
+      if (!item) return;
+      const itemTop = item.offsetTop;
+      const itemBottom = itemTop + item.offsetHeight;
+      if (itemBottom > dropdown.scrollTop + dropdown.clientHeight) {
+        dropdown.scrollTop = itemBottom - dropdown.clientHeight;
+      } else if (itemTop < dropdown.scrollTop) {
+        dropdown.scrollTop = itemTop;
+      }
+    }, 0);
+  }
+
+  $: showClearOption = !!(activeCell && !cellInputVal.trim() && game.gamePlan[activeCell.stepIdx]?.players?.[activeCell.posId]);
 
   function onCellKeydown(e) {
     const len = cellFilteredPlayers.length;
     if (e.key === 'ArrowDown') {
       e.preventDefault();
-      cellHighlightIdx = Math.min(cellHighlightIdx + 1, len - 1);
+      if (cellHighlightIdx === -1) cellHighlightIdx = 0;
+      else cellHighlightIdx = Math.min(cellHighlightIdx + 1, len - 1);
+      scrollDropdownToHighlight();
     } else if (e.key === 'ArrowUp') {
       e.preventDefault();
-      cellHighlightIdx = Math.max(cellHighlightIdx - 1, 0);
+      if (cellHighlightIdx > 0) cellHighlightIdx--;
+      else if (cellHighlightIdx === 0 && showClearOption) cellHighlightIdx = -1;
+      scrollDropdownToHighlight();
     } else if (e.key === 'Enter') {
       e.preventDefault();
-      if (len > 0) selectCellPlayer(cellFilteredPlayers[cellHighlightIdx]?.id ?? cellFilteredPlayers[0].id);
+      if (cellHighlightIdx === -1) selectCellPlayer(null);
+      else if (len > 0) selectCellPlayer(cellFilteredPlayers[cellHighlightIdx]?.id ?? cellFilteredPlayers[0].id);
       else if (!cellInputVal.trim()) selectCellPlayer(null);
-      else closeCell();
+      else closeEditMode();
     } else if (e.key === 'Escape') {
       e.preventDefault();
-      closeCell();
+      // Return to nav mode on the same cell rather than closing everything
+      navCell = { stepIdx: activeCell.stepIdx, posId: activeCell.posId };
+      closeEditMode();
     } else if (e.key === 'Tab') {
-      closeCell();
+      closeAllModes();
     }
   }
 
   function onCellBlur() {
-    setTimeout(closeCell, 120);
+    // Only close edit mode on blur; keep nav mode so arrow keys still work
+    setTimeout(closeEditMode, 120);
+  }
+
+  // --- Nav-mode keyboard handler (window-level) ---
+  function onWindowKeydown(e) {
+    if (!navCell) return;
+    // Don't intercept keys when the user is typing in any input
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') return;
+
+    const { stepIdx, posId } = navCell;
+
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      navCell = null;
+      return;
+    }
+
+    if (e.key === 'ArrowUp' || e.key === 'ArrowDown' || e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+      e.preventDefault();
+      navigateNav(e.key);
+      return;
+    }
+
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      const el = document.querySelector(`[data-navcell="${stepIdx}-${posId}"]`);
+      if (el) openEditCell(stepIdx, posId, el, true);
+      return;
+    }
+
+    if (e.key === 'Delete' || e.key === 'Backspace') {
+      e.preventDefault();
+      const step = game.gamePlan[stepIdx];
+      if (step?.players) {
+        delete step.players[posId];
+        game.gamePlan = [...game.gamePlan];
+        markGamePlanDirty();
+      }
+      return;
+    }
+
+    // Any printable character → enter edit mode pre-filled with that char
+    if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) {
+      e.preventDefault();
+      const el = document.querySelector(`[data-navcell="${stepIdx}-${posId}"]`);
+      if (el) {
+        const rect = el.getBoundingClientRect();
+        dropdownPos = { top: rect.bottom, left: rect.left, width: Math.max(rect.width, 140) };
+        cellInputVal = e.key;
+        cellHighlightIdx = 0;
+        activeCell = { stepIdx, posId };
+      }
+    }
+  }
+
+  function onWindowClick(e) {
+    if (!navCell) return;
+    const planGrid = document.querySelector('.plan-grid-wrap');
+    if (planGrid && planGrid.contains(e.target)) return;
+    navCell = null;
+  }
+
+  function navigateNav(key) {
+    if (!navCell) return;
+    const { stepIdx, posId } = navCell;
+    const stepColsArr = planColumns.filter(c => c.type === 'step');
+    const currentStepColIdx = stepColsArr.findIndex(c => c.idx === stepIdx);
+    const currentStepCol = stepColsArr[currentStepColIdx];
+    const positions = currentStepCol?.posCol?.formation?.positions ?? [];
+    const rowIdx = positions.findIndex(p => p.id === posId);
+
+    if (key === 'ArrowUp') {
+      if (rowIdx > 0) navCell = { stepIdx, posId: positions[rowIdx - 1].id };
+    } else if (key === 'ArrowDown') {
+      if (rowIdx < positions.length - 1) navCell = { stepIdx, posId: positions[rowIdx + 1].id };
+    } else if (key === 'ArrowLeft') {
+      const newIdx = currentStepColIdx - 1;
+      if (newIdx >= 0) {
+        const newPositions = stepColsArr[newIdx]?.posCol?.formation?.positions ?? [];
+        const target = Math.min(rowIdx, newPositions.length - 1);
+        if (target >= 0) navCell = { stepIdx: stepColsArr[newIdx].idx, posId: newPositions[target].id };
+      }
+    } else if (key === 'ArrowRight') {
+      const newIdx = currentStepColIdx + 1;
+      if (newIdx < stepColsArr.length) {
+        const newPositions = stepColsArr[newIdx]?.posCol?.formation?.positions ?? [];
+        const target = Math.min(rowIdx, newPositions.length - 1);
+        if (target >= 0) navCell = { stepIdx: stepColsArr[newIdx].idx, posId: newPositions[target].id };
+      }
+    }
+
+    // Scroll the newly-focused cell into view
+    setTimeout(() => {
+      const el = document.querySelector(`[data-navcell="${navCell?.stepIdx}-${navCell?.posId}"]`);
+      el?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    }, 0);
   }
 
   function removePlanStep(i) {
@@ -515,6 +852,8 @@
   <title>Game Dashboard | Lineup Pro</title>
 </svelte:head>
 
+<svelte:window on:keydown={onWindowKeydown} on:click={onWindowClick} />
+
 {#if loading}
   <div class="loading">Loading Game Data...</div>
 {:else}
@@ -547,14 +886,11 @@
       <!-- Top Left: Setup & Notes -->
       <div class="panel">
         <h2>Pre-Game Setup</h2>
-        <div class="form-group">
-          <label>Starting Formation</label>
-          <select bind:value={game.formationId} on:change={saveGameNotes}>
-            <option value="">-- Select a Formation --</option>
-            {#each formations as form}
-              <option value={form.id}>{form.name} ({form.positions?.length || 0} pos)</option>
-            {/each}
-          </select>
+        <div class="form-group form-group-inline">
+          <label>Players on Field</label>
+          <input type="number" min="1" max="20" placeholder="e.g. 11"
+            value={game.playersOnField ?? ''}
+            on:change={(e) => { game.playersOnField = e.target.value ? Number(e.target.value) : null; saveGameNotes(); }} />
         </div>
         <div class="form-group">
           <label>Pre-Game Notes</label>
@@ -582,6 +918,7 @@
         <div class="plan-header-controls">
           {#if game.status !== 'completed'}
             <button class="btn-toggle" on:click={addPlanStep}>+ Add Step</button>
+            <button class="btn-toggle" on:click={addGamePlan}>+ Alt Plan</button>
           {/if}
           {#if gamePlanDirty}
             <div class="plan-dirty-actions">
@@ -591,6 +928,38 @@
           {/if}
         </div>
       </div>
+
+      <!-- Plan tabs (only shown when there are multiple plans or always for context) -->
+      {#if planMeta.length > 1 || game.status !== 'completed'}
+        <div class="plan-tabs-row">
+          <div class="plan-tabs">
+            {#each planMeta as plan}
+              <button class="plan-tab"
+                class:plan-tab-sel={plan.id === selectedPlanId}
+                class:plan-tab-live={plan.id === activePlanId}
+                on:click={() => switchToPlan(plan.id)}>
+                {plan.name}{#if plan.id === activePlanId}&nbsp;●{/if}
+              </button>
+            {/each}
+          </div>
+          {#if game.status !== 'completed'}
+            <div class="plan-cur-controls">
+              <input class="plan-name-edit" type="text"
+                value={planMeta.find(p => p.id === selectedPlanId)?.name ?? ''}
+                on:input={(e) => renamePlan(selectedPlanId, e.target.value)}
+                placeholder="Plan name" />
+              {#if selectedPlanId !== activePlanId}
+                <button class="btn-toggle plan-set-active-btn" title="Use this plan in the live tracker" on:click={() => setActivePlan(selectedPlanId)}>Set Active</button>
+              {:else}
+                <span class="plan-active-badge">✓ Active</span>
+              {/if}
+              {#if planMeta.length > 1}
+                <button class="plan-delete-btn" on:click={deleteCurrentPlan}>Delete</button>
+              {/if}
+            </div>
+          {/if}
+        </div>
+      {/if}
 
       {#if !game.gamePlan?.length}
         <p class="text-muted small">No steps yet. Add a step to start planning your rotations.</p>
@@ -624,25 +993,26 @@
                           <select class="load-lineup-sel"
                             value={step.formationId ?? ''}
                             on:change={(e) => {
-                              game.gamePlan[idx].formationId = e.target.value || null;
+                              const newFormationId = e.target.value || null;
+                              remapStepPlayers(idx, newFormationId);
+                              game.gamePlan[idx].formationId = newFormationId;
                               game.gamePlan = [...game.gamePlan];
                               markGamePlanDirty();
                             }}>
                             <option value="">-- Formation --</option>
-                            {#each formations as f}
+                            {#each formations.filter(f => game.playersOnField == null || (f.positions?.length ?? 0) === game.playersOnField) as f}
                               <option value={f.id}>{f.name}</option>
                             {/each}
                           </select>
-                          {#if savedLineups.length > 0}
-                            <!-- svelte-ignore a11y-no-onchange -->
-                            <select class="load-lineup-sel"
-                              on:change={(e) => { if (e.target.value) { importLineupToStep(idx, e.target.value); e.target.value = ''; } }}>
-                              <option value="">Load lineup...</option>
-                              {#each savedLineups as l}
-                                <option value={l.id}>{l.name}</option>
-                              {/each}
-                            </select>
-                          {/if}
+                          <!-- svelte-ignore a11y-no-onchange -->
+                          <select class="load-lineup-sel"
+                            on:mousedown={(e) => { if (!step.formationId) { e.preventDefault(); alert('Select a formation first.'); } }}
+                            on:change={(e) => { if (e.target.value) { importLineupToStep(idx, e.target.value); e.target.value = ''; } }}>
+                            <option value="">Load lineup...</option>
+                            {#each savedLineups.filter(l => !step.formationId || l.formationId === step.formationId) as l}
+                              <option value={l.id}>{l.name}</option>
+                            {/each}
+                          </select>
                           <div class="plan-step-actions">
                             <button class="plan-mv-btn" on:click={() => movePlanStep(idx, -1)} disabled={idx === 0}>←</button>
                             <button class="plan-mv-btn" on:click={() => movePlanStep(idx, 1)} disabled={idx === game.gamePlan.length - 1}>→</button>
@@ -686,8 +1056,17 @@
                         {@const playerSubOn = playerChanged && !!thisPlayer && !Object.values(prevStepPlayers).includes(thisPlayer)}
                         {@const playerSwitched = playerChanged && !!thisPlayer && Object.values(prevStepPlayers).includes(thisPlayer)}
                         <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-noninteractive-element-interactions -->
-                        <td class="plan-cell" class:plan-cell-subon={playerSubOn} class:plan-cell-switched={playerSwitched}
-                          on:click={(e) => openCell(idx, pos.id, e)}>
+                        <td class="plan-cell"
+                          class:plan-cell-subon={playerSubOn}
+                          class:plan-cell-switched={playerSwitched}
+                          class:plan-cell-nav={navCell?.stepIdx === idx && navCell?.posId === pos.id && !activeCell}
+                          data-navcell="{idx}-{pos.id}"
+                          on:click={(e) => clickCell(idx, pos.id, e)}
+                          on:contextmenu|preventDefault={() => openPickerModal(idx, pos.id, pos.name)}
+                          on:touchstart|passive={() => onCellTouchStart(idx, pos.id, pos.name)}
+                          on:touchend={onCellTouchEnd}
+                          on:touchcancel={onCellTouchEnd}
+                          on:touchmove={onCellTouchEnd}>
                           {#if activeCell?.stepIdx === idx && activeCell?.posId === pos.id}
                             <input class="plan-cell-input" use:autoFocus
                               bind:value={cellInputVal}
@@ -752,8 +1131,8 @@
               <button class:active={planSort === 'time'} on:click={() => planSort = 'time'}>Time</button>
             </div>
             <div class="bar-mode-toggle">
-              <button class:active={planBarMode === 'grouped'} on:click={() => planBarMode = 'grouped'}>Grouped</button>
               <button class:active={planBarMode === 'timeline'} on:click={() => planBarMode = 'timeline'}>Timeline</button>
+              <button class:active={planBarMode === 'grouped'} on:click={() => planBarMode = 'grouped'}>Grouped</button>
             </div>
             <div style="margin-left: auto;">
               {#if game.status !== 'completed'}
@@ -812,9 +1191,12 @@
                         <td colspan="2" class="bar-cell">
                           <div class="player-color-bar">
                             {#if planBarMode === 'timeline' && totalPlanMs > 0 && planSegs.length > 0}
-                              {#each planSegs as seg}
+                              {#each planSegs as seg, i}
                                 {@const color = getGroupColor(seg.group)}
                                 <div class="bar-seg" style="width:{((seg.endMs - seg.startMs) / totalPlanMs * 100).toFixed(2)}%;background:{color.bg};" title="{seg.group ?? 'Bench'}: {formatDuration(seg.endMs - seg.startMs)}"></div>
+                                {#if i < planSegs.length - 1}
+                                  <div class="bar-lineup-change"></div>
+                                {/if}
                               {/each}
                             {:else}
                               {#each groupEntries as [group, ms]}
@@ -851,8 +1233,8 @@
             <h2>Player Stats</h2>
             <div class="panel-title-right">
               <div class="bar-mode-toggle">
-                <button class:active={statsBarMode === 'grouped'} on:click={() => statsBarMode = 'grouped'}>Grouped</button>
                 <button class:active={statsBarMode === 'timeline'} on:click={() => statsBarMode = 'timeline'}>Timeline</button>
+                <button class:active={statsBarMode === 'grouped'} on:click={() => statsBarMode = 'grouped'}>Grouped</button>
               </div>
               {#if game.status !== 'completed'}
                 <button class="btn-toggle" on:click={() => editingAvailability = !editingAvailability}>
@@ -967,13 +1349,13 @@
   <div class="plan-dropdown" style="top:{dropdownPos.top}px;left:{dropdownPos.left}px;width:{dropdownPos.width}px;">
     {#if !cellInputVal.trim() && game.gamePlan[activeCell.stepIdx]?.players?.[activeCell.posId]}
       <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
-      <div class="plan-drop-item plan-drop-clear" on:mousedown|preventDefault={() => selectCellPlayer(null)}>— clear —</div>
+      <div class="plan-drop-item plan-drop-clear" class:plan-drop-hi={cellHighlightIdx === -1} on:mousedown|preventDefault={() => selectCellPlayer(null)}>— clear —</div>
     {/if}
     {#each cellFilteredPlayers as player, j}
       <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
       <div class="plan-drop-item" class:plan-drop-hi={j === cellHighlightIdx}
         on:mousedown|preventDefault={() => selectCellPlayer(player.id)}>
-        {player.name}
+        {player.name}{#if player.currentPosName}<span class="plan-drop-pos">{player.currentPosName}</span>{/if}
       </div>
     {/each}
     {#if cellFilteredPlayers.length === 0 && cellInputVal.trim()}
@@ -1011,6 +1393,31 @@
   />
 {/if}
 
+<!-- ADD PLAN MODAL -->
+{#if showAddPlanModal}
+  <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+  <div class="modal-backdrop" on:click={() => showAddPlanModal = false}>
+    <div class="modal-panel" on:click|stopPropagation>
+      <h2>Add Alternate Plan</h2>
+      <div class="add-plan-options">
+        <button class="add-plan-option" on:click={() => confirmAddGamePlan(null)}>
+          <span class="add-plan-option-title">Start empty</span>
+          <span class="add-plan-option-sub">Blank plan with no steps</span>
+        </button>
+        {#each planMeta as plan}
+          <button class="add-plan-option" on:click={() => confirmAddGamePlan(plan.id)}>
+            <span class="add-plan-option-title">Copy from "{plan.name}"</span>
+            <span class="add-plan-option-sub">{allPlanSteps[plan.id]?.length ?? 0} step{(allPlanSteps[plan.id]?.length ?? 0) === 1 ? '' : 's'}</span>
+          </button>
+        {/each}
+      </div>
+      <div class="modal-actions">
+        <button class="btn-secondary" on:click={() => showAddPlanModal = false}>Cancel</button>
+      </div>
+    </div>
+  </div>
+{/if}
+
 <!-- SAVE LINEUP MODAL -->
 {#if showSaveLineupModal}
   <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
@@ -1036,6 +1443,44 @@
           <button class="btn-primary" disabled={!saveLineupName.trim()} on:click={() => confirmSaveLineup(false)}>Save</button>
         </div>
       {/if}
+    </div>
+  </div>
+{/if}
+
+<!-- PLAYER PICKER MODAL (mobile long-press / desktop right-click) -->
+{#if showPickerModal && pickerCell}
+  <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+  <div class="modal-backdrop" on:click={closePickerModal}>
+    <div class="modal-panel picker-modal" on:click|stopPropagation>
+      <div class="picker-header">
+        <span class="picker-pos-label">{pickerCell.posName}</span>
+        <span class="picker-step-label">Lineup {pickerCell.stepIdx + 1}{game.gamePlan[pickerCell.stepIdx]?.name ? ': ' + game.gamePlan[pickerCell.stepIdx].name : ''}</span>
+      </div>
+      <div class="picker-list">
+        {#if game.gamePlan[pickerCell.stepIdx]?.players?.[pickerCell.posId]}
+          <button class="picker-item picker-item-clear" on:click={() => pickerSelectPlayer(null)}>— clear —</button>
+        {/if}
+        {#each pickerPlayers as player}
+          {@const isCurrent = game.gamePlan[pickerCell.stepIdx]?.players?.[pickerCell.posId] === player.id}
+          {@const planEntry = playerPlan.find(p => p.id === player.id)}
+          <button class="picker-item" class:picker-item-active={isCurrent} on:click={() => pickerSelectPlayer(player.id)}>
+            <span class="picker-num">#{player.number}</span>
+            <span class="picker-name">{player.name}</span>
+            {#if player.currentPosName}
+              {@const gc = getGroupColor(player.currentPosGroup)}
+              <span class="picker-cur-pos" style="background:{gc.bg};color:{gc.text};">{player.currentPosName}</span>
+            {/if}
+            {#if isCurrent}<span class="picker-check">✓</span>{/if}
+            <span class="picker-time" class:picker-time-zero={!planEntry?.activeMs}>{formatDuration(planEntry?.activeMs ?? 0)}</span>
+          </button>
+        {/each}
+        {#if pickerPlayers.length === 0}
+          <p class="picker-empty">No available players.</p>
+        {/if}
+      </div>
+      <div class="modal-actions">
+        <button class="btn-secondary" on:click={closePickerModal}>Cancel</button>
+      </div>
     </div>
   </div>
 {/if}
@@ -1110,9 +1555,11 @@
 
   /* Forms */
   .form-group { display: flex; flex-direction: column; gap: 0.5rem; margin-bottom: 1rem; }
+  .form-group-inline { flex-direction: row; align-items: center; }
   label { color: #cbd5e1; font-weight: 500; font-size: 0.95rem;}
-  select, textarea { background: #0f172a; border: 1px solid #334155; color: white; padding: 0.75rem; border-radius: 0.5rem; font-family: inherit; resize: vertical; }
-  select:focus, textarea:focus { border-color: #3b82f6; outline: none; }
+  select, textarea, input[type="number"] { background: #0f172a; border: 1px solid #334155; color: white; padding: 0.75rem; border-radius: 0.5rem; font-family: inherit; resize: vertical; }
+  select:focus, textarea:focus, input[type="number"]:focus { border-color: #3b82f6; outline: none; }
+  input[type="number"] { width: 6rem; }
   .save-status { color: #10b981; font-size: 0.85rem; font-style: italic; }
 
   /* Utility Classes */
@@ -1144,6 +1591,7 @@
   .bar-cell { padding: 0 0.5rem 0.35rem !important; }
   .player-color-bar { display: flex; height: 5px; border-radius: 3px; overflow: hidden; background: #0f172a; }
   .player-color-bar .bar-seg { flex-shrink: 0; height: 100%; }
+  .bar-lineup-change { flex-shrink: 0; width: 2px; height: 100%; background: rgba(255,255,255,0.75); }
 
   /* Player Minutes panel header row */
   .panel-title-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.75rem; }
@@ -1193,6 +1641,48 @@
   .plan-dirty-actions { display: flex; gap: 0.4rem; align-items: center; }
   .plan-save-action { padding: 0.35rem 0.85rem; font-size: 0.85rem; border-radius: 0.5rem; }
 
+  /* Plan tabs */
+  .plan-tabs-row { display: flex; align-items: flex-start; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 0.75rem; }
+  .plan-tabs { display: flex; gap: 0.3rem; flex-wrap: wrap; flex: 1; }
+  .plan-tab {
+    background: #1e293b; border: 1px solid #334155; color: #94a3b8;
+    padding: 0.15rem 0.75rem; border-radius: 0.4rem 0.4rem 0 0;
+    font-size: 0.82rem; font-weight: 600; cursor: pointer; transition: background 0.15s, color 0.15s;
+    align-self: flex-end;
+  }
+  .plan-tab:hover { background: #334155; color: #e2e8f0; }
+  .plan-tab-sel { background: #334155; color: #f8fafc; border-bottom-color: #334155; font-size: 0.92rem; padding: 0.4rem 1rem; }
+  .plan-tab-live { color: #34d399; }
+  .plan-tab-live.plan-tab-sel { color: #34d399; }
+  .plan-cur-controls {
+    display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;
+    padding: 0.3rem 0.5rem; background: #1e293b; border: 1px solid #334155; border-radius: 0.4rem;
+  }
+  .plan-name-edit {
+    background: transparent; border: none; border-bottom: 1px solid #475569;
+    color: #f8fafc; font-size: 0.85rem; font-weight: 600; font-family: inherit;
+    padding: 0.1rem 0.2rem; outline: none; width: 7rem;
+  }
+  .plan-name-edit:focus { border-bottom-color: #3b82f6; }
+  .plan-set-active-btn { font-size: 0.78rem; padding: 0.2rem 0.5rem; }
+  .plan-active-badge { color: #34d399; font-size: 0.78rem; font-weight: 700; white-space: nowrap; }
+  .plan-delete-btn {
+    background: transparent; border: none; color: #ef4444;
+    font-size: 0.78rem; font-weight: 600; cursor: pointer; padding: 0.2rem 0.3rem; opacity: 0.7;
+  }
+  .plan-delete-btn:hover { opacity: 1; }
+
+  /* Add plan modal */
+  .add-plan-options { display: flex; flex-direction: column; gap: 0.5rem; margin-bottom: 0.5rem; }
+  .add-plan-option {
+    display: flex; flex-direction: column; align-items: flex-start; gap: 0.2rem;
+    background: #1e293b; border: 1px solid #334155; border-radius: 0.5rem;
+    padding: 0.75rem 1rem; cursor: pointer; text-align: left; transition: background 0.15s;
+  }
+  .add-plan-option:hover { background: #2d3f55; border-color: #3b82f6; }
+  .add-plan-option-title { color: #f8fafc; font-size: 0.95rem; font-weight: 600; }
+  .add-plan-option-sub { color: #64748b; font-size: 0.8rem; }
+
   .plan-grid-wrap { overflow-x: auto; margin-bottom: 0.75rem; }
   .plan-grid { border-collapse: collapse; font-size: 0.88rem; color: #e2e8f0; width: max-content; min-width: 100%; }
 
@@ -1226,7 +1716,7 @@
   .plan-step-name-input::placeholder { color: #475569; font-weight: 400; }
   .plan-step-name-ro { color: #f8fafc; font-size: 0.82rem; font-weight: 600; display: block; }
   .plan-dur-row { display: flex; align-items: center; gap: 0.3rem; }
-  .plan-dur-input { width: 3.2rem; background: #0f172a; border: 1px solid #334155; color: #f8fafc; padding: 0.25rem 0.4rem; border-radius: 0.35rem; font-size: 0.85rem; text-align: right; outline: none; }
+  .plan-dur-input { width: 3.2rem; background: #0f172a; border: 1px solid #334155; color: #f8fafc; padding: 0.25rem 0.4rem; border-radius: 0.35rem; font-size: 0.85rem; text-align: right; outline: none; text-align: left}
   .plan-dur-input:focus { border-color: #3b82f6; }
   .plan-dur-label { color: #64748b; font-size: 0.8rem; }
   .plan-dur-ro { color: #94a3b8; font-size: 0.82rem; }
@@ -1246,6 +1736,7 @@
   }
   .plan-cell { padding: 0.2rem 0.4rem; border-bottom: 1px solid #1e293b; cursor: pointer; }
   .plan-cell:hover { background: #1e293b; }
+  .plan-cell-nav { outline: 2px solid #3b82f6; outline-offset: -2px; background: #1e3a5f !important; }
   .plan-cell-subon { background: rgba(52, 211, 153, 0.08); }
   .plan-cell-subon:hover { background: rgba(52, 211, 153, 0.14); }
   .plan-cell-switched { background: rgba(245, 158, 11, 0.08); }
@@ -1274,6 +1765,7 @@
   .plan-drop-item:hover, .plan-drop-hi { background: #1e293b; }
   .plan-drop-clear { color: #475569; font-style: italic; }
   .plan-drop-empty { padding: 0.4rem 0.75rem; font-size: 0.85rem; color: #475569; }
+  .plan-drop-pos { color: #475569; font-size: 0.8rem; margin-left: 0.4rem; }
 
   .plan-include-btn {
     width: 100%; background: #0f172a; border: 1px solid #334155;
@@ -1311,4 +1803,29 @@
   .check-item input[type="checkbox"] { width: 1rem; height: 1rem; accent-color: #2563eb; flex-shrink: 0; }
   .check-name { flex: 1; color: #f8fafc; font-size: 0.95rem; }
   .check-number { color: #64748b; font-size: 0.85rem; }
+
+  /* Player picker modal */
+  .plan-cell { touch-action: manipulation; -webkit-touch-callout: none; user-select: none; }
+  .picker-modal { padding: 1.25rem; max-width: 360px; }
+  .picker-header { display: flex; align-items: baseline; gap: 0.6rem; margin-bottom: 0.75rem; }
+  .picker-pos-label { font-size: 1.05rem; font-weight: 700; color: #f8fafc; }
+  .picker-step-label { font-size: 0.82rem; color: #64748b; }
+  .picker-list { display: flex; flex-direction: column; gap: 0.2rem; max-height: 55vh; overflow-y: auto; margin-bottom: 0.5rem; }
+  .picker-item {
+    display: flex; align-items: center; gap: 0.6rem;
+    background: #1e293b; border: 1px solid #334155; border-radius: 0.5rem;
+    color: #e2e8f0; font-size: 0.95rem; font-family: inherit;
+    padding: 0.65rem 0.85rem; cursor: pointer; text-align: left;
+    transition: background 0.1s;
+  }
+  .picker-item:hover, .picker-item:active { background: #2d3f55; }
+  .picker-item-active { border-color: #3b82f6; background: #1e3a5f; }
+  .picker-item-clear { color: #64748b; font-style: italic; background: transparent; border-color: #1e293b; }
+  .picker-num { color: #64748b; font-size: 0.82rem; min-width: 2rem; }
+  .picker-name { flex: 1; font-weight: 500; }
+  .picker-cur-pos { font-size: 0.78rem; font-weight: 600; padding: 0.1rem 0.4rem; border-radius: 0.25rem; }
+  .picker-time { color: #34d399; font-size: 0.82rem; font-variant-numeric: tabular-nums; margin-left: auto; }
+  .picker-time-zero { color: #475569; }
+  .picker-check { color: #34d399; font-size: 0.9rem; }
+  .picker-empty { color: #475569; font-size: 0.9rem; text-align: center; padding: 1rem 0; }
 </style>
