@@ -13,7 +13,20 @@
   let games = [];
   let formations = {};   // { formationId: formation }
   let loading = true;
-  let sortDir = -1;
+  let sortDir = 1;
+  let filterMode = 'group'; // 'group' | 'pos'
+  let filterKeys = new Set(); // values within the current mode
+
+  function toggleFilter(key) {
+    const next = new Set(filterKeys);
+    if (next.has(key)) next.delete(key); else next.add(key);
+    filterKeys = next;
+  }
+
+  function setFilterMode(mode) {
+    filterMode = mode;
+    filterKeys = new Set();
+  }
 
   // Per-game selection: { [gameId]: { included: bool, planId: string|null } }
   let selections = {};
@@ -42,7 +55,10 @@
       const init = {};
       for (const g of games) {
         const plans = gamePlans(g);
-        init[g.id] = { included: g.status === 'completed', planId: plans[0]?.id ?? null };
+        const defaultPlanId = (g.activePlanId && plans.some(p => p.id === g.activePlanId))
+          ? g.activePlanId
+          : plans[0]?.id ?? null;
+        init[g.id] = { included: g.status === 'completed', planId: defaultPlanId };
       }
       selections = init;
     } catch (err) {
@@ -53,21 +69,28 @@
   }
 
   function gamePlans(game) {
-    if (game.gamePlans?.length) return game.gamePlans;
-    if (game.gamePlan?.length) return [{ id: '__legacy__', name: 'Game Plan', steps: game.gamePlan }];
+    const hasPlayers = steps => (steps ?? []).some(s => Object.values(s.players ?? {}).some(Boolean));
+    if (game.gamePlans?.length) return game.gamePlans.filter(p => hasPlayers(p.steps));
+    if (game.gamePlan?.length && hasPlayers(game.gamePlan)) return [{ id: '__legacy__', name: 'Game Plan', steps: game.gamePlan }];
     return [];
   }
 
-  // Returns { [playerId]: { activeMs, groupMs: { [group]: ms } } }
+  // Returns { [playerId]: { activeMs, groupMs: { [group]: ms }, posMs: { [posName]: ms } } }
   function gameContribution(game, planId) {
     if (game.status === 'completed') {
       const formation = formations[game.formationId] ?? null;
       const posStats = computePositionStats(game.history ?? [], formation);
+      const posNameMap = Object.fromEntries((formation?.positions ?? []).map(p => [p.id, p.name]));
       const result = {};
       for (const p of (team?.roster ?? [])) {
         const ps = game.playerStats?.[p.id];
         if (!ps?.activeMs) continue;
-        result[p.id] = { activeMs: ps.activeMs, groupMs: posStats[p.id]?.groupMs ?? {} };
+        const posMs = {};
+        for (const [posId, ms] of Object.entries(posStats[p.id]?.positionMs ?? {})) {
+          const name = posNameMap[posId] ?? posId;
+          posMs[name] = (posMs[name] ?? 0) + ms;
+        }
+        result[p.id] = { activeMs: ps.activeMs, groupMs: posStats[p.id]?.groupMs ?? {}, posMs };
       }
       return result;
     }
@@ -83,13 +106,19 @@
       if (ms <= 0) continue;
       const formation = formations[step.formationId] ?? null;
       const posGroupMap = {};
-      (formation?.positions ?? []).forEach(pos => { posGroupMap[pos.id] = pos.group ?? null; });
+      const posNameMap = {};
+      (formation?.positions ?? []).forEach(pos => {
+        posGroupMap[pos.id] = pos.group ?? null;
+        posNameMap[pos.id] = pos.name;
+      });
       for (const [posId, playerId] of Object.entries(step.players ?? {})) {
         if (!playerId) continue;
-        if (!result[playerId]) result[playerId] = { activeMs: 0, groupMs: {} };
+        if (!result[playerId]) result[playerId] = { activeMs: 0, groupMs: {}, posMs: {} };
         result[playerId].activeMs += ms;
         const grp = posGroupMap[posId];
         if (grp) result[playerId].groupMs[grp] = (result[playerId].groupMs[grp] ?? 0) + ms;
+        const posName = posNameMap[posId];
+        if (posName) result[playerId].posMs[posName] = (result[playerId].posMs[posName] ?? 0) + ms;
       }
     }
     return result;
@@ -98,7 +127,7 @@
   $: totals = (() => {
     const acc = {};
     for (const p of (team?.roster ?? [])) {
-      acc[p.id] = { activeMs: 0, completedGroupMs: {}, plannedGroupMs: {} };
+      acc[p.id] = { activeMs: 0, completedGroupMs: {}, plannedGroupMs: {}, completedPosMs: {}, plannedPosMs: {} };
     }
     for (const g of games) {
       const sel = selections[g.id];
@@ -107,28 +136,73 @@
       for (const [pid, data] of Object.entries(contrib)) {
         if (!acc[pid]) continue;
         acc[pid].activeMs += data.activeMs;
-        const target = g.status === 'completed' ? acc[pid].completedGroupMs : acc[pid].plannedGroupMs;
+        const groupTarget = g.status === 'completed' ? acc[pid].completedGroupMs : acc[pid].plannedGroupMs;
         for (const [grp, ms] of Object.entries(data.groupMs)) {
-          target[grp] = (target[grp] ?? 0) + ms;
+          groupTarget[grp] = (groupTarget[grp] ?? 0) + ms;
         }
-        // Track ungrouped active time (bench time is excluded; ungrouped = time w/o a known group)
         const groupedMs = Object.values(data.groupMs).reduce((s, v) => s + v, 0);
         const ungrouped = data.activeMs - groupedMs;
-        if (ungrouped > 0) {
-          target[''] = (target[''] ?? 0) + ungrouped;
+        if (ungrouped > 0) groupTarget[''] = (groupTarget[''] ?? 0) + ungrouped;
+        const posTarget = g.status === 'completed' ? acc[pid].completedPosMs : acc[pid].plannedPosMs;
+        for (const [posName, ms] of Object.entries(data.posMs ?? {})) {
+          posTarget[posName] = (posTarget[posName] ?? 0) + ms;
         }
       }
     }
     return acc;
   })();
 
-  $: maxMs = Math.max(1, ...Object.values(totals).map(t => t.activeMs));
+  function filteredMs(t, mode, keys) {
+    if (keys.size === 0) return t.activeMs;
+    let ms = 0;
+    for (const key of keys) {
+      if (mode === 'group') ms += (t.completedGroupMs[key] ?? 0) + (t.plannedGroupMs[key] ?? 0);
+      else ms += (t.completedPosMs[key] ?? 0) + (t.plannedPosMs[key] ?? 0);
+    }
+    return ms;
+  }
+
+  function barSegments(t, mode, keys) {
+    if (keys.size === 0) {
+      const segs = [];
+      for (const [grp, ms] of Object.entries(t.completedGroupMs ?? {})) {
+        if (ms > 0) segs.push({ grp, ms, planned: false });
+      }
+      for (const [grp, ms] of Object.entries(t.plannedGroupMs ?? {})) {
+        if (ms > 0) segs.push({ grp, ms, planned: true });
+      }
+      return segs;
+    }
+    const segs = [];
+    for (const key of keys) {
+      const grp = mode === 'group' ? key : positionGroup(key);
+      const comp = mode === 'group' ? (t.completedGroupMs[key] ?? 0) : (t.completedPosMs[key] ?? 0);
+      const plan = mode === 'group' ? (t.plannedGroupMs[key] ?? 0) : (t.plannedPosMs[key] ?? 0);
+      if (comp > 0) segs.push({ grp, ms: comp, planned: false });
+      if (plan > 0) segs.push({ grp, ms: plan, planned: true });
+    }
+    return segs;
+  }
+
+  // Recomputes whenever totals, filterMode, or filterKeys change
+  $: filteredTotals = (() => {
+    const mode = filterMode;
+    const keys = filterKeys;
+    return Object.fromEntries(
+      (team?.roster ?? []).map(p => {
+        const t = totals[p.id] ?? { activeMs: 0, completedGroupMs: {}, plannedGroupMs: {}, completedPosMs: {}, plannedPosMs: {} };
+        return [p.id, { ms: filteredMs(t, mode, keys), segs: barSegments(t, mode, keys) }];
+      })
+    );
+  })();
+
+  $: maxMs = Math.max(1, ...Object.values(filteredTotals).map(t => t.ms));
 
   $: sortedRoster = [...(team?.roster ?? [])]
     .map(p => ({ ...p, ...totals[p.id] }))
-    .sort((a, b) => (b.activeMs - a.activeMs) * sortDir || a.name.localeCompare(b.name));
+    .sort((a, b) => ((filteredTotals[b.id]?.ms ?? 0) - (filteredTotals[a.id]?.ms ?? 0)) * sortDir || a.name.localeCompare(b.name));
 
-  // Collect all groups that appear (for legend)
+  // Collect all groups and position names that appear (for filter + legend)
   $: allGroups = [...new Set(
     Object.values(totals).flatMap(t => [
       ...Object.keys(t.completedGroupMs),
@@ -136,18 +210,25 @@
     ])
   )].filter(g => g !== '');
 
+  $: allPositionNames = [...new Set(
+    Object.values(totals).flatMap(t => [
+      ...Object.keys(t.completedPosMs),
+      ...Object.keys(t.plannedPosMs),
+    ])
+  )].sort((a, b) => {
+    const ga = positionGroup(a) ?? '';
+    const gb = positionGroup(b) ?? '';
+    return ga.localeCompare(gb) || a.localeCompare(b);
+  });
+
   $: selectedCount = games.filter(g => selections[g.id]?.included).length;
 
-  // Build bar segments for a player: actual group segs (full) then planned group segs (faded)
-  function barSegments(playerTotal) {
-    const segs = [];
-    for (const [grp, ms] of Object.entries(playerTotal.completedGroupMs)) {
-      if (ms > 0) segs.push({ grp, ms, planned: false });
+  function positionGroup(posName) {
+    for (const f of Object.values(formations)) {
+      const pos = f.positions?.find(p => p.name === posName);
+      if (pos?.group) return pos.group;
     }
-    for (const [grp, ms] of Object.entries(playerTotal.plannedGroupMs)) {
-      if (ms > 0) segs.push({ grp, ms, planned: true });
-    }
-    return segs;
+    return null;
   }
 
   function fmt(ms) {
@@ -243,24 +324,55 @@
             {sortDir === -1 ? 'Most → Least' : 'Least → Most'}
           </button>
         </div>
+        {#if allGroups.length > 0 || allPositionNames.length > 0}
+          <div class="filter-row">
+            <div class="filter-mode-toggle">
+              <button class:active={filterMode === 'group'} on:click={() => setFilterMode('group')}>Group</button>
+              <button class:active={filterMode === 'pos'} on:click={() => setFilterMode('pos')}>Position</button>
+            </div>
+            <div class="filter-chips">
+              {#if filterMode === 'group'}
+                {#each allGroups as grp}
+                  {@const color = getGroupColor(grp)}
+                  {@const active = filterKeys.has(grp)}
+                  <button class="filter-chip" class:active
+                    style={active ? `background:${color.bg};border-color:${color.bg};color:#fff;` : `border-color:${color.bg};color:${color.bg};`}
+                    on:click={() => toggleFilter(grp)}>{grp}</button>
+                {/each}
+              {:else}
+                {#each allPositionNames as pos}
+                  {@const grp = positionGroup(pos)}
+                  {@const color = getGroupColor(grp)}
+                  {@const active = filterKeys.has(pos)}
+                  <button class="filter-chip" class:active
+                    style={active ? `background:${color.bg};border-color:${color.bg};color:#fff;` : `border-color:${color.bg};color:${color.bg};`}
+                    on:click={() => toggleFilter(pos)}>{pos}</button>
+                {/each}
+              {/if}
+              {#if filterKeys.size > 0}
+                <button class="filter-chip filter-clear" on:click={() => filterKeys = new Set()}>✕ Clear</button>
+              {/if}
+            </div>
+          </div>
+        {/if}
 
         {#if sortedRoster.length === 0}
           <p class="text-muted small">No players in roster.</p>
         {:else}
           <div class="player-list">
             {#each sortedRoster as p}
-              {@const segs = barSegments(totals[p.id])}
+              {@const ft = filteredTotals[p.id]}
               <div class="player-row">
                 <div class="player-info">
                   <span class="player-num">#{p.number}</span>
                   <span class="player-name">{p.name}</span>
-                  <span class="player-time">{fmt(p.activeMs)}</span>
+                  <span class="player-time">{fmt(ft?.ms ?? 0)}</span>
                 </div>
                 <div class="time-bar-wrap">
-                  {#each segs as seg}
+                  {#each ft?.segs ?? [] as seg}
                     {@const color = getGroupColor(seg.grp || null)}
                     <div class="time-bar-seg"
-                      style="width:{(seg.ms / maxMs * 100).toFixed(2)}%;background:{color.bg};{seg.planned ? 'opacity:0.45;' : ''}"
+                      style="width:{(seg.ms / maxMs * 100).toFixed(2)}%;background:{color.bg};{seg.planned ? 'opacity:0.50;' : ''}"
                       title="{seg.grp || 'Unknown'} ({seg.planned ? 'planned' : 'actual'}): {fmt(seg.ms)}">
                     </div>
                   {/each}
@@ -347,6 +459,19 @@
   .totals-header { display: flex; align-items: center; gap: 0.6rem; margin-bottom: 1rem; flex-wrap: wrap; }
   .totals-summary { color: #64748b; font-size: 0.82rem; }
   .sort-btn { margin-left: auto; }
+
+  .filter-row { display: flex; align-items: center; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 0.85rem; }
+  .filter-mode-toggle { display: flex; background: #0f172a; border-radius: 0.4rem; padding: 0.15rem; flex-shrink: 0; }
+  .filter-mode-toggle button { background: transparent; border: none; color: #64748b; padding: 0.2rem 0.6rem; border-radius: 0.3rem; cursor: pointer; font-size: 0.75rem; font-weight: 600; }
+  .filter-mode-toggle button.active { background: #334155; color: #f8fafc; }
+  .filter-chips { display: flex; flex-wrap: wrap; align-items: center; gap: 0.35rem; }
+  .filter-chip {
+    background: transparent; border: 1px solid; border-radius: 0.4rem;
+    font-size: 0.75rem; font-weight: 600; padding: 0.15rem 0.5rem;
+    cursor: pointer; transition: all 0.12s;
+  }
+  .filter-chip:hover { opacity: 0.8; }
+  .filter-clear { border-color: #475569 !important; color: #64748b !important; background: transparent !important; }
 
   .player-list { display: flex; flex-direction: column; gap: 0.55rem; }
   .player-row { display: flex; flex-direction: column; gap: 0.2rem; }

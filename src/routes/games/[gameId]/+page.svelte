@@ -894,7 +894,7 @@
         </div>
         <div class="form-group">
           <label>Pre-Game Notes</label>
-          <textarea bind:value={game.preNotes} on:blur={saveGameNotes} rows="3"></textarea>
+          <textarea bind:value={game.preNotes} on:blur={saveGameNotes} rows="6"></textarea>
         </div>
         <span class="save-status">{saveStatus}</span>
       </div>
@@ -984,7 +984,7 @@
                             on:input={(e) => { game.gamePlan[idx].name = e.target.value; markGamePlanDirty(); }}
                             placeholder="Lineup {idx + 1}" />
                           <div class="plan-dur-row">
-                            <input class="plan-dur-input" type="number" min="1" max="120"
+                            <input style="width: 4rem" class="plan-dur-input" type="number" min="1" max="120"
                               value={step.durationMins}
                               on:input={(e) => { game.gamePlan[idx].durationMins = Number(e.target.value); markGamePlanDirty(); }} />
                             <span class="plan-dur-label">min</span>
@@ -1041,7 +1041,7 @@
                       {@const pos = col.formation?.positions?.[rowIdx]}
                       {#if pos}
                         {@const posColor = getGroupColor(pos.group)}
-                        <td class="plan-pos-td" style="border-left: 3px solid {posColor.bg};">{pos.name}</td>
+                        <td class="plan-pos-td" style="box-shadow: inset 3px 0 0 {posColor.bg};">{pos.name}</td>
                       {:else}
                         <td class="plan-pos-td plan-pos-empty-cell"></td>
                       {/if}
@@ -1686,7 +1686,7 @@
   .plan-grid-wrap { overflow-x: auto; margin-bottom: 0.75rem; }
   .plan-grid { border-collapse: collapse; font-size: 0.88rem; color: #e2e8f0; width: max-content; min-width: 100%; }
 
-  .plan-pos-th-sep { border-left: 2px solid #334155; }
+  .plan-pos-th-sep { box-shadow: inset 2px 0 0 #334155; }
   .plan-pos-empty { border-left: 2px solid #334155; background: transparent; padding: 0; }
   .plan-cell-oos { background: #0a0f1a; cursor: default; border-left: 2px solid #334155; }
   .plan-cell-oos:hover { background: #0a0f1a; }
@@ -1695,6 +1695,7 @@
     text-align: left; color: #94a3b8; font-weight: 600;
     padding: 0.5rem 0.5rem; border-bottom: 2px solid #334155;
     min-width: 6rem; vertical-align: bottom;
+    position: sticky; left: 0; background: #111827; z-index: 2;
   }
   .plan-seg-form-sel { background: #0f172a; border: 1px solid #334155; color: #f8fafc; padding: 0.25rem 0.4rem; border-radius: 0.35rem; font-size: 0.78rem; outline: none; width: 100%; }
   .plan-seg-form-sel:focus { border-color: #3b82f6; }
@@ -1703,7 +1704,7 @@
   .plan-step-th {
     border-bottom: 2px solid #334155;
     padding: 0.4rem 0.35rem;
-    min-width: 6.5rem;
+    width: 7.5rem;
     vertical-align: top;
   }
   .plan-step-hdr { display: flex; flex-direction: column; gap: 0.3rem; align-items: flex-start; }

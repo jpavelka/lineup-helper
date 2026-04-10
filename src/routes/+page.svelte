@@ -242,6 +242,8 @@
               <div class="team-actions">
                 <a href="/teams/{team.id}" class="btn-secondary">Manage Team</a>
                 <a href="/teams/{team.id}/schedule" class="btn-secondary">Schedule</a>
+                <a href="/teams/{team.id}/stats" class="btn-secondary">Season Stats</a>
+                <a href="/teams/{team.id}/playingTime" class="btn-secondary">Playing Time</a>
               </div>
             </div>
           {/each}
@@ -476,7 +478,8 @@
   .muted { color: #94a3b8; margin: 0; }
 
   .team-actions {
-    display: flex;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
     gap: 0.5rem;
     margin-top: auto;
   }

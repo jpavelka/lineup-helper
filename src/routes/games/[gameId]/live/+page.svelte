@@ -114,6 +114,26 @@
     const stintBase = lastSub ? lastSub.gameTimeMs : 0;
     (team?.roster || []).forEach(p => { stintStartMs[p.id] = stintBase; });
 
+    // Pre-stage first game plan step for unstarted games with an empty lineup
+    const hasLineup = Object.values(game.lineup).some(Boolean);
+    if (game.status === 'scheduled' && !hasLineup && game.gamePlan.length > 0) {
+      const firstStep = game.gamePlan[0];
+      if (firstStep.formationId && firstStep.formationId !== game.formationId) {
+        const stepFormation = formations.find(f => f.id === firstStep.formationId);
+        if (stepFormation) { formation = stepFormation; game.formationId = firstStep.formationId; }
+      }
+      const availableIds = new Set(
+        (team?.roster ?? []).filter(p => game.availablePlayers?.includes(p.id)).map(p => p.id)
+      );
+      const newLineup = {};
+      for (const [posId, playerId] of Object.entries(firstStep.players ?? {})) {
+        newLineup[posId] = availableIds.has(playerId) ? playerId : null;
+      }
+      lineup = newLineup;
+      pendingPlanStepName = firstStep.name || 'Lineup 1';
+      planStepIndex = 0;
+    }
+
     loading = false;
     timerInterval = setInterval(() => { now = Date.now(); }, 1000);
   });
@@ -469,6 +489,7 @@
     lineup = newLineup;
     selectedItem = null;
     pendingLineupId = null;
+    pendingPlanStepName = null;
   }
 
   async function applyLineup() {
@@ -643,23 +664,26 @@
   {#if game.gamePlan?.length > 0}
     <div class="plan-nav">
       <span class="plan-nav-label">Game Plan</span>
-      <div class="plan-steps">
-        {#each game.gamePlan as step, i}
-          {@const name = step.name || `Lineup ${i + 1}`}
-          <button
-            class="plan-step-chip"
-            class:active={planStepIndex === i}
-            on:click={() => loadPlanStep(i)}
-            title="{name} · {step.durationMins} min"
-          >
-            <span class="chip-name">{name}</span>
-            <span class="chip-dur">{step.durationMins}′</span>
-          </button>
-        {/each}
-      </div>
-      <div class="plan-nav-arrows">
-        <button class="plan-arrow" disabled={planStepIndex === null || planStepIndex <= 0} on:click={() => loadPlanStep((planStepIndex ?? 1) - 1)}>‹</button>
-        <button class="plan-arrow" disabled={planStepIndex !== null && planStepIndex >= game.gamePlan.length - 1} on:click={() => loadPlanStep(planStepIndex === null ? 0 : planStepIndex + 1)}>›</button>
+      <div class="plan-nav-bottom">
+        <div class="plan-steps">
+          {#each game.gamePlan as step, i}
+            {@const name = step.name || `Lineup ${i + 1}`}
+            <button
+              class="plan-step-chip"
+              class:active={name === appliedPlanStepName}
+              class:pending={name === pendingPlanStepName && name !== appliedPlanStepName}
+              on:click={() => loadPlanStep(i)}
+              title="{name} · {step.durationMins} min"
+            >
+              <span class="chip-name">{name}</span>
+              <span class="chip-dur">{step.durationMins}′</span>
+            </button>
+          {/each}
+        </div>
+        <div class="plan-nav-arrows">
+          <button class="plan-arrow" disabled={planStepIndex === null || planStepIndex <= 0} on:click={() => loadPlanStep((planStepIndex ?? 1) - 1)}>‹</button>
+          <button class="plan-arrow" disabled={planStepIndex !== null && planStepIndex >= game.gamePlan.length - 1} on:click={() => loadPlanStep(planStepIndex === null ? 0 : planStepIndex + 1)}>›</button>
+        </div>
       </div>
     </div>
   {/if}
@@ -671,6 +695,9 @@
       <div class="pitch-header">
         <div class="pitch-header-title">
           <h2>On Field</h2>
+          {#if !gameEnded}
+            <button class="btn-primary" on:click={applyLineup} style="margin-left:5pt" disabled={pendingSubs.length === 0 || game.status === 'scheduled'}>Apply Subs</button>
+          {/if}
           <div class="view-toggle">
             <button class:active={!pitchView} on:click={() => pitchView = false}>List</button>
             <button class:active={pitchView} on:click={() => pitchView = true}>Field</button>
@@ -678,7 +705,6 @@
         </div>
         <div class="pitch-header-actions">
           {#if !gameEnded}
-            <button class="btn-primary btn-sub-action" on:click={applyLineup} disabled={pendingSubs.length === 0 || game.status === 'scheduled'}>Apply Subs</button>
             <button class="btn-secondary btn-sub-action" on:click={() => { lineup = { ...game.lineup }; pendingLineupId = appliedLineupId; selectedItem = null; }} disabled={pendingSubs.length === 0}>Clear</button>
           {/if}
           <!-- svelte-ignore a11y-no-onchange -->
@@ -778,7 +804,7 @@
                 {/if}
               </div>
               {#if gameStarted && pendingSub}
-                <button class="btn-restore" title="Restore current player" on:click|stopPropagation={() => { lineup = { ...lineup, [pos.id]: game.lineup[pos.id] ?? null }; selectedItem = null; pendingLineupId = null; }}>↺</button>
+                <button class="btn-restore" title="Restore current player" on:click|stopPropagation={() => { lineup = { ...lineup, [pos.id]: game.lineup[pos.id] ?? null }; selectedItem = null; pendingLineupId = null; pendingPlanStepName = null; }}>↺</button>
               {:else if lineup[pos.id]}
                 <button class="btn-remove" on:click|stopPropagation={() => executeSwap('slot', pos.id)}>×</button>
               {/if}
@@ -1064,26 +1090,30 @@
 
   /* ─── Game plan navigator ─── */
   .plan-nav {
-    display: flex; align-items: center; gap: 0.5rem;
+    display: flex; flex-direction: column; align-items: flex-start; gap: 0.35rem;
     background: #0f172a; border: 1px solid #1e293b; border-radius: 0.6rem;
     padding: 0.4rem 0.6rem; margin-bottom: 0.6rem; overflow: hidden;
   }
-  .plan-nav-label { font-size: 0.7rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; flex-shrink: 0; }
+  .plan-nav-label { font-size: 0.9rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; }
+  .plan-nav-bottom { display: flex; align-items: center; gap: 0.5rem; width: 100%; overflow: hidden; }
   .plan-steps { display: flex; gap: 0.3rem; overflow-x: auto; flex: 1; padding-bottom: 1px; }
   .plan-steps::-webkit-scrollbar { display: none; }
   .plan-step-chip {
     display: flex; align-items: center; gap: 0.3rem;
     background: #1e293b; border: 1px solid #334155; color: #64748b;
-    padding: 0.2rem 0.5rem; border-radius: 0.4rem; cursor: pointer;
+    padding: 0.4rem 0.5rem; border-radius: 0.4rem; cursor: pointer;
     font-size: 0.75rem; white-space: nowrap; flex-shrink: 0; transition: all 0.15s;
   }
   .plan-step-chip:hover { background: #334155; color: #cbd5e1; }
   .plan-step-chip.active { background: #1e3a5f; border-color: #3b82f6; color: #93c5fd; }
+  .plan-step-chip.pending { background: #2d1f08; border-color: #d97706; color: #fcd34d; }
   .chip-num { font-weight: 700; color: #475569; font-size: 0.65rem; }
   .plan-step-chip.active .chip-num { color: #60a5fa; }
+  .plan-step-chip.pending .chip-num { color: #f59e0b; }
   .chip-name { font-weight: 600; }
   .chip-dur { color: #475569; font-size: 0.65rem; }
   .plan-step-chip.active .chip-dur { color: #60a5fa; }
+  .plan-step-chip.pending .chip-dur { color: #f59e0b; }
   .plan-nav-arrows { display: flex; gap: 0.2rem; flex-shrink: 0; }
   .plan-arrow {
     background: #1e293b; border: 1px solid #334155; color: #94a3b8;
@@ -1110,7 +1140,7 @@
 
   /* ─── Pitch panel ─── */
   .pitch-header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #334155; padding-bottom: 0.5rem; margin-bottom: 0.75rem; gap: 0.5rem; flex-wrap: wrap; }
-  .lineup-label { font-size: 0.72rem; color: #64748b; margin-bottom: 0.5rem; font-style: italic; }
+  .lineup-label { font-size: 0.72rem; color: #f8fafc; margin-bottom: 0.5rem; font-style: italic; font-weight: bold;}
   .pitch-header-title { display: flex; align-items: center; gap: 0.5rem; flex: 1; }
   .pitch-header h2 { margin: 0; border: none; padding: 0; }
   .pitch-header-actions { display: flex; align-items: center; gap: 0.5rem; margin-left: auto; }
@@ -1131,9 +1161,9 @@
   .slot-card, .bench-card {
     display: flex; align-items: center; gap: 0.5rem;
     background: #1e293b; border: 2px solid transparent; border-radius: 0.5rem;
-    padding: 0.5rem 0.75rem; cursor: pointer; transition: all 0.1s; min-height: 50px;
+    padding: 0.3rem 0.5rem; cursor: pointer; transition: all 0.1s; min-height: 50px;
   }
-  .bench-card { flex-direction: column; align-items: stretch; gap: 0.35rem; padding-bottom: 0.4rem; flex-shrink: 0; }
+  .bench-card { flex-direction: column; align-items: stretch; gap: 0.35rem; padding-bottom: 0.3rem; flex-shrink: 0; }
   .bench-card-row { display: flex; align-items: center; gap: 0.5rem; }
   .color-bar { display: flex; height: 5px; border-radius: 3px; overflow: hidden; background: #0f172a; }
   .bar-seg { flex-shrink: 0; height: 100%; }
@@ -1148,7 +1178,7 @@
   .pos-badge { background: #334155; padding: 0.1rem 0.4rem; border-radius: 0.25rem; font-weight: bold; font-size: 0.75rem; min-width: 40px; text-align: center; color: #94a3b8; }
 
   .player-info { display: flex; flex-direction: column; flex: 1; overflow: hidden; }
-  .player-name { font-size: 0.9rem; font-weight: 600; color: #f8fafc; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .player-name { font-size: 1rem; font-weight: 600; color: #f8fafc; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .pos-changed { color: #fb923c; }
   .field-node-label.pos-changed { color: #fb923c; }
   .player-time { font-size: 0.7rem; font-weight: 500; margin-top: 0.05rem; }

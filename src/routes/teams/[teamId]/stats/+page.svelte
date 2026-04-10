@@ -38,7 +38,7 @@
       // Initialise per-player accumulators
       const acc = {};
       for (const p of (team.roster || [])) {
-        acc[p.id] = { activeMs: 0, benchMs: 0, gamesPlayed: 0, goals: 0, assists: 0, yellowCards: 0, redCards: 0 };
+        acc[p.id] = { activeMs: 0, benchMs: 0, gamesPlayed: 0, gamesStarted: 0, goals: 0, assists: 0, yellowCards: 0, redCards: 0 };
       }
 
       for (const game of games) {
@@ -51,10 +51,13 @@
         else record.losses++;
 
         const ps = game.playerStats ?? {};
+        const lineupSetEvent = (game.history || []).find(e => e.event === 'Lineup Set' && e.lineupSnapshot);
+        const startingIds = new Set(Object.values(lineupSetEvent?.lineupSnapshot ?? game.lineup ?? {}).filter(Boolean));
         for (const p of (team.roster || [])) {
           const s = ps[p.id];
           if (!s) continue;
           if ((s.activeMs ?? 0) > 0) acc[p.id].gamesPlayed++;
+          if (startingIds.has(p.id)) acc[p.id].gamesStarted++;
           acc[p.id].activeMs += s.activeMs ?? 0;
           acc[p.id].benchMs += s.benchMs ?? 0;
         }
@@ -159,6 +162,7 @@
               <tr>
                 <th class="col-player" on:click={() => setSort('name')}>Player{arrow('name')}</th>
                 <th class="col-num sortable" on:click={() => setSort('gamesPlayed')}>GP{arrow('gamesPlayed')}</th>
+                <th class="col-num sortable" on:click={() => setSort('gamesStarted')}>GS{arrow('gamesStarted')}</th>
                 <th class="col-time sortable" on:click={() => setSort('activeMs')}>Time{arrow('activeMs')}</th>
                 <th class="col-num sortable" on:click={() => setSort('goals')}>G{arrow('goals')}</th>
                 <th class="col-num sortable" on:click={() => setSort('assists')}>A{arrow('assists')}</th>
@@ -171,6 +175,7 @@
                 <tr class:row-inactive={p.gamesPlayed === 0}>
                   <td><span class="player-num">#{p.number}</span> {p.name}</td>
                   <td class="col-num">{p.gamesPlayed}</td>
+                  <td class="col-num">{p.gamesStarted}</td>
                   <td class="col-time">{fmt(p.activeMs)}</td>
                   <td class="col-num">{p.goals || '–'}</td>
                   <td class="col-num">{p.assists || '–'}</td>

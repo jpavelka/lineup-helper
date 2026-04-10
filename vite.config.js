@@ -22,6 +22,9 @@ export default {
           }
         ]
       },
+      devOptions: {
+        enabled: true
+      },
       workbox: {
         // Cache the app shell (JS, CSS, HTML)
         globPatterns: ['**/*.{js,css,html,svg,png,ico,woff,woff2}'],
