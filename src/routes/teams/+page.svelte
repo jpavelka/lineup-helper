@@ -1,4 +1,4 @@
 <script>
   import { goto } from '$app/navigation';
-  goto('/#formations-section');
+  goto('/#teams-section');
 </script>

@@ -69,6 +69,11 @@
     gap: 0.5rem;
   }
 
+  .nav-logo {
+    width: 1.5rem;
+    height: 1.5rem;
+  }
+
   .nav-links {
     display: flex;
     gap: 1rem;
@@ -115,7 +120,7 @@
     <!-- Top Navigation for Authenticated Users -->
     <nav>
       <a href="/" class="nav-brand">
-        ⚽ Lineup Pro
+        <img src="/favicon.svg" alt="" class="nav-logo" /> Lineup Pro
       </a>
       <div class="nav-links">
         <button class="btn-logout" on:click={handleLogout}>Log Out</button>

@@ -6,10 +6,11 @@
     GoogleAuthProvider, 
     signInWithPopup
   } from 'firebase/auth';
-  import { collection, query, where, getDocs, addDoc, deleteDoc, doc } from 'firebase/firestore';
+  import { collection, query, where, getDocs, addDoc, deleteDoc, doc, writeBatch } from 'firebase/firestore';
   import { authStore } from '$lib/stores/authStore';
   import { goto } from '$app/navigation';
   import { onMount } from 'svelte';
+  import { generateUUID } from '$lib/utils.js';
 
   // Auth Form State
   let email = '';
@@ -20,6 +21,8 @@
   // Dashboard State
   let teams = [];
   let loadingTeams = true;
+  let formations = [];
+  let loadingFormations = true;
 
   // --- Auth Functions ---
   async function handleEmailAuth(e) {
@@ -50,6 +53,7 @@
   // --- Dashboard Functions ---
   $: if ($authStore.user) {
     loadUserTeams();
+    loadFormations();
   }
 
   async function loadUserTeams() {
@@ -79,6 +83,69 @@
     } catch (e) {
       console.error("Error creating team:", e);
       alert("Failed to create a new team.");
+    }
+  }
+
+  async function loadFormations() {
+    loadingFormations = true;
+    try {
+      const q = query(collection(db, 'formations'), where('ownerId', '==', $authStore.user.uid));
+      const snap = await getDocs(q);
+      formations = snap.docs
+        .map(d => ({ id: d.id, ...d.data() }))
+        .filter(f => f.name)
+        .sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0) || a.name.localeCompare(b.name));
+    } catch (e) {
+      console.error("Error loading formations:", e);
+    } finally {
+      loadingFormations = false;
+    }
+  }
+
+  async function createNewFormation() {
+    try {
+      const ref = await addDoc(collection(db, 'formations'), {
+        name: 'New Formation',
+        ownerId: $authStore.user.uid,
+        groups: ['GK', 'DEF', 'MID', 'FWD'],
+        positions: [
+          { id: generateUUID(), name: 'GK',  group: 'GK',  x: 50, y: 92 },
+          { id: generateUUID(), name: 'RB',  group: 'DEF', x: 85, y: 75 },
+          { id: generateUUID(), name: 'RCB', group: 'DEF', x: 60, y: 80 },
+          { id: generateUUID(), name: 'LCB', group: 'DEF', x: 40, y: 80 },
+          { id: generateUUID(), name: 'LB',  group: 'DEF', x: 15, y: 75 },
+          { id: generateUUID(), name: 'RM',  group: 'MID', x: 80, y: 50 },
+          { id: generateUUID(), name: 'RCM', group: 'MID', x: 60, y: 55 },
+          { id: generateUUID(), name: 'LCM', group: 'MID', x: 40, y: 55 },
+          { id: generateUUID(), name: 'LM',  group: 'MID', x: 20, y: 50 },
+          { id: generateUUID(), name: 'RS',  group: 'FWD', x: 60, y: 25 },
+          { id: generateUUID(), name: 'LS',  group: 'FWD', x: 40, y: 25 },
+        ]
+      });
+      goto(`/formations/${ref.id}`);
+    } catch (e) {
+      console.error("Error creating formation:", e);
+    }
+  }
+
+  async function moveFormation(index, dir) {
+    const newIndex = index + dir;
+    if (newIndex < 0 || newIndex >= formations.length) return;
+    const updated = [...formations];
+    [updated[index], updated[newIndex]] = [updated[newIndex], updated[index]];
+    formations = updated;
+    const batch = writeBatch(db);
+    formations.forEach((f, i) => batch.update(doc(db, 'formations', f.id), { sortOrder: i }));
+    await batch.commit();
+  }
+
+  async function deleteFormation(formId, formName) {
+    if (!confirm(`Are you sure you want to delete the formation "${formName}"?`)) return;
+    try {
+      await deleteDoc(doc(db, 'formations', formId));
+      formations = formations.filter(f => f.id !== formId);
+    } catch (e) {
+      console.error("Error deleting formation:", e);
     }
   }
 
@@ -147,11 +214,13 @@
   <div class="dashboard">
     <header class="dash-header">
       <h1>Coach Dashboard</h1>
-      <button class="btn-primary" on:click={createNewTeam}>+ Create New Team</button>
     </header>
 
-    <section class="teams-section">
-      <h2>My Teams</h2>
+    <section class="teams-section" id="teams-section">
+      <header class="section-header">
+        <h2>My Teams</h2>
+        <button class="btn-primary" on:click={createNewTeam}>+ Create New Team</button>
+      </header>
       
       {#if loadingTeams}
         <p class="muted">Loading your teams...</p>
@@ -189,17 +258,39 @@
       {/if}
     </section>
 
-    <section class="quick-actions-section">
-      <h2>Quick Actions</h2>
-      <div class="grid-layout">
-        <a href="/formations" class="quick-action-card">
-          <div class="icon">⚽</div>
-          <div class="details">
-            <h3>Global Formations</h3>
-            <p>Build and edit tactical formations (e.g., 4-3-3, 3-5-2) to use across all your teams.</p>
-          </div>
-        </a>
-      </div>
+    <section class="formations-section" id="formations-section">
+      <header class="section-header">
+        <h2>My Formations</h2>
+        <button class="btn-primary" on:click={createNewFormation}>+ Create Formation</button>
+      </header>
+
+      {#if loadingFormations}
+        <p class="muted">Loading formations...</p>
+      {:else}
+        <div class="grid-layout">
+          {#each formations as form, i}
+            <div class="formation-card">
+              <button class="btn-delete-card" on:click={() => deleteFormation(form.id, form.name)}>✕</button>
+              <div class="reorder-btns">
+                <button class="btn-reorder" disabled={i === 0} on:click={() => moveFormation(i, -1)} title="Move up">▲</button>
+                <button class="btn-reorder" disabled={i === formations.length - 1} on:click={() => moveFormation(i, 1)} title="Move down">▼</button>
+              </div>
+              <a href="/formations/{form.id}" class="formation-link">
+                <h3>{form.name}</h3>
+              </a>
+              <p class="muted">{form.positions?.length || 0} Positions</p>
+              <a href="/formations/{form.id}" class="btn-secondary">Edit</a>
+            </div>
+          {/each}
+
+          {#if formations.length === 0}
+            <div class="formation-card empty-state">
+              <p class="muted">You haven't created any formations yet.</p>
+              <button class="btn-primary" on:click={createNewFormation}>Create Your First Formation</button>
+            </div>
+          {/if}
+        </div>
+      {/if}
     </section>
   </div>
 {/if}
@@ -349,9 +440,17 @@
 
   .dash-header h1 { margin: 0; }
 
-  .teams-section, .quick-actions-section {
+  .teams-section, .formations-section {
     margin-bottom: 3rem;
   }
+
+  .section-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 1.5rem;
+  }
+  .section-header h2 { margin: 0; }
 
   .grid-layout {
     display: grid;
@@ -401,29 +500,44 @@
     opacity: 1;
   }
 
-  .quick-action-card {
+  .formation-card {
+    position: relative;
     background: #111827;
     border: 1px solid #334155;
     border-radius: 1rem;
     padding: 1.5rem;
     display: flex;
-    gap: 1rem;
-    text-decoration: none;
-    color: inherit;
-    transition: transform 0.2s, border-color 0.2s;
+    flex-direction: column;
+    gap: 0.5rem;
   }
+  .formation-card h3 { margin: 0 0 0.25rem 0; font-size: 1.25rem; }
+  .formation-card .btn-secondary { margin-top: auto; text-align: center; text-decoration: none; }
+  .empty-state { border-style: dashed; align-items: center; text-align: center; }
 
-  .quick-action-card:hover {
-    transform: translateY(-2px);
-    border-color: #3b82f6;
+  .formation-link { text-decoration: none; color: inherit; display: block; width: fit-content; }
+  .formation-link:hover h3 { color: #3b82f6; }
+
+  .reorder-btns {
+    position: absolute;
+    top: 0.5rem;
+    left: 0.5rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.1rem;
   }
-
-  .quick-action-card .icon {
-    font-size: 2rem;
+  .btn-reorder {
+    background: transparent;
+    border: none;
+    color: #64748b;
+    font-size: 0.6rem;
+    padding: 0.1rem 0.3rem;
+    cursor: pointer;
+    line-height: 1;
+    border-radius: 0.2rem;
+    transition: color 0.15s;
   }
-
-  .quick-action-card h3 { margin: 0 0 0.25rem 0; color: #3b82f6;}
-  .quick-action-card p { margin: 0; color: #94a3b8; font-size: 0.9rem; line-height: 1.4;}
+  .btn-reorder:hover:not(:disabled) { color: #cbd5e1; }
+  .btn-reorder:disabled { opacity: 0.2; cursor: default; }
 
   /* Shared Buttons */
   .btn-primary {

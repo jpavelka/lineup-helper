@@ -122,9 +122,7 @@
 
   // --- Derived State ---
   $: availableRoster = team?.roster.filter(p => game?.availablePlayers?.includes(p.id)) || [];
-  // Active players based on the *applied* lineup (game.lineup), not the pending local lineup
   $: appliedPlayerIds = Object.values(game?.lineup || {}).filter(id => id !== null);
-  $: activePlayerIds = Object.values(lineup).filter(id => id !== null);
   $: benchPlayers = availableRoster.filter(p => !appliedPlayerIds.includes(p.id));
 
   $: liveGameTimeMs = (game?.gameTimeStats.totalMs ?? 0) +
@@ -223,7 +221,7 @@
     game.gameTimeStats.sessionStart = Date.now();
     availableRoster.forEach(p => {
       if (!game.playerStats[p.id]) game.playerStats[p.id] = { activeMs: 0, benchMs: 0 };
-      if (activePlayerIds.includes(p.id)) game.playerStats[p.id].activeMs += elapsed;
+      if (appliedPlayerIds.includes(p.id)) game.playerStats[p.id].activeMs += elapsed;
       else game.playerStats[p.id].benchMs += elapsed;
     });
   }
@@ -243,21 +241,23 @@
       }
       const isResume = game.status === 'paused';
 
-      // On first start, auto-apply any pending lineup changes
-      if (!isResume && pendingSubs.length > 0) {
-        const prevFieldIds = new Set(Object.values(game.lineup).filter(Boolean));
-        const newFieldIds = new Set(Object.values(lineup).filter(Boolean));
-        availableRoster.forEach(p => {
-          if (prevFieldIds.has(p.id) !== newFieldIds.has(p.id)) {
-            stintStartMs = { ...stintStartMs, [p.id]: 0 };
-          }
-        });
-        game.lineup = { ...lineup };
-        appliedLineupId = pendingLineupId;
-        appliedPlanStepName = pendingPlanStepName;
-        game.appliedLineupId = appliedLineupId;
-        game.appliedPlanStepName = appliedPlanStepName;
-        game.history.push({ event: 'Lineup Set', timestamp: Date.now(), gameTimeMs: 0, lineupSnapshot: { ...lineup } });
+      // On first start, always record the initial lineup and auto-apply any pending changes
+      if (!isResume) {
+        if (pendingSubs.length > 0) {
+          const prevFieldIds = new Set(Object.values(game.lineup).filter(Boolean));
+          const newFieldIds = new Set(Object.values(lineup).filter(Boolean));
+          availableRoster.forEach(p => {
+            if (prevFieldIds.has(p.id) !== newFieldIds.has(p.id)) {
+              stintStartMs = { ...stintStartMs, [p.id]: 0 };
+            }
+          });
+          game.lineup = { ...lineup };
+          appliedLineupId = pendingLineupId;
+          appliedPlanStepName = pendingPlanStepName;
+          game.appliedLineupId = appliedLineupId;
+          game.appliedPlanStepName = appliedPlanStepName;
+        }
+        game.history.push({ event: 'Lineup Set', timestamp: Date.now(), gameTimeMs: 0, lineupSnapshot: { ...game.lineup } });
       }
 
       game.gameTimeStats.sessionStart = Date.now();

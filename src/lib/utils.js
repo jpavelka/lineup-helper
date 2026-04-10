@@ -1,3 +1,5 @@
+const roundToSec = ms => Math.round(ms / 1000) * 1000;
+
 /**
  * Computes per-player position and group time from game history.
  * Returns { [playerId]: { positionMs: { [posId]: ms }, groupMs: { [group]: ms } } }
@@ -23,8 +25,9 @@ export function computePositionStats(history, formation) {
   let intervalStart = null;
 
   for (const ev of sorted) {
-    if (isLive && intervalStart !== null && ev.timestamp > intervalStart) {
-      const duration = ev.timestamp - intervalStart;
+    const ts = roundToSec(ev.timestamp);
+    if (isLive && intervalStart !== null && ts > intervalStart) {
+      const duration = ts - intervalStart;
       Object.entries(currentLineup).forEach(([posId, playerId]) => {
         if (!playerId) return;
         const s = ensure(playerId);
@@ -36,7 +39,7 @@ export function computePositionStats(history, formation) {
     if (ev.lineupSnapshot) currentLineup = { ...ev.lineupSnapshot };
     if (ev.event === 'Game Started' || ev.event === 'Game Resumed') isLive = true;
     else if (ev.event === 'Game Paused' || ev.event === 'Match Ended') isLive = false;
-    intervalStart = ev.timestamp;
+    intervalStart = ts;
   }
   return stats;
 }
@@ -66,9 +69,11 @@ export function computePlayerTimelines(history, formation, roster) {
   let prevGameMs = 0;
 
   for (const ev of sorted) {
-    if (isLive && prevTs !== null && ev.timestamp > prevTs) {
+    const ts = roundToSec(ev.timestamp);
+    const gms = ev.gameTimeMs != null ? roundToSec(ev.gameTimeMs) : null;
+    if (isLive && prevTs !== null && ts > prevTs) {
       const segStart = prevGameMs;
-      const segEnd = ev.gameTimeMs ?? (prevGameMs + (ev.timestamp - prevTs));
+      const segEnd = gms ?? (prevGameMs + (ts - prevTs));
       if (segEnd > segStart) {
         const onField = new Set(Object.values(currentLineup).filter(Boolean));
         roster.forEach(p => {
@@ -81,8 +86,8 @@ export function computePlayerTimelines(history, formation, roster) {
     if (ev.lineupSnapshot) currentLineup = { ...ev.lineupSnapshot };
     if (ev.event === 'Game Started' || ev.event === 'Game Resumed') isLive = true;
     else if (ev.event === 'Game Paused' || ev.event === 'Match Ended') isLive = false;
-    prevTs = ev.timestamp;
-    prevGameMs = ev.gameTimeMs ?? prevGameMs;
+    prevTs = ts;
+    prevGameMs = gms ?? prevGameMs;
   }
   return segs;
 }
@@ -99,7 +104,7 @@ export function generateUUID() {
   }
   // Fallback for older browsers
   return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
-    const r = Math.random() * 16 | 0, 
+    const r = Math.random() * 16 | 0,
           v = c === 'x' ? r : (r & 0x3 | 0x8);
     return v.toString(16);
   });

@@ -130,12 +130,12 @@
           <span class="record-lbl">Wins</span>
         </div>
         <div class="record-cell">
-          <span class="record-val draw">{record.draws}</span>
-          <span class="record-lbl">Draws</span>
-        </div>
-        <div class="record-cell">
           <span class="record-val loss">{record.losses}</span>
           <span class="record-lbl">Losses</span>
+        </div>
+        <div class="record-cell">
+          <span class="record-val draw">{record.draws}</span>
+          <span class="record-lbl">Draws</span>
         </div>
         <div class="record-cell">
           <span class="record-val">{record.goalsFor}</span>
