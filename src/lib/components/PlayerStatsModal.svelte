@@ -16,7 +16,7 @@
 
   const dispatch = createEventDispatcher();
 
-  let barMode = 'grouped'; // 'grouped' | 'timeline'
+  let barMode = 'timeline'; // 'grouped' | 'timeline'
 
   function formatDuration(ms) {
     if (!ms) return '0:00';
@@ -49,8 +49,8 @@
     {#if groupedSegments.length > 0 || hasTimeline}
       {#if hasTimeline}
         <div class="bar-mode-toggle">
-          <button class:active={barMode === 'grouped'} on:click={() => barMode = 'grouped'}>Grouped</button>
           <button class:active={barMode === 'timeline'} on:click={() => barMode = 'timeline'}>Timeline</button>
+          <button class:active={barMode === 'grouped'} on:click={() => barMode = 'grouped'}>Grouped</button>
         </div>
       {/if}
       <div class="color-bar">

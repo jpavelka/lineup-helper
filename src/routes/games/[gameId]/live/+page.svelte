@@ -3,6 +3,7 @@
   import { onMount, onDestroy } from 'svelte';
   import { doc, getDoc, updateDoc, collection, query, where, getDocs } from 'firebase/firestore';
   import { db } from '$lib/firebase/config';
+  import { authStore } from '$lib/stores/authStore';
   import { getGroupColor } from '$lib/groupColors.js';
   import { computePositionStats, computePlayerTimelines } from '$lib/utils.js';
   import MatchTimeline from '$lib/components/MatchTimeline.svelte';
@@ -13,6 +14,7 @@
   let game = null;
   let team = null;
   let formation = null;
+  let formations = [];
   let lineup = {};
   let savedLineups = [];
 
@@ -26,14 +28,17 @@
   let timerInterval;
   let gameLive = false;
   let gameEnded = false;
+  $: gameStarted = game?.status && game.status !== 'scheduled';
 
   // --- Bench Sort & Bar Mode ---
   let benchSort = 'status';
-  let colorBarMode = 'grouped'; // 'grouped' | 'timeline'
+  let colorBarMode = 'timeline'; // 'grouped' | 'timeline'
 
   // --- Preset lineup tracking ---
   let appliedLineupId = null;  // which saved lineup is currently on the field
+  let appliedPlanStepName = null; // name of plan step currently on the field
   let pendingLineupId = null;  // which saved lineup the pending local lineup came from
+  let pendingPlanStepName = null; // name of plan step loaded into pending lineup
 
   // --- Game plan navigation ---
   let planStepIndex = null; // null = not following plan; number = current step index
@@ -75,8 +80,12 @@
     if (!game.gameTimeStats) game.gameTimeStats = { totalMs: 0, sessionStart: null };
     if (!game.score) game.score = { mine: 0, theirs: 0 };
     if (!game.gamePlan) game.gamePlan = [];
+    if (!game.appliedLineupId) game.appliedLineupId = null;
+    if (!game.appliedPlanStepName) game.appliedPlanStepName = null;
 
     lineup = { ...game.lineup };
+    appliedLineupId = game.appliedLineupId;
+    appliedPlanStepName = game.appliedPlanStepName;
     gameLive = game.status === 'live';
     gameEnded = game.status === 'completed';
 
@@ -86,12 +95,19 @@
     const lineupsSnap = await getDocs(query(collection(db, 'lineups'), where('teamId', '==', game.teamId)));
     savedLineups = lineupsSnap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0) || a.name.localeCompare(b.name));
 
-    if (game.formationId) {
-      const formSnap = await getDoc(doc(db, 'formations', game.formationId));
-      formation = formSnap.data();
-    } else {
-      formation = { positions: [{id: 'p1', name: 'GK'}, {id: 'p2', name: 'DEF'}, {id: 'p3', name: 'FWD'}] };
-    }
+    // Migrate old gamePlan format: { lineupId, durationMins } → { durationMins, players, formationId }
+    game.gamePlan = game.gamePlan.map(step => {
+      if (step.lineupId !== undefined && !step.players) {
+        const lu = savedLineups.find(l => l.id === step.lineupId);
+        return { ...step, players: { ...(lu?.players ?? {}) } };
+      }
+      if (!step.players) step.players = {};
+      return step;
+    });
+
+    const formationsSnap = await getDocs(query(collection(db, 'formations'), where('ownerId', '==', $authStore.user.uid)));
+    formations = formationsSnap.docs.map(d => ({ id: d.id, ...d.data() })).filter(f => f.name).sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0) || a.name.localeCompare(b.name));
+    formation = formations.find(f => f.id === game.formationId) ?? null;
 
     // Initialise stint tracking from the last sub event (or 0 if no subs yet)
     const lastSub = [...game.history].filter(e => e.lineupSnapshot).sort((a, b) => b.gameTimeMs - a.gameTimeMs)[0];
@@ -141,10 +157,10 @@
   $: goalEvents = [...(game?.history || [])].filter(e => e.type === 'goal').sort((a, b) => a.gameTimeMs - b.gameTimeMs);
 
   $: lineupLabel = (() => {
-    const appliedName = appliedLineupId ? savedLineups.find(l => l.id === appliedLineupId)?.name ?? null : null;
-    const pendingName = pendingLineupId ? savedLineups.find(l => l.id === pendingLineupId)?.name ?? null : null;
+    const appliedName = appliedPlanStepName ?? (appliedLineupId ? savedLineups.find(l => l.id === appliedLineupId)?.name ?? null : null);
+    const pendingName = pendingPlanStepName ?? (pendingLineupId ? savedLineups.find(l => l.id === pendingLineupId)?.name ?? null : null);
     if (!appliedName && !pendingName) return null;
-    if (appliedLineupId === pendingLineupId) return appliedName ?? 'manual lineup';
+    if (!gameStarted || appliedName === pendingName) return pendingName ?? appliedName ?? 'manual lineup';
     return `${appliedName ?? 'manual lineup'} → ${pendingName ?? 'manual lineup'}`;
   })();
 
@@ -154,8 +170,8 @@
       const stats = livePlayerStats.find(s => s.id === p.id) || { activeMs: 0, benchMs: 0 };
       const onField = appliedPlayerIds.includes(p.id);
       const stintMs = liveGameTimeMs - (stintStartMs[p.id] ?? 0);
-      const pendingIn = pendingSubs.some(s => s.playerInId === p.id);
-      const pendingOut = pendingSubs.some(s => s.playerOutId === p.id);
+      const pendingIn = gameStarted && pendingSubs.some(s => s.playerInId === p.id);
+      const pendingOut = gameStarted && pendingSubs.some(s => s.playerOutId === p.id);
       return { ...p, ...stats, onField, stintMs, pendingIn, pendingOut };
     });
 
@@ -238,12 +254,16 @@
         });
         game.lineup = { ...lineup };
         appliedLineupId = pendingLineupId;
+        appliedPlanStepName = pendingPlanStepName;
+        game.appliedLineupId = appliedLineupId;
+        game.appliedPlanStepName = appliedPlanStepName;
         game.history.push({ event: 'Lineup Set', timestamp: Date.now(), gameTimeMs: 0, lineupSnapshot: { ...lineup } });
       }
 
       game.gameTimeStats.sessionStart = Date.now();
       game.status = 'live';
       gameLive = true;
+      changedPositionPlayers = new Set();
       game.history.push({ event: isResume ? 'Game Resumed' : 'Game Started', timestamp: Date.now(), gameTimeMs: game.gameTimeStats.totalMs });
     }
     await syncToDb();
@@ -278,16 +298,72 @@
     game.score = { mine: 0, theirs: 0 };
     game.status = 'scheduled';
     game.lineup = {};
+    game.appliedLineupId = null;
+    game.appliedPlanStepName = null;
     lineup = {};
     gameLive = false;
     gameEnded = false;
     stintStartMs = {};
     appliedLineupId = null;
+    appliedPlanStepName = null;
     pendingLineupId = null;
+    pendingPlanStepName = null;
     await syncToDb();
   }
 
   // --- Load Saved Lineup ---
+  let changedPositionPlayers = new Set();
+
+  async function changeFormation(formationId) {
+    if (!formationId) return;
+    const newFormation = formations.find(f => f.id === formationId);
+    if (!newFormation) return;
+
+    const oldPosNameMap = {};
+    (formation?.positions || []).forEach(p => { oldPosNameMap[p.id] = p.name; });
+
+    const playerOldPosName = {};
+    for (const [posId, playerId] of Object.entries(lineup)) {
+      if (playerId) playerOldPosName[playerId] = oldPosNameMap[posId];
+    }
+
+    const onFieldPlayers = Object.values(lineup).filter(id => id);
+    const newPositions = newFormation.positions || [];
+    const newLineup = {};
+    const usedPlayers = new Set();
+    const filledPositions = new Set();
+
+    // First pass: match by position name
+    for (const newPos of newPositions) {
+      const match = onFieldPlayers.find(pid => !usedPlayers.has(pid) && playerOldPosName[pid] === newPos.name);
+      if (match) {
+        newLineup[newPos.id] = match;
+        usedPlayers.add(match);
+        filledPositions.add(newPos.id);
+      }
+    }
+
+    // Second pass: fill remaining slots with unmatched players
+    const unmatched = onFieldPlayers.filter(pid => !usedPlayers.has(pid));
+    const emptySlots = newPositions.filter(p => !filledPositions.has(p.id));
+    unmatched.forEach((pid, i) => { if (i < emptySlots.length) newLineup[emptySlots[i].id] = pid; });
+
+    // Track players whose position name changed
+    const changed = new Set();
+    for (const [newPosId, playerId] of Object.entries(newLineup)) {
+      const newPosName = newPositions.find(p => p.id === newPosId)?.name;
+      if (playerOldPosName[playerId] !== undefined && playerOldPosName[playerId] !== newPosName) {
+        changed.add(playerId);
+      }
+    }
+
+    changedPositionPlayers = changed;
+    formation = newFormation;
+    lineup = newLineup;
+    game.formationId = formationId;
+    await updateDoc(doc(db, 'games', gameId), { formationId });
+  }
+
   function loadSavedLineup(lineupId) {
     if (!lineupId) return;
     const saved = savedLineups.find(l => l.id === lineupId);
@@ -306,6 +382,7 @@
     }
     lineup = newLineup;
     pendingLineupId = lineupId;
+    pendingPlanStepName = null;
     if (missingCount > 0) {
       showToast(`${missingCount} player${missingCount > 1 ? 's' : ''} from "${saved.name}" ${missingCount > 1 ? 'are' : 'is'} not available — ${missingCount > 1 ? 'their positions were' : 'their position was'} left empty.`);
     }
@@ -314,7 +391,52 @@
   function loadPlanStep(i) {
     if (i < 0 || i >= (game?.gamePlan?.length ?? 0)) return;
     planStepIndex = i;
-    loadSavedLineup(game.gamePlan[i].lineupId);
+    const step = game.gamePlan[i];
+    const stepName = step.name || `Lineup ${i + 1}`;
+
+    if (step.formationId && step.formationId !== game.formationId) {
+      const newFormation = formations.find(f => f.id === step.formationId);
+      if (newFormation) {
+        formation = newFormation;
+        game.formationId = step.formationId;
+        updateDoc(doc(db, 'games', gameId), { formationId: step.formationId });
+      }
+    }
+
+    // Support old format where step had lineupId instead of players map
+    const stepPlayers = step.players ?? (step.lineupId ? (savedLineups.find(l => l.id === step.lineupId)?.players ?? {}) : {});
+
+    const availableIds = new Set(availableRoster.map(p => p.id));
+    const newLineup = {};
+    let missingCount = 0;
+    for (const [posId, playerId] of Object.entries(stepPlayers)) {
+      if (availableIds.has(playerId)) {
+        newLineup[posId] = playerId;
+      } else {
+        newLineup[posId] = null;
+        if (playerId) missingCount++;
+      }
+    }
+    lineup = newLineup;
+    changedPositionPlayers = new Set();
+    pendingLineupId = null;
+    pendingPlanStepName = stepName;
+    if (missingCount > 0) {
+      showToast(`${missingCount} player${missingCount > 1 ? 's' : ''} from "${stepName}" ${missingCount > 1 ? 'are' : 'is'} not available — ${missingCount > 1 ? 'their positions were' : 'their position was'} left empty.`);
+    }
+  }
+
+  function getSubChain(startSub) {
+    const chain = [startSub.playerInId];
+    let currentOutId = startSub.playerOutId;
+    while (currentOutId) {
+      if (currentOutId === startSub.playerInId) break; // cycle back to start
+      chain.push(currentOutId);
+      const nextSub = pendingSubs.find(s => s.playerInId === currentOutId);
+      if (!nextSub || !nextSub.playerOutId) break; // going to bench or empty slot
+      currentOutId = nextSub.playerOutId;
+    }
+    return chain;
   }
 
   // --- Sub / Swap Logic ---
@@ -366,6 +488,9 @@
 
     game.lineup = { ...lineup };
     appliedLineupId = pendingLineupId;
+    appliedPlanStepName = pendingPlanStepName;
+    game.appliedLineupId = appliedLineupId;
+    game.appliedPlanStepName = appliedPlanStepName;
     if (gameStarted) {
       game.history.push({ event: 'Substitution', timestamp: Date.now(), gameTimeMs: game.gameTimeStats.totalMs, lineupSnapshot: { ...lineup } });
     }
@@ -406,7 +531,9 @@
         history: game.history,
         playerStats: game.playerStats,
         gameTimeStats: game.gameTimeStats,
-        score: game.score
+        score: game.score,
+        appliedLineupId: game.appliedLineupId,
+        appliedPlanStepName: game.appliedPlanStepName
       });
     } catch (error) {
       console.error("Firebase Sync Error:", error);
@@ -518,15 +645,13 @@
       <span class="plan-nav-label">Game Plan</span>
       <div class="plan-steps">
         {#each game.gamePlan as step, i}
-          {@const name = savedLineups.find(l => l.id === step.lineupId)?.name ?? '?'}
+          {@const name = step.name || `Lineup ${i + 1}`}
           <button
             class="plan-step-chip"
             class:active={planStepIndex === i}
-            class:applied={planStepIndex === i && pendingLineupId === step.lineupId}
             on:click={() => loadPlanStep(i)}
             title="{name} · {step.durationMins} min"
           >
-            <span class="chip-num">{i + 1}</span>
             <span class="chip-name">{name}</span>
             <span class="chip-dur">{step.durationMins}′</span>
           </button>
@@ -556,14 +681,21 @@
             <button class="btn-primary btn-sub-action" on:click={applyLineup} disabled={pendingSubs.length === 0 || game.status === 'scheduled'}>Apply Subs</button>
             <button class="btn-secondary btn-sub-action" on:click={() => { lineup = { ...game.lineup }; pendingLineupId = appliedLineupId; selectedItem = null; }} disabled={pendingSubs.length === 0}>Clear</button>
           {/if}
-          {#if savedLineups.length > 0}
-            <select class="lineup-select" on:change={(e) => { loadSavedLineup(e.target.value); e.target.value = ''; }}>
-              <option value="">Load lineup…</option>
-              {#each savedLineups as sl}
-                <option value={sl.id}>{sl.name}</option>
-              {/each}
-            </select>
-          {/if}
+          <!-- svelte-ignore a11y-no-onchange -->
+          <select class="lineup-select" value={game.formationId ?? ''} on:change={(e) => changeFormation(e.target.value)}>
+            <option value="">Formation…</option>
+            {#each formations.filter(f => game.playersOnField == null || (f.positions?.length ?? 0) === game.playersOnField) as f}
+              <option value={f.id}>{f.name}</option>
+            {/each}
+          </select>
+          <select class="lineup-select"
+            on:mousedown={(e) => { if (!game.formationId) { e.preventDefault(); alert('Select a formation first.'); } }}
+            on:change={(e) => { loadSavedLineup(e.target.value); e.target.value = ''; }}>
+            <option value="">Load lineup…</option>
+            {#each savedLineups.filter(sl => !game.formationId || sl.formationId === game.formationId) as sl}
+              <option value={sl.id}>{sl.name}</option>
+            {/each}
+          </select>
         </div>
       </div>
       {#if lineupLabel}
@@ -594,7 +726,7 @@
                 on:click|stopPropagation={() => handleSlotClick(pos.id)}
               >
                 <div class="field-node" style="background: {color.bg}; border-color: {color.bg};">{pos.name}</div>
-                <div class="field-node-label">{lineup[pos.id] ? getPlayerName(lineup[pos.id]) : '—'}</div>
+                <div class="field-node-label" class:pos-changed={gameStarted && changedPositionPlayers.has(lineup[pos.id])}>{lineup[pos.id] ? getPlayerName(lineup[pos.id]) : '—'}</div>
               </div>
             {/each}
           </div>
@@ -608,32 +740,44 @@
             <div class="slot-card"
                  class:selected={selectedItem?.type === 'slot' && selectedItem?.id === pos.id}
                  class:empty={!lineup[pos.id]}
-                 class:has-pending={!!pendingSub}
+                 class:has-pending={gameStarted && !!pendingSub}
                  on:click={() => handleSlotClick(pos.id)}>
               <div class="pos-badge" style="background: {color.bg}; color: {color.text};">{pos.name}</div>
               <div class="player-info">
-                {#if pendingSub}
+                {#if gameStarted && pendingSub}
                   {#if pendingSub.playerInId}
                     {@const fromPosId = Object.entries(game.lineup).find(([, pid]) => pid === pendingSub.playerInId)?.[0]}
                     {@const fromPosName = fromPosId ? formation.positions.find(p => p.id === fromPosId)?.name : null}
-                    <span class="player-name sub-name-in">{getPlayerName(pendingSub.playerInId)}{#if fromPosName}&nbsp;<span class="pos-move">({fromPosName}→{pendingSub.posName})</span>{/if}</span>
+                    {@const chain = getSubChain(pendingSub)}
+                    <span class="player-name sub-name-in">{getPlayerName(pendingSub.playerInId)}{#if fromPosName}&nbsp;<span class="pos-move">({fromPosName}→{pendingSub.posName})</span>{/if}
+                      {#if chain.length > 2 && !Object.values(game.lineup).includes(pendingSub.playerInId)}
+                        {@const playerOut = 'for ' + getPlayerName(chain[chain.length - 1])}
+                        {@const playersMoving = chain.toReversed().slice(1, chain.length - 1).map(playerId => {
+                            const pendSub = [...pendingSubs].find(s => s.playerInId === playerId);
+                            const pos = pendSub ? pendSub.posName : 'bench';
+                            return `${getPlayerName(playerId)} → ${pos}`;
+                        }).join(', ')}
+                        <span class="pos-move">
+                          ({playerOut}, {playersMoving})
+                        </span>
+                      {/if}</span>
                   {/if}
                   {#if pendingSub.playerOutId}
                     {@const movingToSub = pendingSubs.find(s => s.playerInId === pendingSub.playerOutId)}
                     {#if movingToSub}
                       <span class="player-name sub-name-move">({getPlayerName(pendingSub.playerOutId)} → {movingToSub.posName})</span>
                     {:else}
-                      <span class="player-name sub-name-bench">{getPlayerName(pendingSub.playerOutId)}</span>
+                    <span class="player-name sub-name-bench">{getPlayerName(pendingSub.playerOutId)}</span>
                     {/if}
                   {/if}
                 {:else}
-                  <span class="player-name">{getPlayerName(lineup[pos.id])}</span>
+                  <span class="player-name" class:pos-changed={gameStarted && changedPositionPlayers.has(lineup[pos.id])}>{getPlayerName(lineup[pos.id])}</span>
                   {#if lineup[pos.id]}
                     <span class="player-time active-color">Field: {formatDuration(livePlayerStats.find(p => p.id === lineup[pos.id])?.activeMs ?? 0)}</span>
                   {/if}
                 {/if}
               </div>
-              {#if pendingSub}
+              {#if gameStarted && pendingSub}
                 <button class="btn-restore" title="Restore current player" on:click|stopPropagation={() => { lineup = { ...lineup, [pos.id]: game.lineup[pos.id] ?? null }; selectedItem = null; pendingLineupId = null; }}>↺</button>
               {:else if lineup[pos.id]}
                 <button class="btn-remove" on:click|stopPropagation={() => executeSwap('slot', pos.id)}>×</button>
@@ -649,8 +793,8 @@
         <h2>Players</h2>
         <div class="bench-header-controls">
           <div class="bar-mode-toggle">
-            <button class:active={colorBarMode === 'grouped'} on:click={() => colorBarMode = 'grouped'}>Grouped</button>
             <button class:active={colorBarMode === 'timeline'} on:click={() => colorBarMode = 'timeline'}>Timeline</button>
+            <button class:active={colorBarMode === 'grouped'} on:click={() => colorBarMode = 'grouped'}>Grouped</button>
           </div>
           <select class="sort-select" bind:value={benchSort}>
             <option value="status">By Status</option>
@@ -1005,6 +1149,8 @@
 
   .player-info { display: flex; flex-direction: column; flex: 1; overflow: hidden; }
   .player-name { font-size: 0.9rem; font-weight: 600; color: #f8fafc; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .pos-changed { color: #fb923c; }
+  .field-node-label.pos-changed { color: #fb923c; }
   .player-time { font-size: 0.7rem; font-weight: 500; margin-top: 0.05rem; }
   .active-color { color: #34d399; }
   .bench-color { color: #94a3b8; }

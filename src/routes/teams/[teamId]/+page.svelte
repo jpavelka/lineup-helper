@@ -214,6 +214,17 @@
       <div class="header-actions">
         <span class="save-status">{saveStatus}</span>
         <div class="default-formation-group">
+          <label class="default-formation-label" for="default-players">Default Players on Field</label>
+          <input
+            id="default-players"
+            class="default-formation-select"
+            type="number" min="1" max="20" placeholder="e.g. 11"
+            value={team.defaultPlayersOnField ?? ''}
+            on:change={(e) => { team.defaultPlayersOnField = e.target.value ? Number(e.target.value) : null; saveTeamToDb(team); }}
+            style="width: 80px;"
+          />
+        </div>
+        <div class="default-formation-group">
           <label class="default-formation-label" for="default-formation">Default Formation</label>
           <select
             id="default-formation"
@@ -228,6 +239,8 @@
           </select>
         </div>
         <a href="/teams/{teamId}/schedule" class="btn-primary">View Schedule</a>
+        <a href="/teams/{teamId}/stats" class="btn-primary">Season Stats</a>
+        <a href="/teams/{teamId}/playingTime" class="btn-primary">Playing Time</a>
       </div>
     </header>
 
