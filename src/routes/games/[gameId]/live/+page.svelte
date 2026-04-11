@@ -147,6 +147,15 @@
   $: appliedPlayerIds = Object.values(game?.lineup || {}).filter(id => id !== null);
   $: benchPlayers = availableRoster.filter(p => !appliedPlayerIds.includes(p.id));
 
+  $: eventModalPlayers = (() => {
+    const onFieldIds = new Set(Object.values(lineup).filter(Boolean));
+    const sort = (a, b) => a.name.localeCompare(b.name);
+    return {
+      onField: availableRoster.filter(p => onFieldIds.has(p.id)).sort(sort),
+      onBench: availableRoster.filter(p => !onFieldIds.has(p.id)).sort(sort),
+    };
+  })();
+
   $: liveGameTimeMs = (game?.gameTimeStats.totalMs ?? 0) +
     (gameLive && game?.gameTimeStats.sessionStart ? now - game.gameTimeStats.sessionStart : 0);
 
@@ -955,14 +964,24 @@
             <label>Goal Scorer</label>
             <select bind:value={eventScorer}>
               <option value="">-- Select Player --</option>
-              {#each availableRoster as p}<option value={p.id}>{p.name}</option>{/each}
+              <optgroup label="On Field">
+                {#each eventModalPlayers.onField as p}<option value={p.id}>{p.name}</option>{/each}
+              </optgroup>
+              <optgroup label="On Bench">
+                {#each eventModalPlayers.onBench as p}<option value={p.id}>{p.name}</option>{/each}
+              </optgroup>
             </select>
           </div>
           <div class="form-group">
             <label>Assist (Optional)</label>
             <select bind:value={eventAssist}>
               <option value="">-- None --</option>
-              {#each availableRoster as p}<option value={p.id}>{p.name}</option>{/each}
+              <optgroup label="On Field">
+                {#each eventModalPlayers.onField as p}<option value={p.id}>{p.name}</option>{/each}
+              </optgroup>
+              <optgroup label="On Bench">
+                {#each eventModalPlayers.onBench as p}<option value={p.id}>{p.name}</option>{/each}
+              </optgroup>
             </select>
           </div>
         {/if}
@@ -978,7 +997,12 @@
           <label>Player</label>
           <select bind:value={eventPlayer}>
             <option value="">-- Select Player --</option>
-            {#each availableRoster as p}<option value={p.id}>{p.name}</option>{/each}
+            <optgroup label="On Field">
+              {#each eventModalPlayers.onField as p}<option value={p.id}>{p.name}</option>{/each}
+            </optgroup>
+            <optgroup label="On Bench">
+              {#each eventModalPlayers.onBench as p}<option value={p.id}>{p.name}</option>{/each}
+            </optgroup>
           </select>
         </div>
       {/if}
