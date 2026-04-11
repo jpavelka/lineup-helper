@@ -279,7 +279,7 @@
           game.appliedLineupId = appliedLineupId;
           game.appliedPlanStepName = appliedPlanStepName;
         }
-        game.history.push({ event: 'Lineup Set', timestamp: Date.now(), gameTimeMs: 0, lineupSnapshot: { ...game.lineup } });
+        game.history.push({ event: 'Lineup Set', timestamp: Date.now(), gameTimeMs: 0, lineupSnapshot: { ...game.lineup }, formationId: game.formationId ?? null, formationName: formation?.name ?? null });
       }
 
       game.gameTimeStats.sessionStart = Date.now();
@@ -515,7 +515,7 @@
     game.appliedLineupId = appliedLineupId;
     game.appliedPlanStepName = appliedPlanStepName;
     if (gameStarted) {
-      game.history.push({ event: 'Substitution', timestamp: Date.now(), gameTimeMs: game.gameTimeStats.totalMs, lineupSnapshot: { ...lineup } });
+      game.history.push({ event: 'Substitution', timestamp: Date.now(), gameTimeMs: game.gameTimeStats.totalMs, lineupSnapshot: { ...lineup }, formationId: game.formationId ?? null, formationName: formation?.name ?? null });
     }
     await syncToDb();
   }
