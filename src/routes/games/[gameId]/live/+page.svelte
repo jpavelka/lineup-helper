@@ -33,6 +33,8 @@
   // --- Bench Sort & Bar Mode ---
   let benchSort = 'status';
   let colorBarMode = 'timeline'; // 'grouped' | 'timeline'
+  let pitchExpanded = false;
+  let benchExpanded = false;
 
   // --- Preset lineup tracking ---
   let appliedLineupId = null;  // which saved lineup is currently on the field
@@ -144,6 +146,15 @@
   $: availableRoster = team?.roster.filter(p => game?.availablePlayers?.includes(p.id)) || [];
   $: appliedPlayerIds = Object.values(game?.lineup || {}).filter(id => id !== null);
   $: benchPlayers = availableRoster.filter(p => !appliedPlayerIds.includes(p.id));
+
+  $: eventModalPlayers = (() => {
+    const onFieldIds = new Set(Object.values(lineup).filter(Boolean));
+    const sort = (a, b) => a.name.localeCompare(b.name);
+    return {
+      onField: availableRoster.filter(p => onFieldIds.has(p.id)).sort(sort),
+      onBench: availableRoster.filter(p => !onFieldIds.has(p.id)).sort(sort),
+    };
+  })();
 
   $: liveGameTimeMs = (game?.gameTimeStats.totalMs ?? 0) +
     (gameLive && game?.gameTimeStats.sessionStart ? now - game.gameTimeStats.sessionStart : 0);
@@ -277,7 +288,7 @@
           game.appliedLineupId = appliedLineupId;
           game.appliedPlanStepName = appliedPlanStepName;
         }
-        game.history.push({ event: 'Lineup Set', timestamp: Date.now(), gameTimeMs: 0, lineupSnapshot: { ...game.lineup } });
+        game.history.push({ event: 'Lineup Set', timestamp: Date.now(), gameTimeMs: 0, lineupSnapshot: { ...game.lineup }, formationId: game.formationId ?? null, formationName: formation?.name ?? null });
       }
 
       game.gameTimeStats.sessionStart = Date.now();
@@ -513,7 +524,7 @@
     game.appliedLineupId = appliedLineupId;
     game.appliedPlanStepName = appliedPlanStepName;
     if (gameStarted) {
-      game.history.push({ event: 'Substitution', timestamp: Date.now(), gameTimeMs: game.gameTimeStats.totalMs, lineupSnapshot: { ...lineup } });
+      game.history.push({ event: 'Substitution', timestamp: Date.now(), gameTimeMs: game.gameTimeStats.totalMs, lineupSnapshot: { ...lineup }, formationId: game.formationId ?? null, formationName: formation?.name ?? null });
     }
     await syncToDb();
   }
@@ -689,9 +700,9 @@
   {/if}
 
   <!-- PITCH & PLAYERS LAYOUT -->
-  <div class="layout-grid">
+  <div class="layout-grid" class:any-expanded={pitchExpanded || benchExpanded}>
 
-    <div class="panel pitch-panel">
+    <div class="panel pitch-panel" class:expanded={pitchExpanded} class:sibling-expanded={!pitchExpanded && benchExpanded}>
       <div class="pitch-header">
         <div class="pitch-header-title">
           <h2>On Field</h2>
@@ -702,10 +713,11 @@
             <button class:active={!pitchView} on:click={() => pitchView = false}>List</button>
             <button class:active={pitchView} on:click={() => pitchView = true}>Field</button>
           </div>
+          <button class="btn-expand" on:click={() => pitchExpanded = !pitchExpanded}>{pitchExpanded ? '⤡' : '⤢'}</button>
         </div>
         <div class="pitch-header-actions">
           {#if !gameEnded}
-            <button class="btn-secondary btn-sub-action" on:click={() => { lineup = { ...game.lineup }; pendingLineupId = appliedLineupId; selectedItem = null; }} disabled={pendingSubs.length === 0}>Clear</button>
+            <button class="btn-secondary btn-sub-action" on:click={() => { lineup = { ...game.lineup }; pendingLineupId = appliedLineupId; pendingPlanStepName = appliedPlanStepName; selectedItem = null; }} disabled={pendingSubs.length === 0}>Clear</button>
           {/if}
           <!-- svelte-ignore a11y-no-onchange -->
           <select class="lineup-select" value={game.formationId ?? ''} on:change={(e) => changeFormation(e.target.value)}>
@@ -758,7 +770,7 @@
           </div>
         </div>
       {:else}
-        <div class="slots-container">
+        <div class="slots-container" class:expanded={pitchExpanded}>
           {#each formation?.positions || [] as pos}
             {@const color = getGroupColor(pos.group)}
             {@const pendingSub = pendingSubs.find(s => s.posId === pos.id)}
@@ -814,9 +826,10 @@
       {/if}
     </div>
 
-    <div class="panel bench-panel">
+    <div class="panel bench-panel" class:expanded={benchExpanded} class:sibling-expanded={!benchExpanded && pitchExpanded}>
       <div class="bench-header">
         <h2>Players</h2>
+        <button class="btn-expand" on:click={() => benchExpanded = !benchExpanded}>{benchExpanded ? '⤡' : '⤢'}</button>
         <div class="bench-header-controls">
           <div class="bar-mode-toggle">
             <button class:active={colorBarMode === 'timeline'} on:click={() => colorBarMode = 'timeline'}>Timeline</button>
@@ -831,7 +844,7 @@
           </select>
         </div>
       </div>
-      <div class="bench-container">
+      <div class="bench-container" class:expanded={benchExpanded}>
         {#each sortedAvailablePlayers as player}
           <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
           <div class="bench-card"
@@ -951,14 +964,24 @@
             <label>Goal Scorer</label>
             <select bind:value={eventScorer}>
               <option value="">-- Select Player --</option>
-              {#each availableRoster as p}<option value={p.id}>{p.name}</option>{/each}
+              <optgroup label="On Field">
+                {#each eventModalPlayers.onField as p}<option value={p.id}>{p.name}</option>{/each}
+              </optgroup>
+              <optgroup label="On Bench">
+                {#each eventModalPlayers.onBench as p}<option value={p.id}>{p.name}</option>{/each}
+              </optgroup>
             </select>
           </div>
           <div class="form-group">
             <label>Assist (Optional)</label>
             <select bind:value={eventAssist}>
               <option value="">-- None --</option>
-              {#each availableRoster as p}<option value={p.id}>{p.name}</option>{/each}
+              <optgroup label="On Field">
+                {#each eventModalPlayers.onField as p}<option value={p.id}>{p.name}</option>{/each}
+              </optgroup>
+              <optgroup label="On Bench">
+                {#each eventModalPlayers.onBench as p}<option value={p.id}>{p.name}</option>{/each}
+              </optgroup>
             </select>
           </div>
         {/if}
@@ -974,7 +997,12 @@
           <label>Player</label>
           <select bind:value={eventPlayer}>
             <option value="">-- Select Player --</option>
-            {#each availableRoster as p}<option value={p.id}>{p.name}</option>{/each}
+            <optgroup label="On Field">
+              {#each eventModalPlayers.onField as p}<option value={p.id}>{p.name}</option>{/each}
+            </optgroup>
+            <optgroup label="On Bench">
+              {#each eventModalPlayers.onBench as p}<option value={p.id}>{p.name}</option>{/each}
+            </optgroup>
           </select>
         </div>
       {/if}
@@ -1129,12 +1157,24 @@
     display: flex; flex-direction: column; gap: 1rem;
     height: calc(100vh - 100px);
   }
+  .layout-grid.any-expanded { height: auto; }
   .panel {
     background: #111827; border: 1px solid #334155; border-radius: 1rem;
     padding: 1rem; display: flex; flex-direction: column; overflow: hidden;
   }
   .pitch-panel { flex: 1.2; }
   .bench-panel { flex: 1; }
+  .panel.expanded { flex: none; height: auto; overflow: visible; }
+  .panel.sibling-expanded { flex: none; height: 45vh; }
+  .slots-container.expanded, .bench-container.expanded { overflow-y: visible; height: auto; flex: none; }
+
+  .btn-expand {
+    background: transparent; border: 1px solid #334155; color: #64748b;
+    width: 1.5rem; height: 1.5rem; border-radius: 0.3rem; cursor: pointer;
+    font-size: 0.85rem; display: flex; align-items: center; justify-content: center;
+    padding: 0; flex-shrink: 0;
+  }
+  .btn-expand:hover { background: #334155; color: #f8fafc; }
 
   h2 { margin-top: 0; font-size: 1rem; color: #cbd5e1; border-bottom: 1px solid #334155; padding-bottom: 0.5rem; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.75rem; }
 
@@ -1257,6 +1297,7 @@
   @media (min-width: 800px) {
     .layout-grid { display: grid; grid-template-columns: 1.5fr 1fr; height: auto; }
     .pitch-panel, .bench-panel { flex: none; height: auto; }
+    .btn-expand { display: none; }
     .slots-container, .bench-container { overflow-y: visible; height: auto; display: flex; flex-direction: column; }
     .slots-container { display: flex; }
     .panel { padding: 1.5rem; overflow: visible; }
