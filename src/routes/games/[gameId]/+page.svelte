@@ -1135,11 +1135,9 @@
               <button class:active={planBarMode === 'grouped'} on:click={() => planBarMode = 'grouped'}>Grouped</button>
             </div>
             <div style="margin-left: auto;">
-              {#if game.status !== 'completed'}
-                <button class="btn-toggle" on:click={() => editingAvailability = !editingAvailability}>
-                  {editingAvailability ? 'Done' : 'Edit Availability'}
-                </button>
-              {/if}
+              <button class="btn-toggle" on:click={() => editingAvailability = !editingAvailability}>
+                {editingAvailability ? 'Done' : 'Edit Availability'}
+              </button>
             </div>
           </div>
 
@@ -1147,11 +1145,13 @@
             <p class="small text-muted" style="margin: 0 0 0.75rem 0;">Check players available for this game.</p>
             <div class="roster-checklist">
               {#each (team?.roster || []).sort((a, b) => a.name.localeCompare(b.name)) as player}
-                <label class="check-item">
+                {@const played = game.status === 'completed' && (game.playerStats?.[player.id]?.activeMs ?? 0) > 0}
+                <label class="check-item" class:check-item-locked={played}>
                   <input
                     type="checkbox"
                     checked={game.availablePlayers?.includes(player.id)}
                     on:change={() => togglePlayerAvailability(player.id)}
+                    disabled={played}
                   />
                   <span class="check-name">{player.name}</span>
                   <span class="check-number">#{player.number}</span>
@@ -1236,11 +1236,9 @@
                 <button class:active={statsBarMode === 'timeline'} on:click={() => statsBarMode = 'timeline'}>Timeline</button>
                 <button class:active={statsBarMode === 'grouped'} on:click={() => statsBarMode = 'grouped'}>Grouped</button>
               </div>
-              {#if game.status !== 'completed'}
-                <button class="btn-toggle" on:click={() => editingAvailability = !editingAvailability}>
-                  {editingAvailability ? 'Done' : 'Edit Availability'}
-                </button>
-              {/if}
+              <button class="btn-toggle" on:click={() => editingAvailability = !editingAvailability}>
+                {editingAvailability ? 'Done' : 'Edit Availability'}
+              </button>
             </div>
           </div>
 
@@ -1248,11 +1246,13 @@
             <p class="small text-muted" style="margin: 0 0 0.75rem 0;">Check players available for this game.</p>
             <div class="roster-checklist">
               {#each (team?.roster || []).sort((a, b) => a.name.localeCompare(b.name)) as player}
-                <label class="check-item">
+                {@const played = game.status === 'completed' && (game.playerStats?.[player.id]?.activeMs ?? 0) > 0}
+                <label class="check-item" class:check-item-locked={played}>
                   <input
                     type="checkbox"
                     checked={game.availablePlayers?.includes(player.id)}
                     on:change={() => togglePlayerAvailability(player.id)}
+                    disabled={played}
                   />
                   <span class="check-name">{player.name}</span>
                   <span class="check-number">#{player.number}</span>
@@ -1801,6 +1801,8 @@
     border-radius: 0.25rem;
   }
   .check-item:hover { background: #1e293b; }
+  .check-item-locked { cursor: default; opacity: 0.45; }
+  .check-item-locked:hover { background: transparent; }
   .check-item input[type="checkbox"] { width: 1rem; height: 1rem; accent-color: #2563eb; flex-shrink: 0; }
   .check-name { flex: 1; color: #f8fafc; font-size: 0.95rem; }
   .check-number { color: #64748b; font-size: 0.85rem; }

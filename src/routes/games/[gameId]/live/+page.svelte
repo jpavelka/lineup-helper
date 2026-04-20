@@ -159,6 +159,19 @@
   $: liveGameTimeMs = (game?.gameTimeStats.totalMs ?? 0) +
     (gameLive && game?.gameTimeStats.sessionStart ? now - game.gameTimeStats.sessionStart : 0);
 
+  // Game time (ms) at which the second half began, or null if not yet in second half.
+  $: secondHalfStartMs = (() => {
+    const sorted = [...(game?.history || [])].sort((a, b) => a.timestamp - b.timestamp);
+    let hadHalftime = false;
+    for (const ev of sorted) {
+      if (ev.event === 'Game Paused – Halftime') { hadHalftime = true; continue; }
+      if (hadHalftime && ev.event === 'Game Resumed') return ev.gameTimeMs;
+    }
+    return null;
+  })();
+
+  $: liveSecondHalfMs = secondHalfStartMs !== null ? liveGameTimeMs - secondHalfStartMs : null;
+
   $: livePlayerStats = availableRoster.map(player => {
     const base = game?.playerStats[player.id] || { activeMs: 0, benchMs: 0 };
     let currentActive = base.activeMs;
@@ -238,7 +251,7 @@
 
   // --- Time Helpers ---
   function formatDuration(ms) {
-    if (!ms) return '0:00';
+    if (!ms || ms < 0) return '0:00';
     const totalSecs = Math.floor(ms / 1000);
     const mins = Math.floor(totalSecs / 60);
     const secs = totalSecs % 60;
@@ -650,6 +663,9 @@
         <span class="status-badge" class:live={gameLive} class:ended={gameEnded}>
           {gameEnded ? 'ENDED' : gameLive ? 'LIVE' : game.status === 'scheduled' ? 'NOT STARTED' : 'PAUSED'}
         </span>
+        {#if liveSecondHalfMs !== null}
+          <span class="half-clock">2nd {formatDuration(liveSecondHalfMs)}</span>
+        {/if}
       </div>
     </div>
 
@@ -1092,6 +1108,7 @@
 
   .clock-display { display: flex; flex-direction: column; align-items: flex-start; gap: 0.25rem; }
   .time { font-size: 1.5rem; font-weight: bold; font-variant-numeric: tabular-nums; }
+  .half-clock { font-size: 0.8rem; font-variant-numeric: tabular-nums; color: #94a3b8; font-weight: 600; letter-spacing: 0.5px; }
   .status-badge { padding: 0.1rem 0.5rem; border-radius: 1rem; background: #475569; font-size: 0.75rem; font-weight: bold; letter-spacing: 1px; }
   .status-badge.live { background: #ef4444; color: white; animation: blink 2s infinite; }
   .status-badge.ended { background: #334155; color: #94a3b8; }

@@ -38,8 +38,10 @@
     expandedTimestamp = expandedTimestamp === ev.timestamp ? null : ev.timestamp;
   }
 
-  // Sort by game clock time, falling back to wall-clock timestamp
-  $: sortedHistory = [...history].sort((a, b) =>
+  // Recalculate game times from wall-clock timestamps, then sort by game clock.
+  // This ensures pause/resume times are consistent even if stored gameTimeMs were
+  // corrupted by a previous bug where 'Game Paused – X' events weren't matched.
+  $: sortedHistory = recalculateGameTimes([...history]).sort((a, b) =>
     (a.gameTimeMs ?? a.timestamp) - (b.gameTimeMs ?? b.timestamp)
   );
 
@@ -141,7 +143,7 @@
         sessionStartTs = ev.timestamp;
         // accumulatedMs was set by the preceding Pause event
         return { ...ev, gameTimeMs: accumulatedMs };
-      } else if (ev.event === 'Game Paused' || ev.event === 'Match Ended') {
+      } else if (isPauseEvent(ev) || ev.event === 'Match Ended') {
         if (sessionStartTs !== null) {
           accumulatedMs = accumulatedMs + (ev.timestamp - sessionStartTs);
           sessionStartTs = null;
