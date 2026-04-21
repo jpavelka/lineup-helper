@@ -12,7 +12,7 @@
   let team = null;
   let games = [];
   let loading = true;
-  let filter = 'future'; // 'past', 'future', 'all'
+  let filter = 'all'; // 'past', 'future', 'all'
 
   // Modal State
   let showModal = false;
@@ -175,6 +175,7 @@
             <div class="date-badge">
               <span class="month">{new Date(game.date).toLocaleDateString(undefined, { month: 'short' })}</span>
               <span class="day">{new Date(game.date).getDate()}</span>
+              <span class="weekday">{new Date(game.date).toLocaleDateString(undefined, { weekday: 'short' })}</span>
             </div>
             <div class="details">
               <a href="/games/{game.id}" class="game-link">
@@ -370,6 +371,16 @@
     color: #f8fafc;
     font-size: 1.5rem;
     font-weight: 700;
+    line-height: 1;
+  }
+
+  .date-badge .weekday {
+    color: #64748b;
+    font-size: 0.7rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    margin-top: 0.1rem;
   }
 
   .details h3 { margin: 0 0 0.25rem 0; font-size: 1.25rem; color: #e2e8f0; }

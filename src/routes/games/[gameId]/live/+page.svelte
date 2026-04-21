@@ -45,6 +45,43 @@
   // --- Game plan navigation ---
   let planStepIndex = null; // null = not following plan; number = current step index
 
+  // Optional override: assume first half lasted this many minutes (for pulse timing in 2nd half)
+  let assumedFirstHalfMins = null;
+
+  $: defaultFirstHalfMins = Math.round(
+    (game?.gamePlan ?? []).reduce((sum, s) => sum + (s.durationMins ?? 0), 0) / 2
+  );
+
+  // Adjusted game time used for pulse calculations — accounts for first-half length override
+  $: effectivePulseTimeMs = (() => {
+    if (secondHalfStartMs === null) return liveGameTimeMs;
+    const halfMins = assumedFirstHalfMins ?? defaultFirstHalfMins;
+    return halfMins * 60000 + (liveGameTimeMs - secondHalfStartMs);
+  })();
+
+  // Cumulative game-time (ms) at which each plan step should go on the field
+  $: planStepStartMs = (() => {
+    let cumulative = 0;
+    return (game?.gamePlan ?? []).map(step => {
+      const start = cumulative;
+      cumulative += (step.durationMins ?? 0) * 60000;
+      return start;
+    });
+  })();
+
+  // Set of step indices whose scheduled start is within ±2 minutes and not yet active
+  $: pulsingStepIndices = (() => {
+    if (!gameLive) return new Set();
+    const result = new Set();
+    (game?.gamePlan ?? []).forEach((step, i) => {
+      const name = step.name || `Lineup ${i + 1}`;
+      if (name === appliedPlanStepName) return; // already applied
+      const msUntil = planStepStartMs[i] - effectivePulseTimeMs;
+      if (msUntil >= -120000 && msUntil <= 120000) result.add(i);
+    });
+    return result;
+  })();
+
   // --- Stint tracking (playerId -> gameTimeMs when they entered current status) ---
   let stintStartMs = {};
 
@@ -352,6 +389,7 @@
     appliedPlanStepName = null;
     pendingLineupId = null;
     pendingPlanStepName = null;
+    assumedFirstHalfMins = null;
     await syncToDb();
   }
 
@@ -690,7 +728,25 @@
   <!-- GAME PLAN NAVIGATOR -->
   {#if game.gamePlan?.length > 0}
     <div class="plan-nav">
-      <span class="plan-nav-label">Game Plan</span>
+      <div class="plan-nav-top">
+        <span class="plan-nav-label">Game Plan</span>
+        {#if secondHalfStartMs !== null}
+          <div class="first-half-override">
+            <span class="fh-label">1st half assumed:</span>
+            <input
+              class="fh-input"
+              type="number" min="1" max="90"
+              placeholder={defaultFirstHalfMins}
+              value={assumedFirstHalfMins ?? defaultFirstHalfMins}
+              on:input={(e) => { assumedFirstHalfMins = e.target.value !== '' ? Number(e.target.value) : null; }}
+            />
+            <span class="fh-label">min</span>
+            {#if assumedFirstHalfMins !== null}
+              <button class="fh-clear" on:click={() => assumedFirstHalfMins = null}>✕</button>
+            {/if}
+          </div>
+        {/if}
+      </div>
       <div class="plan-nav-bottom">
         <div class="plan-steps">
           {#each game.gamePlan as step, i}
@@ -699,6 +755,7 @@
               class="plan-step-chip"
               class:active={name === appliedPlanStepName}
               class:pending={name === pendingPlanStepName && name !== appliedPlanStepName}
+              class:pulsing={pulsingStepIndices.has(i)}
               on:click={() => loadPlanStep(i)}
               title="{name} · {step.durationMins} min"
             >
@@ -714,6 +771,7 @@
       </div>
     </div>
   {/if}
+
 
   <!-- PITCH & PLAYERS LAYOUT -->
   <div class="layout-grid" class:any-expanded={pitchExpanded || benchExpanded}>
@@ -1139,7 +1197,21 @@
     background: #0f172a; border: 1px solid #1e293b; border-radius: 0.6rem;
     padding: 0.4rem 0.6rem; margin-bottom: 0.6rem; overflow: hidden;
   }
+  .plan-nav-top { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; }
   .plan-nav-label { font-size: 0.9rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; }
+  .first-half-override { display: flex; align-items: center; gap: 0.3rem; margin-left: auto; }
+  .fh-label { font-size: 0.72rem; color: #64748b; white-space: nowrap; }
+  .fh-input {
+    width: 3rem; background: #0f172a; border: 1px solid #334155; color: #cbd5e1;
+    border-radius: 0.3rem; padding: 0.15rem 0.3rem; font-size: 0.78rem;
+    text-align: center; outline: none;
+  }
+  .fh-input:focus { border-color: #3b82f6; }
+  .fh-clear {
+    background: transparent; border: none; color: #475569; font-size: 0.7rem;
+    padding: 0.1rem 0.2rem; cursor: pointer; line-height: 1;
+  }
+  .fh-clear:hover { color: #94a3b8; }
   .plan-nav-bottom { display: flex; align-items: center; gap: 0.5rem; width: 100%; overflow: hidden; }
   .plan-steps { display: flex; gap: 0.3rem; overflow-x: auto; flex: 1; padding-bottom: 1px; }
   .plan-steps::-webkit-scrollbar { display: none; }
@@ -1152,6 +1224,11 @@
   .plan-step-chip:hover { background: #334155; color: #cbd5e1; }
   .plan-step-chip.active { background: #1e3a5f; border-color: #3b82f6; color: #93c5fd; }
   .plan-step-chip.pending { background: #2d1f08; border-color: #d97706; color: #fcd34d; }
+  .plan-step-chip.pulsing { animation: chip-pulse 2s ease-in-out infinite; }
+  @keyframes chip-pulse {
+    0%, 100% { border-color: #f59e0b; box-shadow: 0 0 0 0 rgba(245,158,11,0); }
+    50% { border-color: #fbbf24; box-shadow: 0 0 0 4px rgba(245,158,11,0.35); }
+  }
   .chip-num { font-weight: 700; color: #475569; font-size: 0.65rem; }
   .plan-step-chip.active .chip-num { color: #60a5fa; }
   .plan-step-chip.pending .chip-num { color: #f59e0b; }
