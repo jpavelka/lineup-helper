@@ -1684,7 +1684,7 @@
   .add-plan-option-sub { color: #64748b; font-size: 0.8rem; }
 
   .plan-grid-wrap { overflow-x: auto; margin-bottom: 0.75rem; }
-  .plan-grid { border-collapse: collapse; font-size: 0.88rem; color: #e2e8f0; width: max-content; min-width: 100%; }
+  .plan-grid { border-collapse: collapse; font-size: 0.88rem; color: #e2e8f0; width: max-content; }
 
   .plan-pos-th-sep { box-shadow: inset 2px 0 0 #334155; }
   .plan-pos-empty { border-left: 2px solid #334155; background: transparent; padding: 0; }
