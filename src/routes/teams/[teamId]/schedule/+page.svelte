@@ -124,6 +124,10 @@
     return true;
   });
 
+  $: futureStartIndex = filter === 'all'
+    ? filteredGames.findIndex(g => new Date(g.date) >= new Date())
+    : -1;
+
   function formatDate(dateString) {
     if (!dateString) return 'TBD';
     const d = new Date(dateString);
@@ -169,8 +173,11 @@
     </header>
 
     <div class="games-list">
-      {#each filteredGames as game}
-        <div class="game-card">
+      {#each filteredGames as game, i}
+        {#if futureStartIndex >= 0 && i === futureStartIndex && futureStartIndex > 0}
+          <div class="upcoming-divider"><span>Upcoming</span></div>
+        {/if}
+        <div class="game-card" class:future={new Date(game.date) >= new Date()}>
           <div class="game-info">
             <div class="date-badge">
               <span class="month">{new Date(game.date).toLocaleDateString(undefined, { month: 'short' })}</span>
@@ -331,6 +338,23 @@
     gap: 1rem;
   }
 
+  .upcoming-divider {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    color: #3b82f6;
+    font-weight: 700;
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+  }
+  .upcoming-divider::before,
+  .upcoming-divider::after {
+    content: '';
+    flex: 1;
+    border-top: 1px solid #1d4ed8;
+  }
+
   .game-card {
     background: #111827;
     border: 1px solid #334155;
@@ -341,6 +365,11 @@
     align-items: center;
     flex-wrap: wrap;
     gap: 1.5rem;
+  }
+
+  .game-card.future {
+    border-left: 3px solid #3b82f6;
+    background: #0f1f38;
   }
 
   .game-info {

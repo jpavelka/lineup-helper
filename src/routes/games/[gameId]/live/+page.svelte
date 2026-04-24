@@ -548,10 +548,13 @@
       newLineup[targetId] = temp;
     }
 
+    const changed = Object.keys(newLineup).some(k => newLineup[k] !== lineup[k]);
     lineup = newLineup;
     selectedItem = null;
-    pendingLineupId = null;
-    pendingPlanStepName = null;
+    if (changed) {
+      pendingLineupId = null;
+      pendingPlanStepName = null;
+    }
   }
 
   async function applyLineup() {
@@ -1304,6 +1307,8 @@
   .slot-card.empty { border: 1px dashed #475569; background: #0f172a; }
   .slot-card.selected, .bench-card.selected { border-color: #3b82f6; background: rgba(59,130,246,0.15); box-shadow: 0 0 10px rgba(59,130,246,0.3); }
   .slot-card.has-pending { border-color: #f59e0b; background: rgba(245,158,11,0.08); }
+  .slot-card.has-pending.selected { border-color: #fbbf24; background: rgba(245,158,11,0.28); box-shadow: 0 0 0 2px rgba(245,158,11,0.5), 0 0 12px rgba(245,158,11,0.3); }
+  .bench-card.pending-in.selected { border-color: #34d399; background: rgba(16,185,129,0.28); box-shadow: 0 0 0 2px rgba(16,185,129,0.5), 0 0 12px rgba(16,185,129,0.3); }
   .sub-name-in { color: #34d399; }
   .pos-move { font-size: 0.78rem; opacity: 0.8; font-weight: 400; }
   .sub-name-move { color: #fb923c; font-size: 0.8rem; }
