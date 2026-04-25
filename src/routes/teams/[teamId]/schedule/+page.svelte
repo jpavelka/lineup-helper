@@ -115,17 +115,23 @@
 
   const HA_LABELS = { home: '🏠 Home', away: '✈️ Away', neutral: '⚖️ Neutral', 'n/a': 'N/A' };
 
-  $: filteredGames = games.filter(game => {
-    if (filter === 'all') return true;
-    const gameDate = new Date(game.date);
+  $: filteredGames = (() => {
     const now = new Date();
-    if (filter === 'past') return gameDate < now;
-    if (filter === 'future') return gameDate >= now;
-    return true;
-  });
+    const all = games.filter(game => {
+      if (filter === 'past') return new Date(game.date) < now;
+      if (filter === 'future') return new Date(game.date) >= now;
+      return true;
+    });
+    if (filter === 'all') {
+      const future = all.filter(g => new Date(g.date) >= now);
+      const past = all.filter(g => new Date(g.date) < now).sort((a, b) => new Date(b.date) - new Date(a.date));
+      return [...future, ...past];
+    }
+    return all;
+  })();
 
-  $: futureStartIndex = filter === 'all'
-    ? filteredGames.findIndex(g => new Date(g.date) >= new Date())
+  $: pastStartIndex = filter === 'all'
+    ? filteredGames.findIndex(g => new Date(g.date) < new Date())
     : -1;
 
   function formatDate(dateString) {
@@ -174,8 +180,8 @@
 
     <div class="games-list">
       {#each filteredGames as game, i}
-        {#if futureStartIndex >= 0 && i === futureStartIndex && futureStartIndex > 0}
-          <div class="upcoming-divider"><span>Upcoming</span></div>
+        {#if pastStartIndex >= 0 && i === pastStartIndex && pastStartIndex > 0}
+          <div class="upcoming-divider"><span>Past Games</span></div>
         {/if}
         <div class="game-card" class:future={new Date(game.date) >= new Date()}>
           <div class="game-info">

@@ -888,7 +888,7 @@
                 {:else}
                   <span class="player-name" class:pos-changed={gameStarted && changedPositionPlayers.has(lineup[pos.id])}>{getPlayerName(lineup[pos.id])}</span>
                   {#if lineup[pos.id]}
-                    <span class="player-time active-color">Field: {formatDuration(livePlayerStats.find(p => p.id === lineup[pos.id])?.activeMs ?? 0)}</span>
+                    <span class="player-time active-color">Stint: {formatDuration(liveGameTimeMs - (stintStartMs[lineup[pos.id]] ?? 0))}</span>
                   {/if}
                 {/if}
               </div>
@@ -936,7 +936,7 @@
               <div class="player-info">
                 <span class="player-name">#{player.number} {player.name}</span>
                 <span class="player-time {player.onField ? 'active-color' : 'bench-color'}">
-                  {player.onField ? 'Field: ' + getPlayerLiveStats(player.id).active : 'Bench: ' + getPlayerLiveStats(player.id).bench}
+                  {player.onField ? 'Field' : 'Bench'}: {formatDuration(player.stintMs)}
                 </span>
               </div>
               <div class="time-totals">
