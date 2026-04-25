@@ -760,10 +760,10 @@
               class:pending={name === pendingPlanStepName && name !== appliedPlanStepName}
               class:pulsing={pulsingStepIndices.has(i)}
               on:click={() => loadPlanStep(i)}
-              title="{name} · {step.durationMins} min"
+              title="{name} · starts at {Math.round(planStepStartMs[i] / 60000)}′ · {step.durationMins} min"
             >
               <span class="chip-name">{name}</span>
-              <span class="chip-dur">{step.durationMins}′</span>
+              <span class="chip-dur">@{Math.round(planStepStartMs[i] / 60000)}′</span>
             </button>
           {/each}
         </div>

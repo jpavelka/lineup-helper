@@ -670,6 +670,15 @@
     markGamePlanDirty();
   }
 
+  function copyPlanStep(i) {
+    const src = game.gamePlan[i];
+    const copy = { ...src, players: { ...(src.players ?? {}) }, name: src.name ? src.name + ' (copy)' : '' };
+    const arr = [...game.gamePlan];
+    arr.splice(i + 1, 0, copy);
+    game.gamePlan = arr;
+    markGamePlanDirty();
+  }
+
   $: totalPlanMins = (game?.gamePlan || []).reduce((sum, s) => s.included !== false ? sum + (Number(s.durationMins) || 0) : sum, 0);
   $: isPreGame = game?.status !== 'live' && game?.status !== 'completed';
 
@@ -1007,15 +1016,40 @@
                           <!-- svelte-ignore a11y-no-onchange -->
                           <select class="load-lineup-sel"
                             on:mousedown={(e) => { if (!step.formationId) { e.preventDefault(); alert('Select a formation first.'); } }}
-                            on:change={(e) => { if (e.target.value) { importLineupToStep(idx, e.target.value); e.target.value = ''; } }}>
+                            on:change={(e) => {
+                              const val = e.target.value;
+                              if (!val) return;
+                              if (val.startsWith('step:')) {
+                                const srcIdx = Number(val.slice(5));
+                                const src = game.gamePlan[srcIdx];
+                                if (src) { game.gamePlan[idx].players = { ...(src.players ?? {}) }; game.gamePlan = [...game.gamePlan]; markGamePlanDirty(); }
+                              } else {
+                                importLineupToStep(idx, val);
+                              }
+                              e.target.value = '';
+                            }}>
                             <option value="">Load lineup...</option>
-                            {#each savedLineups.filter(l => !step.formationId || l.formationId === step.formationId) as l}
-                              <option value={l.id}>{l.name}</option>
-                            {/each}
+                            {#if game.gamePlan.some((s, i) => i !== idx && s.formationId === step.formationId)}
+                              <optgroup label="Plan steps">
+                                {#each game.gamePlan as s, i}
+                                  {#if i !== idx && s.formationId === step.formationId}
+                                    <option value="step:{i}">{s.name || `Lineup ${i + 1}`}</option>
+                                  {/if}
+                                {/each}
+                              </optgroup>
+                            {/if}
+                            {#if savedLineups.some(l => !step.formationId || l.formationId === step.formationId)}
+                              <optgroup label="Saved lineups">
+                                {#each savedLineups.filter(l => !step.formationId || l.formationId === step.formationId) as l}
+                                  <option value={l.id}>{l.name}</option>
+                                {/each}
+                              </optgroup>
+                            {/if}
                           </select>
                           <div class="plan-step-actions">
                             <button class="plan-mv-btn" on:click={() => movePlanStep(idx, -1)} disabled={idx === 0}>←</button>
                             <button class="plan-mv-btn" on:click={() => movePlanStep(idx, 1)} disabled={idx === game.gamePlan.length - 1}>→</button>
+                            <button class="plan-mv-btn" title="Copy step" on:click={() => copyPlanStep(idx)}>⧉</button>
                             <button class="plan-mv-btn" title="Save as lineup" on:click={() => openSaveLineupModal(idx)}>
                               <svg width="11" height="11" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M2 1a1 1 0 0 0-1 1v12a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V4.414L11.586 1H2zm9 1.5V5H5V2.5h6zM5 9h6v4H5V9zm1 1v2h1v-2H6zm3 0v2h1v-2H9z"/></svg>
                             </button>
