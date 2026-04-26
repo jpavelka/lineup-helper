@@ -32,7 +32,7 @@
   $: gameStarted = game?.status && game.status !== 'scheduled';
 
   // --- Bench Sort & Bar Mode ---
-  let benchSort = 'status';
+  let benchSort = 'benchStint';
   let colorBarMode = 'timeline'; // 'grouped' | 'timeline'
   let pitchExpanded = false;
   let benchExpanded = false;
@@ -150,10 +150,20 @@
     formations = formationsSnap.docs.map(d => ({ id: d.id, ...d.data() })).filter(f => f.name).sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0) || a.name.localeCompare(b.name));
     formation = formations.find(f => f.id === game.formationId) ?? null;
 
-    // Initialise stint tracking from the last sub event (or 0 if no subs yet)
-    const lastSub = [...game.history].filter(e => e.lineupSnapshot).sort((a, b) => b.gameTimeMs - a.gameTimeMs)[0];
-    const stintBase = lastSub ? lastSub.gameTimeMs : 0;
-    (team?.roster || []).forEach(p => { stintStartMs[p.id] = stintBase; });
+    // Initialise stint tracking by replaying sub events to find when each player last changed field status
+    const subEvents = [...game.history].filter(e => e.lineupSnapshot).sort((a, b) => a.gameTimeMs - b.gameTimeMs);
+    let prevFieldIds = new Set();
+    for (const ev of subEvents) {
+      const newFieldIds = new Set(Object.values(ev.lineupSnapshot).filter(Boolean));
+      (team?.roster || []).forEach(p => {
+        if (prevFieldIds.has(p.id) !== newFieldIds.has(p.id)) {
+          stintStartMs[p.id] = ev.gameTimeMs;
+        }
+      });
+      prevFieldIds = newFieldIds;
+    }
+    // Players with no recorded change start their stint at 0
+    (team?.roster || []).forEach(p => { if (stintStartMs[p.id] == null) stintStartMs[p.id] = 0; });
 
     // Pre-stage first game plan step for unstarted games with an empty lineup
     const hasLineup = Object.values(game.lineup).some(Boolean);
@@ -259,30 +269,16 @@
     switch (benchSort) {
       case 'totalField':
         return players.sort((a, b) => b.activeMs - a.activeMs || a.name.localeCompare(b.name));
-      case 'benchStint':
-        return players.sort((a, b) => {
-          if (!a.onField && !b.onField) return b.stintMs - a.stintMs || a.name.localeCompare(b.name);
-          if (!a.onField) return -1;
-          if (!b.onField) return 1;
-          return a.name.localeCompare(b.name);
-        });
-      case 'fieldStint':
-        return players.sort((a, b) => {
-          if (a.onField && b.onField) return b.stintMs - a.stintMs || a.name.localeCompare(b.name);
-          if (a.onField) return -1;
-          if (b.onField) return 1;
-          return a.name.localeCompare(b.name);
-        });
-      case 'status':
-        return players.sort((a, b) => {
-          const getGroup = (p) => {
-            if (!p.onField) return p.pendingOut ? 2 : 0;
-            return p.pendingIn ? 1 : 3;
-          };
-          const aGroup = getGroup(a);
-          const bGroup = getGroup(b);
-          return aGroup - bGroup || a.name.localeCompare(b.name);
-        });
+      case 'totalBench':
+        return players.sort((a, b) => b.benchMs - a.benchMs || a.name.localeCompare(b.name));
+      case 'benchStint': {
+        const key = p => p.onField ? -p.stintMs : p.stintMs;
+        return players.sort((a, b) => key(b) - key(a) || a.name.localeCompare(b.name));
+      }
+      case 'fieldStint': {
+        const key = p => p.onField ? p.stintMs : -p.stintMs;
+        return players.sort((a, b) => key(b) - key(a) || a.name.localeCompare(b.name));
+      }
       default: // alpha
         return players.sort((a, b) => a.name.localeCompare(b.name));
     }
@@ -915,11 +911,11 @@
             <button class:active={colorBarMode === 'grouped'} on:click={() => colorBarMode = 'grouped'}>Grouped</button>
           </div>
           <select class="sort-select" bind:value={benchSort}>
-            <option value="status">By Status</option>
             <option value="alpha">A–Z</option>
-            <option value="totalField">Most Field Time</option>
-            <option value="benchStint">Longest on Bench</option>
-            <option value="fieldStint">Longest on Field</option>
+            <option value="benchStint">Bench Stint</option>
+            <option value="fieldStint">Field Stint</option>
+            <option value="totalBench">Bench Time</option>
+            <option value="totalField">Field Time</option>
           </select>
         </div>
       </div>
