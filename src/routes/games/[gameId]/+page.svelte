@@ -7,6 +7,7 @@
   import { authStore } from '$lib/stores/authStore';
   import MatchTimeline from '$lib/components/MatchTimeline.svelte';
   import PlayerStatsModal from '$lib/components/PlayerStatsModal.svelte';
+  import AddEventModal from '$lib/components/AddEventModal.svelte';
   import { computePositionStats, computePlayerTimelines, generateUUID } from '$lib/utils.js';
   import { getGroupColor } from '$lib/groupColors.js';
 
@@ -28,6 +29,7 @@
   let showPlanStatsModal = false;
   let planStatsModalPlayer = null;
   let savedLineups = [];
+  let showAddEventModal = false;
 
   // --- Player picker modal (mobile long-press / desktop right-click) ---
   let showPickerModal = false;
@@ -1360,7 +1362,10 @@
 
       <!-- Match Timeline -->
       <div class="panel">
-        <h2>Match Timeline</h2>
+        <div class="panel-title-row">
+          <h2>Match Timeline</h2>
+          <button class="btn-toggle" on:click={() => showAddEventModal = true}>+ Add Event</button>
+        </div>
         <div class="stats-panel-scroll">
           <MatchTimeline
             history={game.history}
@@ -1552,6 +1557,20 @@
       </div>
     </div>
   </div>
+{/if}
+
+<!-- ADD EVENT MODAL -->
+{#if showAddEventModal}
+  <AddEventModal
+    roster={availableRoster}
+    history={game.history}
+    {gameId}
+    score={game.score}
+    totalGameMs={game?.gameTimeStats?.totalMs ?? 0}
+    formation={gameFormation}
+    on:close={() => showAddEventModal = false}
+    on:saved={(e) => { game.history = e.detail.history; game.score = e.detail.score; showAddEventModal = false; }}
+  />
 {/if}
 
 <style>

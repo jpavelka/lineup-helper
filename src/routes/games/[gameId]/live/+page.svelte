@@ -8,6 +8,7 @@
   import { computePositionStats, computePlayerTimelines } from '$lib/utils.js';
   import MatchTimeline from '$lib/components/MatchTimeline.svelte';
   import PlayerStatsModal from '$lib/components/PlayerStatsModal.svelte';
+  import AddEventModal from '$lib/components/AddEventModal.svelte';
 
   const gameId = $page.params.gameId;
 
@@ -99,6 +100,7 @@
   let showPauseModal = false;
   let pauseReason = 'Halftime';
   let showEventModal = false;
+  let showAddEventModal = false;
   let showGoalsModal = false;
   let showPlayerStatsModal = false;
   let statsModalPlayer = null;
@@ -975,7 +977,10 @@
 
   <!-- MATCH TIMELINE -->
   <div class="panel timeline-panel">
-    <h2>Match Timeline</h2>
+    <div class="panel-title-row">
+      <h2>Match Timeline</h2>
+      <button class="btn-toggle" on:click={() => showAddEventModal = true}>+ Add Event</button>
+    </div>
     <MatchTimeline
       history={game.history}
       roster={availableRoster}
@@ -1126,6 +1131,20 @@
       </div>
     </div>
   </div>
+{/if}
+
+<!-- ADD EVENT MODAL (post-game) -->
+{#if showAddEventModal}
+  <AddEventModal
+    roster={availableRoster}
+    history={game.history}
+    {gameId}
+    score={game.score}
+    totalGameMs={liveGameTimeMs}
+    {formation}
+    on:close={() => showAddEventModal = false}
+    on:saved={(e) => { game.history = e.detail.history; game.score = e.detail.score; showAddEventModal = false; }}
+  />
 {/if}
 
 <!-- PLAYER STATS MODAL -->
@@ -1442,4 +1461,8 @@
   /* ─── Timeline panel ─── */
   .timeline-panel { margin-top: 1rem; }
   .timeline-panel h2 { font-size: 1rem; color: #cbd5e1; border-bottom: 1px solid #334155; padding-bottom: 0.5rem; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.75rem; }
+  .panel-title-row { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #334155; padding-bottom: 0.5rem; margin-bottom: 0.75rem; }
+  .panel-title-row h2 { margin: 0; border: none; padding: 0; }
+  .btn-toggle { background: #1e293b; border: 1px solid #334155; color: #cbd5e1; padding: 0.35rem 0.75rem; border-radius: 0.5rem; cursor: pointer; font-size: 0.85rem; font-weight: 600; }
+  .btn-toggle:hover { background: #334155; }
 </style>
