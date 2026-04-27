@@ -291,7 +291,7 @@
       </div>
       {#if isPauseEvent(editingEvent)}
         <div class="form-group">
-          <label>Pause Reason</label>
+          <span class="form-label">Pause Reason</span>
           <div class="pause-reason-list">
             {#each PAUSE_REASONS as reason}
               <button
@@ -392,12 +392,13 @@
   .modal-panel h3 { margin: 0 0 1rem 0; color: #e2e8f0; }
   .form-group { display: flex; flex-direction: column; gap: 0.5rem; margin-bottom: 1rem; }
   .form-group label { color: #cbd5e1; font-size: 0.9rem; }
-  .form-group select, .form-group input[type="text"], .form-group input[type="time"] {
+  .form-label { color: #cbd5e1; font-size: 0.9rem; }
+  .form-group select, .form-group input[type="time"] {
     background: #0f172a; border: 1px solid #334155; color: white;
     padding: 0.75rem; border-radius: 0.5rem; font-size: 1rem; outline: none;
     font-family: monospace;
   }
-  .form-group input[type="text"]:focus, .form-group input[type="time"]:focus { border-color: #3b82f6; }
+  .form-group input[type="time"]:focus { border-color: #3b82f6; }
   .time-adjust-btns { display: flex; gap: 0.4rem; }
   .btn-adjust { background: #1e293b; border: 1px solid #334155; color: #cbd5e1; font-size: 0.8rem; padding: 0.3rem 0.6rem; border-radius: 0.4rem; cursor: pointer; font-family: monospace; flex: 1; }
   .btn-adjust:hover { background: #334155; }

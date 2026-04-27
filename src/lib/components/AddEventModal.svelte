@@ -8,7 +8,7 @@
   /** @type {any[]} */
   export let history = [];
   export let gameId = '';
-  export let score = { mine: 0, theirs: 0 };
+  export const score = { mine: 0, theirs: 0 };
   export let totalGameMs = 0;
   /** @type {{ id: string, name: string, positions: { id: string, name: string, group?: string }[] } | null} */
   export let formation = null;
@@ -342,7 +342,7 @@
       {/if}
     {:else if eventType === 'pause'}
       <div class="form-group">
-        <label>Pause Reason</label>
+        <span class="form-label">Pause Reason</span>
         <div class="pause-reason-list">
           {#each PAUSE_REASONS as reason}
             <button
@@ -382,7 +382,7 @@
   .hint { margin: 0 0 1rem 0; font-size: 0.8rem; color: #64748b; }
   .sub-hint { font-size: 0.82rem; color: #64748b; margin: 0 0 1rem 0; }
   .form-group { display: flex; flex-direction: column; gap: 0.4rem; margin-bottom: 1rem; }
-  label { font-size: 0.8rem; color: #94a3b8; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; }
+  label, .form-label { font-size: 0.8rem; color: #94a3b8; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; }
   input, select {
     background: #0f172a; border: 1px solid #334155; border-radius: 0.4rem;
     color: #f8fafc; padding: 0.5rem 0.75rem; font-size: 0.9rem; width: 100%; box-sizing: border-box;

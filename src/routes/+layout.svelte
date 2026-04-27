@@ -80,16 +80,6 @@
     align-items: center;
   }
 
-  .nav-links a {
-    color: #cbd5e1;
-    text-decoration: none;
-    font-size: 0.95rem;
-  }
-
-  .nav-links a:hover {
-    color: #3b82f6;
-  }
-
   .btn-logout {
     background: transparent;
     border: 1px solid #475569;

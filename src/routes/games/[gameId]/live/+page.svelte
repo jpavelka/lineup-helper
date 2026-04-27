@@ -197,7 +197,7 @@
   $: benchPlayers = availableRoster.filter(p => !appliedPlayerIds.includes(p.id));
 
   $: eventModalPlayers = (() => {
-    const onFieldIds = new Set(Object.values(lineup).filter(Boolean));
+    const onFieldIds = new Set(Object.values(game?.lineup || {}).filter(Boolean));
     const sort = (a, b) => a.name.localeCompare(b.name);
     return {
       onField: availableRoster.filter(p => onFieldIds.has(p.id)).sort(sort),
@@ -251,7 +251,8 @@
     const appliedName = appliedPlanStepName ?? (appliedLineupId ? savedLineups.find(l => l.id === appliedLineupId)?.name ?? null : null);
     const pendingName = pendingPlanStepName ?? (pendingLineupId ? savedLineups.find(l => l.id === pendingLineupId)?.name ?? null : null);
     if (!appliedName && !pendingName) return null;
-    if (!gameStarted || appliedName === pendingName) return pendingName ?? appliedName ?? 'manual lineup';
+    if (!gameStarted) return pendingName ?? appliedName ?? 'manual lineup';
+    if (pendingSubs.length === 0 || appliedName === pendingName) return appliedName ?? pendingName ?? 'manual lineup';
     return `${appliedName ?? 'manual lineup'} → ${pendingName ?? 'manual lineup'}`;
   })();
 
@@ -1023,24 +1024,24 @@
     <div class="modal-panel" on:click|stopPropagation>
       <h2>Add Match Event</h2>
       <div class="form-group">
-        <label>Event Type</label>
-        <select bind:value={eventType}>
+        <label for="event-type">Event Type</label>
+        <select id="event-type" bind:value={eventType}>
           <option value="goal">Goal</option>
           <option value="card">Booking (Card)</option>
         </select>
       </div>
       {#if eventType === 'goal'}
         <div class="form-group">
-          <label>Team</label>
-          <select bind:value={eventTeam}>
+          <label for="event-team">Team</label>
+          <select id="event-team" bind:value={eventTeam}>
             <option value="mine">Our Team</option>
             <option value="theirs">Opponent</option>
           </select>
         </div>
         {#if eventTeam === 'mine'}
           <div class="form-group">
-            <label>Goal Scorer</label>
-            <select bind:value={eventScorer}>
+            <label for="event-scorer">Goal Scorer</label>
+            <select id="event-scorer" bind:value={eventScorer}>
               <option value="">-- Select Player --</option>
               <optgroup label="On Field">
                 {#each eventModalPlayers.onField as p}<option value={p.id}>{p.name}</option>{/each}
@@ -1051,8 +1052,8 @@
             </select>
           </div>
           <div class="form-group">
-            <label>Assist (Optional)</label>
-            <select bind:value={eventAssist}>
+            <label for="event-assist">Assist (Optional)</label>
+            <select id="event-assist" bind:value={eventAssist}>
               <option value="">-- None --</option>
               <optgroup label="On Field">
                 {#each eventModalPlayers.onField as p}<option value={p.id}>{p.name}</option>{/each}
@@ -1065,15 +1066,15 @@
         {/if}
       {:else}
         <div class="form-group">
-          <label>Card Type</label>
-          <select bind:value={eventCard}>
+          <label for="event-card">Card Type</label>
+          <select id="event-card" bind:value={eventCard}>
             <option value="yellow">Yellow Card</option>
             <option value="red">Red Card</option>
           </select>
         </div>
         <div class="form-group">
-          <label>Player</label>
-          <select bind:value={eventPlayer}>
+          <label for="event-player">Player</label>
+          <select id="event-player" bind:value={eventPlayer}>
             <option value="">-- Select Player --</option>
             <optgroup label="On Field">
               {#each eventModalPlayers.onField as p}<option value={p.id}>{p.name}</option>{/each}
@@ -1247,9 +1248,6 @@
     0%, 100% { border-color: #f59e0b; box-shadow: 0 0 0 0 rgba(245,158,11,0); }
     50% { border-color: #fbbf24; box-shadow: 0 0 0 4px rgba(245,158,11,0.35); }
   }
-  .chip-num { font-weight: 700; color: #475569; font-size: 0.65rem; }
-  .plan-step-chip.active .chip-num { color: #60a5fa; }
-  .plan-step-chip.pending .chip-num { color: #f59e0b; }
   .chip-name { font-weight: 600; }
   .chip-dur { color: #475569; font-size: 0.65rem; }
   .plan-step-chip.active .chip-dur { color: #60a5fa; }
