@@ -203,23 +203,46 @@
     .sort((a, b) => ((filteredTotals[b.id]?.ms ?? 0) - (filteredTotals[a.id]?.ms ?? 0)) * sortDir || a.name.localeCompare(b.name));
 
   // Collect all groups and position names that appear (for filter + legend)
-  $: allGroups = [...new Set(
-    Object.values(totals).flatMap(t => [
-      ...Object.keys(t.completedGroupMs),
-      ...Object.keys(t.plannedGroupMs),
-    ])
-  )].filter(g => g !== '');
+  $: allGroups = (() => {
+    const present = new Set(
+      Object.values(totals).flatMap(t => [
+        ...Object.keys(t.completedGroupMs),
+        ...Object.keys(t.plannedGroupMs),
+      ])
+    );
+    present.delete('');
+    const defaultFormation = team?.defaultFormationId ? formations[team.defaultFormationId] : null;
+    const orderedGroups = (defaultFormation?.groups ?? []).filter(g => present.has(g));
+    const orderedSet = new Set(orderedGroups);
+    const rest = [...present].filter(g => !orderedSet.has(g));
+    return [...orderedGroups, ...rest];
+  })();
 
-  $: allPositionNames = [...new Set(
-    Object.values(totals).flatMap(t => [
-      ...Object.keys(t.completedPosMs),
-      ...Object.keys(t.plannedPosMs),
-    ])
-  )].sort((a, b) => {
-    const ga = positionGroup(a) ?? '';
-    const gb = positionGroup(b) ?? '';
-    return ga.localeCompare(gb) || a.localeCompare(b);
-  });
+  $: allPositionNames = (() => {
+    const present = new Set(
+      Object.values(totals).flatMap(t => [
+        ...Object.keys(t.completedPosMs),
+        ...Object.keys(t.plannedPosMs),
+      ])
+    );
+    const defaultFormation = team?.defaultFormationId ? formations[team.defaultFormationId] : null;
+    if (defaultFormation) {
+      const groupOrder = Object.fromEntries((defaultFormation.groups ?? []).map((g, i) => [g, i]));
+      const orderedNames = (defaultFormation.positions ?? [])
+        .slice()
+        .sort((a, b) => (groupOrder[a.group] ?? Infinity) - (groupOrder[b.group] ?? Infinity))
+        .map(p => p.name)
+        .filter(name => present.has(name));
+      const orderedSet = new Set(orderedNames);
+      const rest = [...present].filter(name => !orderedSet.has(name));
+      return [...orderedNames, ...rest];
+    }
+    return [...present].sort((a, b) => {
+      const ga = positionGroup(a) ?? '';
+      const gb = positionGroup(b) ?? '';
+      return ga.localeCompare(gb) || a.localeCompare(b);
+    });
+  })();
 
   $: selectedCount = games.filter(g => selections[g.id]?.included).length;
 

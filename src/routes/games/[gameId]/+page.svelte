@@ -312,7 +312,14 @@
 
   function addPlanStep() {
     const lastStep = game.gamePlan[game.gamePlan.length - 1];
-    const formationId = lastStep?.formationId ?? game.gamePlanFormationId ?? null;
+    let teamDefaultFormationId = null;
+    if (team?.defaultFormationId) {
+      const defaultFormation = formations.find(f => f.id === team.defaultFormationId);
+      if (defaultFormation && (defaultFormation.positions?.length ?? 0) === (game.playersOnField ?? 0)) {
+        teamDefaultFormationId = team.defaultFormationId;
+      }
+    }
+    const formationId = lastStep?.formationId || game.gamePlanFormationId || teamDefaultFormationId || null;
     game.gamePlan = [...game.gamePlan, { durationMins: 20, players: {}, formationId }];
     markGamePlanDirty();
   }
