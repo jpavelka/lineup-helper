@@ -236,7 +236,7 @@
           class:text-green={ev.event === 'Goal (Us)'}
           class:text-red={ev.event === 'Goal Conceded' || ev.event === 'Red Card'}
           class:text-yellow={ev.event === 'Yellow Card'}
-        >{ev.event}{#if ev.scoreAfter}: <span class="score-inline">{ev.scoreAfter.mine}–{ev.scoreAfter.theirs}</span>{/if}</strong>
+        >{#if ev.event === 'Goal (Us)'}Goal{#if ev.playerId}&nbsp;({getPlayerName(ev.playerId)}{#if ev.assistId}/{getPlayerName(ev.assistId)}{/if}){/if}{#if ev.scoreAfter}: <span class="score-inline">{ev.scoreAfter.mine}–{ev.scoreAfter.theirs}</span>{/if}{:else}{ev.event}{#if ev.scoreAfter}: <span class="score-inline">{ev.scoreAfter.mine}–{ev.scoreAfter.theirs}</span>{/if}{#if (ev.event === 'Yellow Card' || ev.event === 'Red Card') && ev.playerId}&nbsp;({getPlayerName(ev.playerId)}){/if}{/if}</strong>
 
         {#if expanded}
           {#if ev.playerId && ev.event !== 'Substitution' && ev.event !== 'Lineup Applied'}

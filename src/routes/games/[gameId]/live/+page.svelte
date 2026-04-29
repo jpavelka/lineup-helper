@@ -980,7 +980,7 @@
     </div>
     <MatchTimeline
       history={game.history}
-      roster={availableRoster}
+      roster={team?.roster || []}
       {gameId}
       {formation}
       allowEditing={true}
