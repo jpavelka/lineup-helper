@@ -287,7 +287,7 @@
                 {teams.length === 0 ? "You don't have any teams yet." : 'All your teams are archived.'}
               </p>
               <button class="btn-primary" style="margin-top: 1rem;" on:click={createNewTeam}>
-                Create Your First Team
+                {teams.length === 0 ? 'Create Your First Team' : 'Create New Team'}
               </button>
             </div>
           {/if}
