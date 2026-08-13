@@ -188,6 +188,13 @@
       console.error("Error deleting lineup:", error);
     }
   }
+
+  async function toggleArchive() {
+    const nextArchived = !team.archived;
+    if (nextArchived && !confirm(`Archive "${team.name}"? It will be hidden from your main dashboard but you can still view and unarchive it later.`)) return;
+    team.archived = nextArchived;
+    await saveTeamToDb(team);
+  }
 </script>
 
 <svelte:head>
@@ -210,9 +217,15 @@
           on:change={updateTeamName}
           placeholder="Enter Team Name..."
         />
+        {#if team.archived}
+          <span class="archived-badge">Archived</span>
+        {/if}
       </div>
       <div class="header-actions">
         <span class="save-status">{saveStatus}</span>
+        <button class="btn-secondary" on:click={toggleArchive}>
+          {team.archived ? 'Unarchive Team' : 'Archive Team'}
+        </button>
         <div class="default-formation-group">
           <label class="default-formation-label" for="default-players">Default Players on Field</label>
           <input
@@ -722,6 +735,35 @@
     padding: 0.4rem 0.8rem;
     font-size: 0.85rem;
     border-radius: 0.5rem;
+  }
+
+  .btn-secondary {
+    background: #334155;
+    color: white;
+    border: none;
+    padding: 0.75rem 1.5rem;
+    border-radius: 0.75rem;
+    font-weight: 600;
+    font-size: 0.9rem;
+    cursor: pointer;
+    text-decoration: none;
+    text-align: center;
+    transition: background 0.2s;
+  }
+  .btn-secondary:hover { background: #475569; }
+
+  .archived-badge {
+    display: inline-block;
+    width: fit-content;
+    background: rgba(148, 163, 184, 0.15);
+    color: #94a3b8;
+    border: 1px solid #475569;
+    padding: 0.2rem 0.6rem;
+    border-radius: 999px;
+    font-size: 0.75rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
   }
 
   .btn-icon {

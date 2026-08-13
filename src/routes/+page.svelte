@@ -6,7 +6,7 @@
     GoogleAuthProvider, 
     signInWithPopup
   } from 'firebase/auth';
-  import { collection, query, where, getDocs, addDoc, deleteDoc, doc, writeBatch } from 'firebase/firestore';
+  import { collection, query, where, getDocs, addDoc, deleteDoc, doc, writeBatch, updateDoc } from 'firebase/firestore';
   import { authStore } from '$lib/stores/authStore';
   import { goto } from '$app/navigation';
   import { onMount } from 'svelte';
@@ -23,6 +23,10 @@
   let loadingTeams = true;
   let formations = [];
   let loadingFormations = true;
+  let archivedOpen = false;
+
+  $: activeTeams = teams.filter(t => !t.archived);
+  $: archivedTeams = teams.filter(t => t.archived);
 
   // --- Auth Functions ---
   async function handleEmailAuth(e) {
@@ -161,6 +165,26 @@
       alert("Failed to delete team.");
     }
   }
+
+  async function archiveTeam(teamId) {
+    try {
+      await updateDoc(doc(db, 'teams', teamId), { archived: true });
+      teams = teams.map(t => t.id === teamId ? { ...t, archived: true } : t);
+    } catch (error) {
+      console.error("Error archiving team:", error);
+      alert("Failed to archive team.");
+    }
+  }
+
+  async function unarchiveTeam(teamId) {
+    try {
+      await updateDoc(doc(db, 'teams', teamId), { archived: false });
+      teams = teams.map(t => t.id === teamId ? { ...t, archived: false } : t);
+    } catch (error) {
+      console.error("Error unarchiving team:", error);
+      alert("Failed to unarchive team.");
+    }
+  }
 </script>
 
 <svelte:head>
@@ -226,15 +250,24 @@
         <p class="muted">Loading your teams...</p>
       {:else}
         <div class="grid-layout">
-          {#each teams as team}
+          {#each activeTeams as team}
             <div class="team-card">
-              <button 
-                class="btn-delete-card" 
-                on:click={() => deleteTeam(team.id, team.name)}
-                title="Delete Team"
-              >
-                ✕
-              </button>
+              <div class="card-corner-actions">
+                <button
+                  class="btn-archive-card"
+                  on:click={() => archiveTeam(team.id)}
+                  title="Archive Team"
+                >
+                  🗄
+                </button>
+                <button
+                  class="btn-delete-card"
+                  on:click={() => deleteTeam(team.id, team.name)}
+                  title="Delete Team"
+                >
+                  ✕
+                </button>
+              </div>
               <a href="/teams/{team.id}" class="team-link">
                 <h3>{team.name}</h3>
               </a>
@@ -247,16 +280,54 @@
               </div>
             </div>
           {/each}
-          
-          {#if teams.length === 0}
+
+          {#if activeTeams.length === 0}
             <div class="team-card empty-teams" style="text-align: center; justify-content: center; border-style: dashed;">
-              <p class="muted">You don't have any teams yet.</p>
+              <p class="muted">
+                {teams.length === 0 ? "You don't have any teams yet." : 'All your teams are archived.'}
+              </p>
               <button class="btn-primary" style="margin-top: 1rem;" on:click={createNewTeam}>
                 Create Your First Team
               </button>
             </div>
           {/if}
         </div>
+      {/if}
+
+      {#if !loadingTeams && archivedTeams.length > 0}
+        <div class="archived-toggle-row">
+          <button class="btn-link" on:click={() => archivedOpen = !archivedOpen}>
+            {archivedOpen ? '▾' : '▸'} Archived Teams ({archivedTeams.length})
+          </button>
+        </div>
+
+        {#if archivedOpen}
+          <div class="grid-layout">
+            {#each archivedTeams as team}
+              <div class="team-card archived">
+                <div class="card-corner-actions">
+                  <button
+                    class="btn-delete-card"
+                    on:click={() => deleteTeam(team.id, team.name)}
+                    title="Permanently Delete Team"
+                  >
+                    ✕
+                  </button>
+                </div>
+                <a href="/teams/{team.id}" class="team-link">
+                  <h3>{team.name}</h3>
+                </a>
+                <p class="muted">{team.roster?.length || 0} Players on Roster</p>
+                <div class="team-actions">
+                  <a href="/teams/{team.id}" class="btn-secondary">View Team</a>
+                  <a href="/teams/{team.id}/schedule" class="btn-secondary">Schedule</a>
+                  <a href="/teams/{team.id}/stats" class="btn-secondary">Season Stats</a>
+                  <button class="btn-secondary" on:click={() => unarchiveTeam(team.id)}>Unarchive</button>
+                </div>
+              </div>
+            {/each}
+          </div>
+        {/if}
       {/if}
     </section>
 
@@ -484,10 +555,16 @@
     margin-top: auto;
   }
 
-  .btn-delete-card {
+  .card-corner-actions {
     position: absolute;
     top: 1rem;
     right: 1rem;
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+  }
+
+  .btn-delete-card {
     background: transparent;
     border: none;
     color: #ef4444;
@@ -501,6 +578,37 @@
 
   .btn-delete-card:hover {
     opacity: 1;
+  }
+
+  .btn-archive-card {
+    background: transparent;
+    border: none;
+    color: #94a3b8;
+    font-size: 1.1rem;
+    cursor: pointer;
+    opacity: 0.5;
+    transition: opacity 0.2s, color 0.2s;
+    padding: 0.25rem;
+    line-height: 1;
+  }
+
+  .btn-archive-card:hover {
+    opacity: 1;
+    color: #cbd5e1;
+  }
+
+  .team-card.archived {
+    opacity: 0.7;
+    border-style: dashed;
+  }
+
+  .archived-toggle-row {
+    margin-top: 1.5rem;
+  }
+
+  .archived-toggle-row .btn-link {
+    font-size: 0.95rem;
+    font-weight: 600;
   }
 
   .formation-card {
