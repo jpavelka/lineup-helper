@@ -93,6 +93,36 @@ export function computePlayerTimelines(history, formation, roster) {
 }
 
 /**
+ * Rebuilds per-player { activeMs, benchMs } from game history (the source of truth
+ * when events are added/edited after the fact). Players present in `existing`, or
+ * who appear in the history lineups, are included; bench = total live time - active.
+ * Returns null if history has no live time (caller should keep existing stats).
+ */
+export function computePlayerStatsFromHistory(history, formation, existing = {}) {
+  const pos = computePositionStats(history, formation);
+  let totalMs = 0;
+  if (history?.length) {
+    const sorted = [...history].sort((a, b) => a.timestamp - b.timestamp);
+    let live = false, start = null;
+    for (const ev of sorted) {
+      const ts = roundToSec(ev.timestamp);
+      if (live && start !== null && ts > start) totalMs += ts - start;
+      if (ev.event === 'Game Started' || ev.event === 'Game Resumed') live = true;
+      else if (ev.event === 'Game Paused' || ev.event === 'Match Ended') live = false;
+      start = ts;
+    }
+  }
+  if (totalMs <= 0) return null;
+  const out = {};
+  const ids = new Set([...Object.keys(existing || {}), ...Object.keys(pos)]);
+  ids.forEach(id => {
+    const active = Object.values(pos[id]?.positionMs ?? {}).reduce((a, b) => a + b, 0);
+    out[id] = { activeMs: active, benchMs: Math.max(0, totalMs - active) };
+  });
+  return out;
+}
+
+/**
  * Generates a universally unique identifier.
  * Uses the built-in `crypto.randomUUID()` if available,
  * otherwise falls back to a robust "good-enough" implementation.

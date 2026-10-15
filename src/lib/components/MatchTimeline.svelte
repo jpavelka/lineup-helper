@@ -2,6 +2,7 @@
   import { createEventDispatcher } from 'svelte';
   import { doc, updateDoc } from 'firebase/firestore';
   import { db } from '$lib/firebase/config';
+  import { computePlayerStatsFromHistory } from '$lib/utils.js';
 
   /** @type {any[]} */
   export let history = [];
@@ -10,6 +11,7 @@
   /** @type {string|null} */
   export let gameId = null;
   export let allowEditing = false;
+  export let playerStats = {};
   /** @type {{ positions: { id: string, name: string }[] } | null} */
   export let formation = null;
 
@@ -199,8 +201,12 @@
     updated = recalculateGameTimes(updated);
 
     try {
-      await updateDoc(doc(db, 'games', gameId), { history: updated });
+      const update = { history: updated };
+      const rebuilt = computePlayerStatsFromHistory(updated, formation, playerStats);
+      if (rebuilt) update.playerStats = rebuilt;
+      await updateDoc(doc(db, 'games', gameId), update);
       dispatch('updated', updated);
+      if (rebuilt) dispatch('statsUpdated', rebuilt);
     } catch (err) {
       console.error('Error saving event edit:', err);
     }

@@ -2,6 +2,7 @@
   import { createEventDispatcher } from 'svelte';
   import { doc, updateDoc } from 'firebase/firestore';
   import { db } from '$lib/firebase/config';
+  import { computePlayerStatsFromHistory } from '$lib/utils.js';
 
   /** @type {{ id: string, name: string, number?: string|number }[]} */
   export let roster = [];
@@ -10,6 +11,8 @@
   export let gameId = '';
   export const score = { mine: 0, theirs: 0 };
   export let totalGameMs = 0;
+  /** Existing { playerId: { activeMs, benchMs } } — rebuilt from history on save */
+  export let playerStats = {};
   /** @type {{ id: string, name: string, positions: { id: string, name: string, group?: string }[] } | null} */
   export let formation = null;
 
@@ -208,8 +211,11 @@
 
     saving = true;
     try {
-      await updateDoc(doc(db, 'games', gameId), { history: newHistory, score: newScore });
-      dispatch('saved', { history: newHistory, score: newScore });
+      const update = { history: newHistory, score: newScore };
+      const rebuilt = computePlayerStatsFromHistory(newHistory, formation, playerStats);
+      if (rebuilt) update.playerStats = rebuilt;
+      await updateDoc(doc(db, 'games', gameId), update);
+      dispatch('saved', { history: newHistory, score: newScore, playerStats: rebuilt });
     } catch (err) {
       console.error('Error adding event:', err);
       error = 'Failed to save. Please try again.';

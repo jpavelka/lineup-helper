@@ -1380,7 +1380,9 @@
             {gameId}
             formation={gameFormation}
             allowEditing={true}
+            playerStats={game.playerStats}
             on:updated={(e) => { game.history = e.detail; }}
+            on:statsUpdated={(e) => { game.playerStats = e.detail; }}
           />
         </div>
       </div>
@@ -1575,8 +1577,9 @@
     score={game.score}
     totalGameMs={game?.gameTimeStats?.totalMs ?? 0}
     formation={gameFormation}
+    playerStats={game.playerStats}
     on:close={() => showAddEventModal = false}
-    on:saved={(e) => { game.history = e.detail.history; game.score = e.detail.score; showAddEventModal = false; }}
+    on:saved={(e) => { game.history = e.detail.history; game.score = e.detail.score; if (e.detail.playerStats) game.playerStats = e.detail.playerStats; showAddEventModal = false; }}
   />
 {/if}
 

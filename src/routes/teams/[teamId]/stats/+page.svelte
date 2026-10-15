@@ -4,6 +4,7 @@
   import { doc, getDoc, getDocs, collection, query, where } from 'firebase/firestore';
   import { db } from '$lib/firebase/config';
   import { authStore } from '$lib/stores/authStore';
+  import { computePlayerStatsFromHistory } from '$lib/utils.js';
 
   const teamId = $page.params.teamId;
 
@@ -41,6 +42,16 @@
         acc[p.id] = { activeMs: 0, benchMs: 0, gamesPlayed: 0, gamesStarted: 0, goals: 0, assists: 0, yellowCards: 0, redCards: 0 };
       }
 
+      const formationCache = {};
+      const getFormation = async (id) => {
+        if (!id) return null;
+        if (!(id in formationCache)) {
+          const snap = await getDoc(doc(db, 'formations', id));
+          formationCache[id] = snap.exists() ? { id: snap.id, ...snap.data() } : null;
+        }
+        return formationCache[id];
+      };
+
       for (const game of games) {
         const score = game.score ?? { mine: 0, theirs: 0 };
         record.played++;
@@ -50,7 +61,9 @@
         else if (score.mine === score.theirs) record.draws++;
         else record.losses++;
 
-        const ps = game.playerStats ?? {};
+        // History is the source of truth: events added after the game may not be reflected in playerStats
+        const formation = await getFormation(game.formationId);
+        const ps = computePlayerStatsFromHistory(game.history, formation, game.playerStats) ?? game.playerStats ?? {};
         const lineupSetEvent = (game.history || []).find(e => e.event === 'Lineup Set' && e.lineupSnapshot);
         const startingIds = new Set(Object.values(lineupSetEvent?.lineupSnapshot ?? game.lineup ?? {}).filter(Boolean));
         for (const p of (team.roster || [])) {
